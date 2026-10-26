@@ -7,8 +7,9 @@ CDC events, so the Data Science layer learns Remaining Useful Life against a kno
 
 Degradation model: one *lifecycle* runs from overhaul (w = 0) to failure (w = 1)
 ----------------------------------------------------------------------------------------------------------
-Lifecycle parameters come from a stable hash of (SIM_SEED, engine_id, lifecycle_id), so a restarted
-simulator re-derives exactly the same curve:
+Lifecycle parameters come from a stable hash of (SIM_SEED, engine_id, lifecycle_id). The SIM_* values a
+lifecycle starts with are stored with it, so a restart re-derives exactly the same curve even after they
+changed (new values apply from the next lifecycle):
     expected life  L ~ Normal(mu, 0.18 mu) clipped to [0.55 mu, 1.6 mu]          mu = SIM_MEAN_LIFE_CYCLES
     wear curve     c(t) = (t / L)^k                            k ~ U(1.8, 2.8)   polynomial   (p = 0.5)
                    c(t) = (exp(b t / L) - 1) / (exp(b) - 1)    b ~ U(2.5, 4.0)   exponential  (p = 0.5)
@@ -40,12 +41,12 @@ Noise widens with wear (looser clearances, unstable combustion), and vibration s
 dips become frequent just before failure: the precursors that engine health monitoring looks for.
 
 Usage: ``python engine_generator.py [--max-ticks N] [--no-backfill]`` with SIM_*, POSTGRES_*, LOG_LEVEL set.
-Helpers: fleet_bootstrap (config, resume, backfill), fleet_runtime (live loop, work orders), fleet_db (SQL).
+Helpers: fleet_config (SIM_*, command line), fleet_bootstrap (resume, backfill), fleet_runtime (live loop,
+work orders), fleet_db (connection, reads), fleet_writer (writes), fleet_lease (single-writer lock).
 """
 
 from __future__ import annotations
 
-import argparse
 import functools
 import hashlib
 import logging
@@ -58,10 +59,13 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
-from fleet_bootstrap import SimulatorConfig, bootstrap_fleet
+from fleet_bootstrap import ResumeMismatchError, bootstrap_fleet
+from fleet_config import SimulatorConfig, parse_args
+from fleet_lease import WriterLockError
 from fleet_runtime import FleetRunner, configure_logging, install_signal_handlers
 
 if TYPE_CHECKING:
+    from fleet_config import GenerationSettings
     from fleet_runtime import MaintenanceCompletion
 
 logger = logging.getLogger("engine_generator")
@@ -263,7 +267,8 @@ class EngineSimulator:
 
     ``next_pulse`` only proposes a pulse; ``advance`` and ``start_next_lifecycle`` apply changes once the
     database transaction persisting them has committed, so a dropped transaction never desynchronises the
-    twin from the database.
+    twin from the database. ``settings`` generate the current lifecycle: the stored ones it started with
+    when it is resumed, the current SIM_* values (``config.generation``) for every new lifecycle.
     """
 
     def __init__(
@@ -276,8 +281,9 @@ class EngineSimulator:
         status: str = HEALTHY,
         current_cycle: int = 0,
         cycles_since_new: int = 0,
-        wear_floor: float = 0.0,
+        wear_factor: float = 0.0,
         last_event_ts: datetime | None = None,
+        settings: GenerationSettings | None = None,
     ) -> None:
         self.engine_id = engine_id
         self.profile = build_profile(engine_id)
@@ -285,14 +291,11 @@ class EngineSimulator:
         self.status = status
         self.current_cycle = current_cycle
         self.cycles_since_new = cycles_since_new
-        self.wear_factor = wear_floor
+        self.wear_factor = wear_factor
         self.last_event_ts = last_event_ts
         self.maintenance_since: datetime | None = None
         self.maintenance_action = ""
-        # Floors only matter when resuming under changed settings: never step w or cycle backwards.
-        self._wear_floor = wear_floor
-        self._cycle_floor = current_cycle
-        self._load_lifecycle(lifecycle_id, pulse_index)
+        self._load_lifecycle(lifecycle_id, pulse_index, settings or config.generation)
 
     @property
     def lifecycle_id(self) -> int:
@@ -304,22 +307,26 @@ class EngineSimulator:
         """True between a committed FAILURE and the committed repair."""
         return self.maintenance_since is not None
 
-    def lifecycle_wear_path(self, lifecycle_id: int) -> tuple[LifecycleParams, np.ndarray]:
-        """Parameters and per-pulse wear of ``lifecycle_id``; re-derivable at any time."""
-        config = self._config
-        params = derive_lifecycle(config.seed, self.engine_id, lifecycle_id, config.mean_life_cycles)
-        rng = np.random.default_rng(stable_seed(config.seed, self.engine_id, lifecycle_id, "wear"))
-        return params, wear_trajectory(params, config.pulses_per_cycle, rng)
+    def lifecycle_wear_path(
+        self, lifecycle_id: int, settings: GenerationSettings | None = None
+    ) -> tuple[LifecycleParams, np.ndarray]:
+        """Parameters and per-pulse wear of ``lifecycle_id`` under ``settings`` (default: current SIM_*)."""
+        settings = settings or self._config.generation
+        params = derive_lifecycle(settings.seed, self.engine_id, lifecycle_id, settings.mean_life_cycles)
+        rng = np.random.default_rng(stable_seed(settings.seed, self.engine_id, lifecycle_id, "wear"))
+        return params, wear_trajectory(params, settings.pulses_per_cycle, rng)
 
     def lifecycle_lengths(self, count: int) -> list[int]:
         """Pulse counts (failure pulse included) of the current lifecycle and the ``count - 1`` after it."""
-        return [len(self.lifecycle_wear_path(self.lifecycle_id + offset)[1]) for offset in range(count)]
+        later = [len(self.lifecycle_wear_path(self.lifecycle_id + offset)[1]) for offset in range(1, count)]
+        return [len(self.wear_path), *later][:count]
 
-    def _load_lifecycle(self, lifecycle_id: int, pulse_index: int) -> None:
-        self.lifecycle, self.wear_path = self.lifecycle_wear_path(lifecycle_id)
+    def _load_lifecycle(self, lifecycle_id: int, pulse_index: int, settings: GenerationSettings) -> None:
+        self.settings = settings
+        self.lifecycle, self.wear_path = self.lifecycle_wear_path(lifecycle_id, settings)
         self.pulse_index = pulse_index
         # Seeding noise by the start pulse gives a resumed run its own reproducible stream.
-        noise_seed = stable_seed(self._config.seed, self.engine_id, lifecycle_id, "noise", pulse_index)
+        noise_seed = stable_seed(settings.seed, self.engine_id, lifecycle_id, "noise", pulse_index)
         self._rng = np.random.default_rng(noise_seed)
         self._theta = 1.0
 
@@ -331,7 +338,7 @@ class EngineSimulator:
             # The wall clock stepped back: keep (engine_id, event_ts) unique and increasing.
             event_ts = self.last_event_ts + MIN_EVENT_GAP
         index = min(self.pulse_index, len(self.wear_path) - 1)
-        wear = max(float(self.wear_path[index]), self._wear_floor)
+        wear = float(self.wear_path[index])
         self._theta = next_operating_condition(self._theta, self._rng)
         readings = sensor_readings(
             self.profile.baseline, self.lifecycle.sensitivity, wear, self._theta, self._rng
@@ -339,7 +346,7 @@ class EngineSimulator:
         return Pulse(
             engine_id=self.engine_id,
             lifecycle_id=self.lifecycle_id,
-            cycle_number=max(index // self._config.pulses_per_cycle, self._cycle_floor),
+            cycle_number=index // self.settings.pulses_per_cycle,
             pulse_index=self.pulse_index,
             event_ts=event_ts,
             wear_factor=wear,
@@ -371,16 +378,15 @@ class EngineSimulator:
         self.maintenance_action = FAILURE_MODES[failure_mode].maintenance_action
 
     def start_next_lifecycle(self, completion: MaintenanceCompletion) -> None:
-        """Apply a committed repair: w = 0 with fresh lifecycle parameters, status MAINTENANCE_RESET."""
+        """Apply a committed repair: w = 0 with fresh lifecycle parameters drawn under the current SIM_*
+        values, status MAINTENANCE_RESET."""
         if completion.lifecycle_id != self.lifecycle_id:
             raise ValueError(f"{self.engine_id}: repair belongs to lifecycle {completion.lifecycle_id}")
-        self._load_lifecycle(completion.next_lifecycle_id, 0)
+        self._load_lifecycle(completion.next_lifecycle_id, 0, self._config.generation)
         self.status = MAINTENANCE_RESET
         self.current_cycle = 0
         self.wear_factor = 0.0
         self.maintenance_since = None
-        self._wear_floor = 0.0
-        self._cycle_floor = 0
 
     def describe(self) -> str:
         """One-line state summary for logs."""
@@ -389,23 +395,9 @@ class EngineSimulator:
         return f"{self.engine_id} {state}{repair}"
 
 
-def _positive_int(raw: str) -> int:
-    value = int(raw)
-    if value < 1:
-        raise argparse.ArgumentTypeError("must be >= 1")
-    return value
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Command line: ``[--max-ticks N] [--no-backfill]``."""
-    parser = argparse.ArgumentParser(description="Jet-engine fleet telemetry simulator (PostgreSQL edge DB).")
-    parser.add_argument("--max-ticks", type=_positive_int, help="stop after N live ticks (smoke tests)")
-    parser.add_argument("--no-backfill", action="store_true", help="never backfill history into an empty DB")
-    return parser.parse_args(argv)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the simulator. Exit codes: 0 clean shutdown, 1 fatal error, 2 invalid configuration."""
+    """Run the simulator. Exit codes: 0 clean shutdown, 1 fatal error, 2 invalid configuration or refusal
+    to write (another simulator holds the writer lock, or stored lifecycles contradict the SIM_* values)."""
     args = parse_args(argv)
     import fleet_db  # deferred so that the physics above stays importable without psycopg2
 
@@ -428,6 +420,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             store, config, factory, models, allow_backfill=not args.no_backfill, stop_event=stop_event
         )
         FleetRunner(engines, store, config, stop_event).run(args.max_ticks)
+    except (WriterLockError, ResumeMismatchError) as exc:
+        logger.error("Refusing to write: %s", exc)
+        return 2
     except fleet_db.DatabaseConnectionError as exc:
         if stop_event.is_set():
             logger.info("Shutdown requested while PostgreSQL was unavailable")

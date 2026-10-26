@@ -1,9 +1,10 @@
 """Fleet runtime of the simulator: registry and work-order bookkeeping plus the drift-free live loop.
 
 Every live tick becomes ONE database transaction (executed by fleet_db) that holds, in order: the repairs
-that became due, one pulse per operating engine, FAILURE events, then registry updates. Engines are
-duck-typed ``engine_generator.EngineSimulator`` objects, so this module never imports engine_generator at
-runtime (that would load the entry-point script a second time).
+that became due, the generation settings of lifecycles whose first pulse this is, one pulse per operating
+engine, FAILURE events, then registry updates. Engines are duck-typed ``engine_generator.EngineSimulator``
+objects, so this module never imports engine_generator at runtime (that would load the entry-point script
+a second time).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from engine_generator import EngineSimulator, Pulse
-    from fleet_bootstrap import SimulatorConfig
+    from fleet_config import GenerationSettings, SimulatorConfig
     from fleet_db import FleetDatabase
 
 logger = logging.getLogger("fleet_runtime")
@@ -29,6 +30,15 @@ WriteOp = tuple[str, Any]
 """One database write as (fleet_db writer method, payload); a list of them runs in ONE transaction."""
 
 HEARTBEAT_SECONDS = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleSettings:
+    """Generation settings of one lifecycle, stored with its first pulse (simulator_lifecycle_params)."""
+
+    engine_id: str
+    lifecycle_id: int
+    settings: GenerationSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +83,11 @@ class MaintenanceCompletion:
     def downtime_seconds(self) -> int:
         """Whole seconds between failure and repair completion."""
         return max(0, round((self.completed_ts - self.failure_ts).total_seconds()))
+
+
+def lifecycle_settings(engine: EngineSimulator) -> LifecycleSettings:
+    """Settings record of the engine's current lifecycle (written with that lifecycle's first pulse)."""
+    return LifecycleSettings(engine.engine_id, engine.lifecycle_id, engine.settings)
 
 
 def registry_update(
@@ -149,6 +164,9 @@ def build_tick_ops(
 ) -> tuple[list[WriteOp], dict[str, int]]:
     """Ordered writes of one live tick and, per failing engine, the index of its record_failure op."""
     ops: list[WriteOp] = [("complete_maintenance", completion) for _, completion in completions]
+    ops += [
+        ("record_settings", lifecycle_settings(engine)) for engine, pulse in pulses if pulse.pulse_index == 0
+    ]
     regular = [pulse for _, pulse in pulses if not pulse.is_failure]
     if regular:
         ops.append(("insert_pulses", regular))
