@@ -304,6 +304,8 @@ services:
       minio-init:
         condition: service_completed_successfully
     command: ["python", "orchestration/pipeline_runner.py", "loop"]
+    # tini as PID 1 reaps grandchildren of the dbt/ML subprocesses.
+    init: true
     environment:
       <<: [*clickhouse-env, *s3-env]
       DBT_PROJECT_DIR: /app/analytics
@@ -320,6 +322,13 @@ services:
       MODEL_PROMOTION_POLICY: ${MODEL_PROMOTION_POLICY:-better}
       ML_ARTIFACT_PREFIX: ${ML_ARTIFACT_PREFIX:-ml-artifacts/rul_model}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      # The scheduler rewrites its heartbeat at least every 10 s, even mid-task.
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/pipeline_runner.heartbeat -mmin -2 2>/dev/null)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
     stop_grace_period: 30s
     restart: unless-stopped
     logging: *default-logging
