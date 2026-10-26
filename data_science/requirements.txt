@@ -4,8 +4,11 @@
 dbt-core==1.12.6
 dbt-clickhouse==1.10.3
 clickhouse-connect==1.11.0
-xgboost==3.4.1
+# CPU-only build of xgboost 3.4.1 (same API and import name, without the ~345 MB CUDA/NCCL wheel)
+xgboost-cpu==3.4.1
 scikit-learn==1.9.1
+# imported directly by failure_classifier.py; the version scikit-learn 1.9.1 resolves to
+scipy==1.18.1
 pandas==3.1.0
 numpy==2.5.4
 pyarrow==26.0.0

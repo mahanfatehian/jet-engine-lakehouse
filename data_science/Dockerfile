@@ -26,12 +26,14 @@ RUN apt-get update \
 
 # Dependencies first so code edits do not invalidate the (large) wheel layer.
 COPY data_science/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+# Retries and a generous timeout keep slow or flaky package-index links from failing the build.
+RUN pip install --no-cache-dir --retries 10 --timeout 120 -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 RUN groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /home/app \
-        --create-home --shell /usr/sbin/nologin app
+        --create-home --shell /usr/sbin/nologin app \
+    && install -d -o app -g app -m 0775 /locks
 
 # The job shares CPUs with Spark, ClickHouse and the simulator. Busy-waiting OpenMP
 # workers (xgboost, scikit-learn) stall badly on a contended host, so idle workers
