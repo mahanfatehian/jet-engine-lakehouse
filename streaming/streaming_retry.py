@@ -19,9 +19,18 @@ T = TypeVar("T")
 WaitFn = Callable[[float], bool]
 """Sleeps up to the given seconds; returns True when shutdown was requested meanwhile."""
 
+# Far beyond any cap; bounds the arithmetic for an operation that keeps failing for weeks.
+_MAX_BACKOFF_EXPONENT = 32
+
 
 class RetryAbortedError(RuntimeError):
     """Raised when shutdown is requested while waiting for the next attempt."""
+
+
+def capped_backoff(failures: int, base_delay_s: float, max_delay_s: float) -> float:
+    """Wait after ``failures`` consecutive failures: ``base_delay_s * 2**(failures - 1)``, capped."""
+    exponent = min(max(failures, 1) - 1, _MAX_BACKOFF_EXPONENT)
+    return min(base_delay_s * 2**exponent, max_delay_s)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +49,10 @@ class RetryPolicy:
 
     def delays(self) -> tuple[float, ...]:
         """Waits between consecutive attempts (one fewer than ``attempts``)."""
-        return tuple(min(self.base_delay_s * 2**n, self.max_delay_s) for n in range(self.attempts - 1))
+        return tuple(
+            capped_backoff(failures, self.base_delay_s, self.max_delay_s)
+            for failures in range(1, self.attempts)
+        )
 
 
 def call_with_retry(

@@ -1,25 +1,25 @@
-"""Startup readiness probes for ClickHouse, MinIO and Kafka.
+"""Readiness probes of the job's dependencies, checked per query group by the supervisor.
 
-Starting the queries before their dependencies accept connections would only fail the
-first micro-batch and crash-loop the container, so the job waits with a bounded backoff
-and gives up with a clear error when a dependency never comes up.
+The lake queries need Kafka and MinIO; ``clickhouse_raw`` needs Kafka and ClickHouse (its
+tables are checked by ``clickhouse_sink.ClickHouseTarget``). Starting a query before its
+dependencies answer would only fail its first micro-batch, so the supervisor runs these
+checks before every (re)start. Each check makes one bounded attempt: retrying with backoff
+is the supervisor's job, which keeps an unavailable dependency from delaying the queries
+that do not need it.
 """
 
 from __future__ import annotations
 
-import logging
 import socket
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from streaming_config import StreamingSettings
-from streaming_retry import RetryPolicy, WaitFn, call_with_retry
 
-logger = logging.getLogger(__name__)
-
-READINESS_POLICY = RetryPolicy(attempts=12, base_delay_s=1.0, max_delay_s=15.0)  # ~2.4 min of waiting
-PROBE_TIMEOUT_S = 5.0
+# Short enough that a supervisor round, which may probe three endpoints, stays well inside
+# the heartbeat interval even when every endpoint hangs.
+PROBE_TIMEOUT_S = 3.0
 
 # Probes target in-network endpoints: an HTTP(S)_PROXY from the environment must not apply.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -55,21 +55,30 @@ def probe_tcp(bootstrap_servers: str, timeout_s: float = PROBE_TIMEOUT_S) -> Non
     raise DependencyNotReadyError("no Kafka bootstrap server is reachable (" + "; ".join(failures) + ")")
 
 
-def wait_for_dependencies(
-    settings: StreamingSettings, wait: WaitFn, policy: RetryPolicy = READINESS_POLICY
-) -> None:
-    """Block until ClickHouse, MinIO and Kafka answer, or raise once ``policy`` is exhausted."""
-    probes: tuple[tuple[str, Callable[[], None]], ...] = (
-        ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
-        ("MinIO", lambda: probe_http(settings.s3_health_url)),
-        ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
-    )
-    for name, probe in probes:
-        call_with_retry(
-            probe,
-            policy=policy,
-            is_retryable=lambda exc: isinstance(exc, DependencyNotReadyError),
-            description=f"readiness probe of {name}",
-            wait=wait,
+def check_lake_dependencies(settings: StreamingSettings) -> None:
+    """Raise :class:`DependencyNotReadyError` unless Kafka and MinIO answer (Path A)."""
+    _check(
+        (
+            ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
+            ("MinIO", lambda: probe_http(settings.s3_health_url)),
         )
-        logger.info("%s is reachable", name)
+    )
+
+
+def check_clickhouse_dependencies(settings: StreamingSettings) -> None:
+    """Raise :class:`DependencyNotReadyError` unless Kafka and ClickHouse answer (Path B)."""
+    _check(
+        (
+            ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
+            ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
+        )
+    )
+
+
+def _check(probes: Sequence[tuple[str, Callable[[], None]]]) -> None:
+    """Run the probes in order; the error names the first dependency that did not answer."""
+    for name, probe in probes:
+        try:
+            probe()
+        except DependencyNotReadyError as exc:
+            raise DependencyNotReadyError(f"{name}: {exc}") from exc

@@ -80,9 +80,11 @@ def bronze_records(records: DataFrame) -> DataFrame:
     """Raw Kafka records plus ``cdc_op``/``cdc_source_ts_ms`` and the UTC ingestion date.
 
     Every record is kept verbatim, tombstones and malformed values included: bronze is
-    the replayable system of record. In a streaming query ``current_date`` resolves to the
-    micro-batch timestamp stored in the checkpoint, so a replayed batch lands in the same
-    ``ingest_date`` partition.
+    the replayable system of record of everything Kafka delivered (a gap left by the topic
+    retention fails the query, see KAFKA_FAIL_ON_DATA_LOSS). Readers that bypass
+    ``_spark_metadata`` deduplicate by (kafka_topic, kafka_partition, kafka_offset). In a
+    streaming query ``current_date`` resolves to the micro-batch timestamp stored in the
+    checkpoint, so a replayed batch lands in the same ``ingest_date`` partition.
     """
     envelope = sf.from_json(sf.col("kafka_value"), _BRONZE_ENVELOPE)
     return records.select(
@@ -129,7 +131,9 @@ def silver_records(parsed: DataFrame, table: TableSpec) -> DataFrame:
     """Usable records: the raw ClickHouse columns + ``processed_at`` + ``event_date``.
 
     Append-only: deletes are kept as rows with ``is_deleted`` = 1 and readers keep the
-    highest ``cdc_lsn`` per primary key. ``processed_at`` is the micro-batch timestamp.
+    row with the highest ``cdc_lsn`` per primary key (argMax or row_number, which also drops
+    the exact copies a crash can leave for readers that bypass ``_spark_metadata``).
+    ``processed_at`` is the micro-batch timestamp.
     """
     return parsed.where(sf.col(PARSE_ERROR_COLUMN).isNull()).select(
         *table.clickhouse_columns,

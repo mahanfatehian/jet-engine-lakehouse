@@ -1,8 +1,22 @@
 """Environment configuration of the streaming job (contract section 2).
 
 Variable names and non-network defaults follow the contract. Network endpoints default to
-the host-published ports on ``localhost`` so the job also runs outside Docker with no
-environment set; docker compose always injects the in-network service addresses.
+the host-published ports on ``localhost`` so that the module (and its unit tests) work with
+no environment set; docker compose always injects the in-network service addresses.
+
+The job itself runs in its image (compose service ``streaming``, ``make stream``): the
+image bakes the Kafka source and S3A jars (spark-sql-kafka-0-10 with its Kafka client
+dependencies, hadoop-aws, aws-java-sdk-bundle) into ``pyspark/jars`` and creates the
+default ``CHECKPOINT_DIR``. A pip-installed PySpark has none of these jars, so a plain host
+run fails with "Failed to find data source: kafka" or a missing S3AFileSystem class. A host
+run additionally needs Java 17, the jars resolved at startup, for example::
+
+    PKGS=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.apache.hadoop:hadoop-aws:3.3.4
+    PYSPARK_SUBMIT_ARGS="--packages $PKGS pyspark-shell" python spark_kafka_to_lakehouse.py
+
+a writable ``CHECKPOINT_DIR`` (plus winutils on Windows), and the ``streaming`` container
+stopped (or another ``LAKEHOUSE_BUCKET``): a second checkpoint lineage writing the same
+file-sink paths makes Spark skip batch ids it believes are already committed.
 """
 
 from __future__ import annotations
@@ -16,6 +30,8 @@ from urllib.parse import urlparse
 SPARK_LOG_LEVELS = frozenset({"ALL", "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"})
 PYTHON_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 SHUFFLE_PARTITIONS = 4
+_TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 _JVM_MEMORY = re.compile(r"^[1-9]\d*[kmgt]$", re.IGNORECASE)
 _S3A_CREDENTIALS_PROVIDER = "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
 
@@ -32,6 +48,9 @@ class StreamingSettings:
     cdc_topic_prefix: str
     kafka_starting_offsets: str
     max_offsets_per_trigger: int
+    # True: a query whose unread offsets were deleted by the topic retention fails instead of
+    # silently skipping them (Spark's ``failOnDataLoss``).
+    kafka_fail_on_data_loss: bool
     s3_endpoint_url: str
     aws_access_key_id: str
     aws_secret_access_key: str = field(repr=False)
@@ -43,6 +62,7 @@ class StreamingSettings:
     clickhouse_password: str = field(repr=False)
     clickhouse_db: str
     checkpoint_dir: str
+    heartbeat_file: str
     lake_trigger_seconds: float
     clickhouse_trigger_seconds: float
     spark_driver_memory: str
@@ -79,6 +99,7 @@ def load_settings(env: Mapping[str, str]) -> StreamingSettings:
         cdc_topic_prefix=_text(env, "CDC_TOPIC_PREFIX", "engine_cdc"),
         kafka_starting_offsets=_text(env, "KAFKA_STARTING_OFFSETS", "earliest"),
         max_offsets_per_trigger=_positive_int(env, "MAX_OFFSETS_PER_TRIGGER", 20000),
+        kafka_fail_on_data_loss=_boolean(env, "KAFKA_FAIL_ON_DATA_LOSS", True),
         s3_endpoint_url=_http_url(env, "S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=_text(env, "AWS_ACCESS_KEY_ID", "minioadmin"),
         aws_secret_access_key=_secret(env, "AWS_SECRET_ACCESS_KEY", "minioadmin"),
@@ -90,6 +111,7 @@ def load_settings(env: Mapping[str, str]) -> StreamingSettings:
         clickhouse_password=_secret(env, "CLICKHOUSE_PASSWORD", "clickhouse"),
         clickhouse_db=_text(env, "CLICKHOUSE_DB", "iot_engine"),
         checkpoint_dir=_text(env, "CHECKPOINT_DIR", "/opt/spark-checkpoints"),
+        heartbeat_file=_text(env, "STREAMING_HEARTBEAT_FILE", "/tmp/streaming.heartbeat"),
         lake_trigger_seconds=_positive_float(env, "LAKE_TRIGGER_SECONDS", 60.0),
         clickhouse_trigger_seconds=_positive_float(env, "CLICKHOUSE_TRIGGER_SECONDS", 5.0),
         spark_driver_memory=_jvm_memory(env, "SPARK_DRIVER_MEMORY", "2g"),
@@ -166,6 +188,15 @@ def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
     if not (math.isfinite(value) and value > 0):
         raise ConfigError(f"{name} must be a finite number > 0, got {raw!r}")
     return value
+
+
+def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
+    value = _raw(env, name, str(default)).lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ConfigError(f"{name} must be true or false, got {value!r}")
 
 
 def _choice(env: Mapping[str, str], name: str, default: str, allowed: frozenset[str]) -> str:
