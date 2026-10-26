@@ -16,6 +16,7 @@ from pipeline_config import RunnerSettings
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_SKIPPED = 3  # contract: "skipped: preconditions not met", never a crash
+EXIT_LOCK_TIMEOUT = 75  # sysexits EX_TEMPFAIL: another run held the task's lock for too long
 EXIT_TIMEOUT = 124  # same convention as coreutils `timeout`
 EXIT_SPAWN_FAILED = 127  # shell convention for "command not found / not executable"
 
@@ -25,6 +26,7 @@ class TaskName(StrEnum):
 
     DBT_RUN = "dbt-run"
     DBT_TEST = "dbt-test"
+    DBT_BUILD = "dbt-build"
     SNAPSHOT = "snapshot"
     TRAIN = "train"
     PREDICT = "predict"
@@ -47,10 +49,21 @@ ONCE_SEQUENCE: tuple[TaskName, ...] = (
     TaskName.TRAIN,
     TaskName.PREDICT,
 )
+# Tasks that must not consume dbt output whose tests failed: training would learn from it
+# (and could promote the result), a snapshot would publish it as the newest lake dataset.
+# Prediction keeps serving the existing production model.
+GATED_BY_DBT_TESTS: frozenset[TaskName] = frozenset({TaskName.TRAIN, TaskName.SNAPSHOT})
+
+DBT_SUBCOMMANDS: dict[TaskName, str] = {
+    TaskName.DBT_RUN: "run",
+    TaskName.DBT_TEST: "test",
+    TaskName.DBT_BUILD: "build",
+}
 
 TASK_TIMEOUT_SECONDS: dict[TaskName, float] = {
     TaskName.DBT_RUN: 15 * 60,
     TaskName.DBT_TEST: 15 * 60,
+    TaskName.DBT_BUILD: 30 * 60,
     TaskName.SNAPSHOT: 10 * 60,
     TaskName.TRAIN: 30 * 60,
     TaskName.PREDICT: 5 * 60,
@@ -109,32 +122,39 @@ def expand_task(name: str) -> tuple[TaskName, ...]:
     return (TaskName(name),)
 
 
-def build_task_spec(task: TaskName, settings: RunnerSettings, *, loop_mode: bool = False) -> TaskSpec:
+def build_task_spec(
+    task: TaskName,
+    settings: RunnerSettings,
+    *,
+    loop_mode: bool = False,
+    extra_args: Sequence[str] = (),
+) -> TaskSpec:
     """Build the command line of ``task``.
 
     ``loop_mode`` adds ``--skip-if-unchanged`` to training, so the scheduled retraining is a
     cheap no-op (exit 3) while no new lifecycle has completed since the last run.
+    ``extra_args`` are appended verbatim (``task train -- --promotion-policy always``).
     """
     timeout = TASK_TIMEOUT_SECONDS[task]
-    if task in (TaskName.DBT_RUN, TaskName.DBT_TEST):
-        dbt_command = "run" if task is TaskName.DBT_RUN else "test"
+    if task in DBT_SUBCOMMANDS:
         argv = (
             settings.dbt_executable,
-            dbt_command,
+            DBT_SUBCOMMANDS[task],
             "--project-dir",
             str(settings.dbt_project_dir),
             "--profiles-dir",
             str(settings.dbt_profiles_dir),
+            *extra_args,
         )
         # dbt resolves target/ and logs/ against the working directory in some versions.
         return TaskSpec(task, argv, settings.dbt_project_dir, timeout, DBT_ENV_DEFAULTS)
     if task is TaskName.SNAPSHOT:
-        argv = _data_science_command(settings, "feature_pipeline.py", "snapshot")
+        argv = _data_science_command(settings, "feature_pipeline.py", "snapshot", *extra_args)
     elif task is TaskName.TRAIN:
-        extra = ("--skip-if-unchanged",) if loop_mode else ()
-        argv = _data_science_command(settings, "train_rul_model.py", *extra)
+        skip = ("--skip-if-unchanged",) if loop_mode else ()
+        argv = _data_science_command(settings, "train_rul_model.py", *skip, *extra_args)
     else:
-        argv = _data_science_command(settings, "predict_rul.py", "--mode", "batch")
+        argv = _data_science_command(settings, "predict_rul.py", "--mode", "batch", *extra_args)
     return TaskSpec(task, argv, settings.repo_root, timeout)
 
 

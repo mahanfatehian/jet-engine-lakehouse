@@ -1,7 +1,10 @@
 """Settings of the pipeline runner, read from environment variables (contract section 2).
 
 Paths default to locations relative to this file, so the runner works unchanged inside
-the data-platform image (repository root = /app) and from a checkout on a host.
+the data-platform image (repository root = /app) and from a checkout on a host. Two
+runner-only variables complement the contract: PIPELINE_LOCK_DIR (where the cross-process
+task locks live) and PIPELINE_GATE_ON_DBT_TESTS (whether failed dbt tests block training
+and lake snapshots).
 """
 
 from __future__ import annotations
@@ -9,8 +12,9 @@ from __future__ import annotations
 import math
 import shutil
 import sys
+import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # port so the runner also works from a host shell with no environment configured.
 DEFAULT_CLICKHOUSE_HOST = "localhost"
 DEFAULT_CLICKHOUSE_PORT = 8123
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 class ConfigError(ValueError):
@@ -35,6 +42,11 @@ class ScheduleIntervals:
     train_seconds: float = 1800.0
 
 
+def default_lock_dir() -> Path:
+    """Lock directory when PIPELINE_LOCK_DIR is unset: the temp dir (``/tmp`` in the container)."""
+    return Path(tempfile.gettempdir())
+
+
 @dataclass(frozen=True)
 class RunnerSettings:
     """Everything the runner needs to build task commands and to probe ClickHouse."""
@@ -47,6 +59,8 @@ class RunnerSettings:
     intervals: ScheduleIntervals
     python_executable: str
     dbt_executable: str
+    lock_dir: Path = field(default_factory=default_lock_dir)
+    gate_on_dbt_tests: bool = True
 
     @property
     def clickhouse_ping_url(self) -> str:
@@ -81,6 +95,8 @@ def load_settings(
         intervals=intervals,
         python_executable=python_executable,
         dbt_executable=resolve_dbt_executable(python_executable),
+        lock_dir=_directory(env, "PIPELINE_LOCK_DIR", repo_root, default_lock_dir()),
+        gate_on_dbt_tests=_flag(env, "PIPELINE_GATE_ON_DBT_TESTS", default=True),
     )
 
 
@@ -125,6 +141,17 @@ def _port(env: Mapping[str, str], name: str, default: int) -> int:
     if not 0 < port < 65536:
         raise ConfigError(f"{name} must be between 1 and 65535, got {raw!r}")
     return port
+
+
+def _flag(env: Mapping[str, str], name: str, *, default: bool) -> bool:
+    raw = _value(env, name)
+    if raw is None:
+        return default
+    if raw.lower() in _TRUE_VALUES:
+        return True
+    if raw.lower() in _FALSE_VALUES:
+        return False
+    raise ConfigError(f"{name} must be true or false (also 1/0, yes/no, on/off), got {raw!r}")
 
 
 def _directory(env: Mapping[str, str], name: str, repo_root: Path, default: Path) -> Path:
