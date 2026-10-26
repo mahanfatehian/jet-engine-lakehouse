@@ -1,0 +1,73 @@
+version: 2
+
+models:
+  - name: int_engine_lifecycles
+    description: >
+      One row per engine lifecycle (run from a repair to the next failure). has_failed turns 1
+      once the lifecycle's FAILURE pulse has landed; failure_cycle and failure_ts stay NULL while
+      the engine is still running. failure_mode comes from the lifecycle's maintenance work order
+      (NULL until it lands). Table (rebuilt every run) on ReplacingMergeTree ordered by
+      (engine_id, lifecycle_id).
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'lifecycle_id']
+      - expression_is_true:
+          name: int_engine_lifecycles_bounds_consistent
+          arguments:
+            expression: >
+              has_failed = isNotNull(failure_cycle)
+              and last_cycle >= first_cycle
+              and lifecycle_end_ts >= lifecycle_start_ts
+              and (failure_cycle is null or failure_cycle between first_cycle and last_cycle)
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle of the engine.
+      - name: lifecycle_start_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: event_ts of the first pulse.
+      - name: lifecycle_end_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: event_ts of the last pulse seen so far.
+      - name: first_cycle
+        data_type: UInt32
+        description: First cycle number of the lifecycle.
+      - name: last_cycle
+        data_type: UInt32
+        description: Last cycle number seen so far.
+      - name: has_failed
+        data_type: UInt8
+        description: 1 when the lifecycle has a FAILURE pulse (completed lifecycle).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: failure_cycle
+        data_type: Nullable(UInt32)
+        description: Cycle of the FAILURE pulse; NULL while the lifecycle is running.
+      - name: failure_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: event_ts of the FAILURE pulse; NULL while the lifecycle is running.
+      - name: lifecycle_length_cycles
+        data_type: UInt32
+        description: Cycles from the first cycle to the failure cycle (completed) or to the last cycle seen (running).
+      - name: telemetry_rows
+        data_type: UInt64
+        description: Number of live pulses in the lifecycle.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: maintenance_id
+        data_type: Nullable(UInt64)
+        description: Work order opened at the failure (NULL until it lands).
+      - name: failure_mode
+        data_type: Nullable(String)
+        description: Failure mode of the work order (NULL until it lands).
+      - name: maintenance_status
+        data_type: Nullable(String)
+        description: OPEN or COMPLETED status of the work order.
