@@ -1,0 +1,17 @@
+# Normalise line endings: shell scripts, SQL and Makefiles are executed inside
+# Linux containers and break with CRLF, regardless of the host's core.autocrlf.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.sql       text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+Makefile    text eol=lf
+Dockerfile  text eol=lf
+
+*.parquet   binary
+*.joblib    binary
+*.png       binary

@@ -1,0 +1,19 @@
+[project]
+name = "iot-engine-data"
+version = "1.0.0"
+description = "IoT jet engine telemetry lakehouse and predictive maintenance platform"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["analytics/target", "analytics/dbt_packages"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "N", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["simulator", "streaming", "data_science", "orchestration"]
+addopts = "-q --import-mode=importlib"

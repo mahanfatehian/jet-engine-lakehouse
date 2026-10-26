@@ -87,3 +87,18 @@ $RECYCLE.BIN/
 .project
 .classpath
 .settings/
+
+# ==========================================
+# 7. Tooling Caches & Local Runtime Artifacts
+# ==========================================
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+# dbt writes an anonymous user id next to profiles.yml
+analytics/.user.yml
+# Spark local-mode metastore/warehouse when jobs run outside Docker
+spark-warehouse/
+metastore_db/
+derby.log
+# Model artifacts belong in MinIO (s3://lakehouse/ml-artifacts/), not in git
+*.joblib
