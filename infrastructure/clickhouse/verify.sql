@@ -4,14 +4,17 @@
 -- `make verify` (or `make verify-clickhouse`) pipes this file into
 --     clickhouse-client --database $CLICKHOUSE_DB --multiquery --ignore-error
 -- inside the clickhouse container. --ignore-error keeps going after a failing
--- statement: dbt models do not exist before the first dbt run, so their
--- UNKNOWN_TABLE errors are printed inline while every other section still runs
--- (the client exit status stays 0; read the summary at the end).
+-- statement, so every section prints even on a half-built stack (dbt models do
+-- not exist before the first dbt run: their UNKNOWN_TABLE errors appear inline).
+-- The client's exit status ignores such errors, so the Makefile reads the output
+-- instead: the target fails when any statement raised an error, when a summary
+-- line starts with FAIL, or when the report never reached its last line. WARN
+-- lines are expected while the stack warms up and never fail it.
 --
 -- Only contract-defined tables and columns are referenced (table names are
--- unqualified, like init-db.sql). dbt models are only count()ed: their columns
--- belong to the dbt project. `SETTINGS final = 1` deduplicates replacing tables
--- and is a no-op for views and plain MergeTree tables.
+-- unqualified, like init-db.sql). dbt models are only count()ed and checked for
+-- existence: their columns belong to the dbt project. `SETTINGS final = 1`
+-- deduplicates replacing tables and is a no-op for views and plain MergeTree tables.
 -- =============================================================================
 
 SET default_format = 'PrettyCompactMonoBlock', output_format_pretty_row_numbers = 0;
@@ -140,6 +143,10 @@ SELECT 'mart_rul_training_features' AS model, count() AS row_count
 FROM mart_rul_training_features SETTINGS final = 1;
 SELECT 'fct_engine_health_status' AS model, count() AS row_count
 FROM fct_engine_health_status SETTINGS final = 1;
+SELECT 'fct_rul_prediction_backtest' AS model, count() AS row_count
+FROM fct_rul_prediction_backtest SETTINGS final = 1;
+SELECT 'rpt_model_live_performance' AS model, count() AS row_count
+FROM rpt_model_live_performance SETTINGS final = 1;
 
 SELECT '\n== 9. RUL model training runs ==' FORMAT TSVRaw;
 SELECT
@@ -209,8 +216,9 @@ SELECT
 FROM v_engine_rul_latest
 ORDER BY engine_id;
 
-SELECT '\n== 11. Summary (OK / WARN / FAIL) ==' FORMAT TSVRaw;
-SELECT check_name, status, detail
+SELECT '\n== 11. Summary (OK / WARN / FAIL; make verify fails on FAIL and on any error above) ==' FORMAT TSVRaw;
+-- One line per check, status first, so the Makefile can match `^FAIL ` exactly.
+SELECT concat(rightPad(status, 6, ' '), rightPad(check_name, 74, ' '), detail)
 FROM
 (
     SELECT
@@ -255,5 +263,24 @@ FROM
         if(maxOrNull(predicted_at) >= now64(3) - INTERVAL 10 MINUTE, 'OK', 'WARN'),
         concat('last prediction ', ifNull(toString(maxOrNull(predicted_at)), 'never'))
     FROM gold_engine_rul_predictions
+    UNION ALL
+    SELECT
+        7,
+        'dbt silver/gold models built',
+        if(empty(missing), 'OK', 'FAIL'),
+        if(empty(missing), 'all 4 checked models exist', concat('missing: ', arrayStringConcat(missing, ', ')))
+    FROM
+    (
+        SELECT arrayFilter(
+            model -> NOT has(built, model),
+            ['stg_engine_telemetry', 'int_sensor_rolling_features',
+             'mart_rul_training_features', 'fct_engine_health_status']
+        ) AS missing
+        FROM (SELECT groupArray(name) AS built FROM system.tables WHERE database = currentDatabase())
+    )
 )
-ORDER BY ord;
+ORDER BY ord
+FORMAT TSVRaw;
+
+-- Must stay the last statement: the Makefile fails the report when this line is missing.
+SELECT '== verify.sql completed ==' FORMAT TSVRaw;
