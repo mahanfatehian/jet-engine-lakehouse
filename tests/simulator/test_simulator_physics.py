@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import engine_generator as eg
 import numpy as np
 import pytest
-from fleet_bootstrap import SimulatorConfig
+from fleet_config import SimulatorConfig
 from fleet_runtime import completion_at
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)

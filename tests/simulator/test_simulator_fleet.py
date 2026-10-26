@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import itertools
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import engine_generator as eg
 import pytest
-from fleet_bootstrap import SimulatorConfig, backfill_fleet, bootstrap_fleet, restore_engine
-from fleet_runtime import FleetRunner, build_tick_ops, completion_at, registry_update
+from fleet_bootstrap import backfill_fleet, bootstrap_fleet, restore_engine
+from fleet_config import GenerationSettings, SimulatorConfig
+from fleet_runtime import FleetRunner, LifecycleSettings, build_tick_ops, completion_at, registry_update
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 SMALL = SimulatorConfig(
@@ -26,13 +28,17 @@ STATUS_ORDER = {"HEALTHY": 0, "WARNING": 1, "CRITICAL": 2, "FAILURE": 3}
 
 
 class FakeStore:
-    """In-memory stand-in for fleet_db.FleetDatabase that records every transaction."""
+    """In-memory stand-in for fleet_db.FleetDatabase that records every transaction.
 
-    def __init__(self, *, telemetry_empty: bool = True) -> None:
+    ``with_telemetry`` names the engines whose snapshot shows earlier telemetry (all others are fresh).
+    """
+
+    def __init__(self, *, with_telemetry: tuple[str, ...] = ()) -> None:
         self.transactions: list[list[tuple[str, Any]]] = []
         self.drop_next = False
-        self.telemetry_empty = telemetry_empty
+        self.with_telemetry = with_telemetry
         self.registered: dict[str, str] = {}
+        self.schema_checks = 0
         self._work_orders = 0
 
     def execute(self, ops: list[tuple[str, Any]]) -> list[Any] | None:
@@ -54,14 +60,19 @@ class FakeStore:
         assert results is not None
         return results
 
+    def ensure_schema(self) -> None:
+        self.schema_checks += 1
+
     def register_engines(self, engine_models: dict[str, str]) -> int:
         self.registered = dict(engine_models)
         return len(engine_models)
 
-    def telemetry_is_empty(self) -> bool:
-        return self.telemetry_empty
-
     def load_snapshot(self, engine_id: str) -> SimpleNamespace:
+        if engine_id in self.with_telemetry:
+            # Previous lifecycle failed and was repaired; the current one has no pulse yet.
+            return snapshot(
+                engine_id, lifecycle_id=2, operational_status="MAINTENANCE_RESET", last_event_ts=T0
+            )
         return snapshot(engine_id)
 
     def ops(self, name: str) -> list[Any]:
@@ -84,6 +95,7 @@ def snapshot(engine_id: str, **overrides: Any) -> SimpleNamespace:
         "last_cycle_number": None,
         "last_wear_factor": None,
         "last_event_ts": None,
+        "settings": None,
         "work_order": None,
     }
     return SimpleNamespace(**(fields | overrides))
@@ -169,9 +181,12 @@ def test_tick_ops_put_repairs_first_and_record_failures_in_the_same_transaction(
     completion = completion_at(repaired, T0 + timedelta(hours=1))
     pulses = [(failing, failure_pulse), (healthy, healthy.next_pulse(T0))]
     ops, slots = build_tick_ops([(repaired, completion)], pulses)
-    assert [name for name, _ in ops] == ["complete_maintenance", "insert_pulses", "record_failure"]
-    assert ops[1][1] == [pulses[1][1]] and slots == {"JT9D-001": 2}
-    assert ops[2][1].pulse == failure_pulse and "live" in ops[2][1].notes
+    names = ["complete_maintenance", "record_settings", "insert_pulses", "record_failure"]
+    assert [name for name, _ in ops] == names
+    # Only the healthy engine emits the first pulse of its lifecycle, which carries the lifecycle's settings.
+    assert ops[1][1] == LifecycleSettings("CFM56-104", 1, SMALL.generation)
+    assert ops[2][1] == [pulses[1][1]] and slots == {"JT9D-001": 3}
+    assert ops[3][1].pulse == failure_pulse and "live" in ops[3][1].notes
 
 
 def test_live_loop_fails_repairs_and_restarts_every_engine() -> None:
@@ -193,6 +208,10 @@ def test_live_loop_fails_repairs_and_restarts_every_engine() -> None:
             assert not [p for p in pulses if event_pulse.event_ts < p.event_ts <= fix.completed_ts]
         lifecycles = [p.lifecycle_id for p in sorted(pulses, key=lambda p: p.event_ts)]
         assert lifecycles == sorted(lifecycles)
+        # Settings are stored once per lifecycle, in the transaction of its first pulse.
+        records = [r for r in store.ops("record_settings") if r.engine_id == engine.engine_id]
+        assert [r.lifecycle_id for r in records] == sorted(set(lifecycles))
+        assert all(r.settings == SMALL.generation for r in records)
     for ops in store.transactions:
         engine_ids = [p.engine_id for name, batch in ops if name == "insert_pulses" for p in batch]
         engine_ids += [event.pulse.engine_id for name, event in ops if name == "record_failure"]
@@ -247,23 +266,58 @@ def test_backfill_writes_backdated_lifecycles_ending_before_now() -> None:
             same = [p.event_ts for p in pulses if p.lifecycle_id == failure.lifecycle_id]
             assert all(b - a == tick for a, b in itertools.pairwise(same))
         assert engine.lifecycle_id == 3 and not engine.in_maintenance
+        records = [r for r in store.ops("record_settings") if r.engine_id == engine.engine_id]
+        assert [r.lifecycle_id for r in records] == sorted({p.lifecycle_id for p in pulses})
     repairs = store.ops("complete_maintenance")
     assert len(repairs) == 2 * len(engines) and all(r.downtime_seconds == 3 for r in repairs)
     assert {u.status for u in store.ops("update_registry")} >= {"HEALTHY", "WARNING", "CRITICAL"}
     assert all("backfill" in event.notes for event in store.ops("record_failure"))
+    # One transaction per engine: an interrupted backfill never leaves an engine with partial history.
+    assert len(store.transactions) == len(engines)
+    for ops, engine in zip(store.transactions, engines, strict=True):
+        written = {p.engine_id for name, batch in ops if name == "insert_pulses" for p in batch}
+        assert written == {engine.engine_id}
 
 
-def test_bootstrap_backfills_only_an_empty_database() -> None:
+class StopDuringWriteStore(FakeStore):
+    """FakeStore whose first retried write coincides with a shutdown request (SIGTERM)."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__()
+        self.stop = stop
+
+    def execute_with_retry(self, ops: list[tuple[str, Any]]) -> list[Any]:
+        self.stop.set()
+        return super().execute_with_retry(ops)
+
+
+def test_backfill_stops_between_engines_on_a_shutdown_request() -> None:
+    stop = threading.Event()
+    store = StopDuringWriteStore(stop)
+    engines = [factory(engine_id) for engine_id in SMALL.engine_ids]
+    backfill_fleet(engines, store, SMALL, stop)
+    assert {p.engine_id for p in store.pulses()} == {"JT9D-001"}, "the running transaction completes"
+    assert [engine.lifecycle_id for engine in engines] == [3, 1, 1]
+
+
+def test_bootstrap_backfills_exactly_the_engines_without_telemetry() -> None:
     models = {engine_id: eg.build_profile(engine_id).engine_model for engine_id in SMALL.engine_ids}
-    fresh = FakeStore(telemetry_empty=True)
+    fresh = FakeStore()
     engines = bootstrap_fleet(
         fresh, SMALL, factory, models, allow_backfill=True, stop_event=threading.Event()
     )
-    assert fresh.registered == models and fresh.ops("record_failure")
+    assert fresh.registered == models and fresh.schema_checks == 1 and fresh.ops("record_failure")
     assert all(engine.lifecycle_id == 3 for engine in engines)
-    for empty, allowed in ((False, True), (True, False)):
-        store = FakeStore(telemetry_empty=empty)
-        bootstrap_fleet(store, SMALL, factory, models, allow_backfill=allowed, stop_event=threading.Event())
+    partly = FakeStore(with_telemetry=("JT9D-001",))
+    engines = bootstrap_fleet(
+        partly, SMALL, factory, models, allow_backfill=True, stop_event=threading.Event()
+    )
+    assert {p.engine_id for p in partly.pulses()} == {"CFM56-104", "GE90-201"}
+    assert (engines[0].lifecycle_id, engines[0].pulse_index) == (2, 0), "resumed, never backfilled again"
+    for allowed, count in ((False, 2), (True, 0)):
+        store = FakeStore()
+        config = replace(SMALL, backfill_lifecycles=count)
+        bootstrap_fleet(store, config, factory, models, allow_backfill=allowed, stop_event=threading.Event())
         assert store.transactions == []
 
 
@@ -333,12 +387,22 @@ def test_config_reads_contract_variables_and_rejects_bad_values() -> None:
     assert config.engine_ids == ("JT9D-001", "GE90-201") and config.tick_seconds == 0.2
     assert (config.pulses_per_cycle, config.mean_life_cycles, config.backfill_lifecycles) == (2, 12.0, 0)
     assert (config.maintenance_seconds, config.seed, config.log_level) == (3.0, 7, "DEBUG")
+    assert config.generation == GenerationSettings(seed=7, mean_life_cycles=12.0, pulses_per_cycle=2)
     for name, value in (
         ("SIM_TICK_SECONDS", "0"),
         ("SIM_PULSES_PER_CYCLE", "1.5"),
         ("SIM_ENGINE_IDS", " , "),
+        ("SIM_SEED", str(2**63)),  # stored per lifecycle in a BIGINT column
     ):
         with pytest.raises(ValueError, match="SIM_"):
             SimulatorConfig.from_env({name: value})
     with pytest.raises(ValueError, match="duplicates"):
         SimulatorConfig.from_env({"SIM_ENGINE_IDS": "JT9D-001,JT9D-001"})
+    assert SimulatorConfig.from_env({"SIM_SEED": str(-(2**63))}).seed == -(2**63)
+
+
+def test_generation_settings_describe_their_values_and_changes_exactly() -> None:
+    old, new = GenerationSettings(2**62, 180.0, 10), GenerationSettings(7, 60.5, 10)
+    assert old.describe() == f"SIM_SEED={2**62}, SIM_MEAN_LIFE_CYCLES=180, SIM_PULSES_PER_CYCLE=10"
+    assert old.changes_to(new) == f"SIM_SEED {2**62} -> 7, SIM_MEAN_LIFE_CYCLES 180 -> 60.5"
+    assert old.changes_to(old) == ""
