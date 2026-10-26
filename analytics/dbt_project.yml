@@ -1,7 +1,8 @@
 # dbt-clickhouse project of the jet-engine lakehouse.
 #
 #   silver: stg_* (deduplicated CDC images) and int_* (lifecycles, rolling sensor features)
-#   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs)
+#   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs),
+#           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest)
 #
 # Every model is a ReplacingMergeTree so that consumers can always read it with FINAL;
 # incremental models rely on FINAL for correctness. See models/**/*.yml for column docs.
@@ -23,20 +24,39 @@ vars:
   # the env vars; `--vars` on the command line still takes precedence.
   rul_failure_horizon_cycles: "{{ env_var('RUL_FAILURE_HORIZON_CYCLES', '25') }}"
   rul_cap_cycles: "{{ env_var('RUL_CAP_CYCLES', '125') }}"
+  # Training window of mart_rul_training_features: the newest N completed lifecycles of every
+  # engine. Bounds the cost of the mart rebuild (every dbt run) and the training set.
+  mart_max_lifecycles_per_engine: 50
   # Healthy reference period of a lifecycle: its first N cycles (drift features compare to it).
+  # Each feature row records the value it was computed with (int_sensor_rolling_features.
+  # baseline_cycles); the next run recomputes every lifecycle built with another value, and
+  # assert_features_use_current_baseline_cycles fails until it has.
   baseline_cycles: 10
   # Incremental models re-read rows ingested this long before their watermark, because rows can
   # become visible in the raw tables slightly out of ingested_at order (concurrent inserts).
   ingestion_lookback_minutes: 10
   # fct_engine_health_status anomaly flags: a flag is raised when the KPI exceeds the threshold.
-  anomaly_egt_drift_c: 25.0               # egt_c_drift (5m mean EGT above lifecycle baseline)
-  anomaly_vibration_ratio: 1.5            # vibration_mm_s_ratio (5m mean vibration / baseline)
-  anomaly_oil_pressure_drop_psi: 5.0      # oil_pressure_psi_drop (baseline - 5m mean oil pressure)
+  # Calibrated on the live fleet (simulator defaults, 38 completed lifecycles, 2026-10-26) from
+  # the KPI percentiles p50 / p90 / p99 per pulse status:
+  #                           HEALTHY            WARNING            CRITICAL           FAILURE
+  #   egt_c_drift (degC)      2.0 / 13.5 / 24.7  30.1 / 54.1 / 71.4 68.6 / 102 / 120   90.1 / 119 / 129
+  #   vibration_mm_s_ratio    1.01 / 1.17 / 1.40 1.65 / 2.18 / 2.77 2.57 / 3.58 / 4.52 2.96 / 4.32 / 4.88
+  #   oil_pressure_psi_drop   0.07 / 0.30 / 0.46 0.54 / 0.75 / 0.98 1.26 / 2.28 / 3.29 2.37 / 3.46 / 3.97
+  # The KPIs are 5-minute means of event time (30 cycles at 10 pulses x 1 s), which dilutes the
+  # late, steep oil-pressure loss: the oil KPI never got past 4 psi, so the former 5 psi
+  # threshold never fired. Recalibrate when SIM_TICK_SECONDS or SIM_PULSES_PER_CYCLE change;
+  # assert_anomaly_thresholds_calibrated fails when a flag is silent at most failures of the
+  # mode it exists for, or noisy on more than 5 % of HEALTHY pulses.
+  anomaly_egt_drift_c: 25.0               # at the HEALTHY p99, below the WARNING p50: early warning
+  anomaly_vibration_ratio: 1.5            # above the HEALTHY p99, below the WARNING p50: early warning
+  anomaly_oil_pressure_drop_psi: 1.0      # above the WARNING p99: fires late (CRITICAL), at every failure
   anomaly_stale_telemetry_seconds: 300    # seconds since the last telemetry pulse
-  # fct_engine_health_status degradation_index: each drift KPI is scaled to 0..1, reaching 1 here.
-  degradation_full_scale_egt_drift_c: 60.0
-  degradation_full_scale_vibration_ratio: 2.5
-  degradation_full_scale_oil_pressure_drop_psi: 15.0
+  # fct_engine_health_status degradation_index: each drift KPI is scaled to 0..1, reaching 1 at
+  # this full scale, set near the KPI's FAILURE p50 so that the index keeps grading CRITICAL
+  # engines (the former 60 / 2.5 / 15 saturated on most CRITICAL pulses, and oil never passed 0.27).
+  degradation_full_scale_egt_drift_c: 90.0
+  degradation_full_scale_vibration_ratio: 3.0
+  degradation_full_scale_oil_pressure_drop_psi: 3.0
 
 models:
   iot_engine_analytics:

@@ -15,6 +15,15 @@
 {% endmacro %}
 
 
+{% macro positive_int_var(name) %}
+    {%- set value = int_var(name) -%}
+    {%- if value < 1 -%}
+        {{ exceptions.raise_compiler_error("var '" ~ name ~ "' must be a positive integer, got " ~ value) }}
+    {%- endif -%}
+    {{ return(value) }}
+{% endmacro %}
+
+
 {% macro number_var(name) %}
     {%- set raw = var(name) | string | trim -%}
     {%- if not modules.re.fullmatch('-?[0-9]+([.][0-9]+)?', raw) -%}
