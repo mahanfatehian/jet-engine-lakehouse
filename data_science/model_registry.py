@@ -1,21 +1,32 @@
-"""Model artifacts in the lakehouse bucket, the production pointer, the ml_model_runs
-registry and the champion/challenger promotion rule.
+"""Model artifacts in the lakehouse bucket, the production pointer and the ml_model_runs registry.
 
 Layout below ML_ARTIFACT_PREFIX (interface contract, section 5)::
 
-    <prefix>/<model_version>/model_bundle.joblib    both models + feature/label contract
-    <prefix>/<model_version>/regressor.json         XGBoost regressor, native JSON format
-    <prefix>/<model_version>/metadata.json          data, split, parameters, versions, promotion
+    <prefix>/<model_version>/model_bundle.joblib    both models + feature/label/calibration contract
+    <prefix>/<model_version>/regressor.json         XGBoost regressor (served trees only), native JSON
+    <prefix>/<model_version>/metadata.json          data, split, parameters, versions, promotion, digest
     <prefix>/<model_version>/metrics.json           holdout + validation metrics, champion comparison
     <prefix>/<model_version>/feature_importance.csv
     <prefix>/production.json                        pointer to the model that serves predictions
 
 Version artifacts are written before the pointer moves, so production.json only
 ever references a complete artifact set.
+
+Integrity: production.json carries ``bundle_sha256``, the SHA-256 of model_bundle.joblib
+recorded at publish time (also in metadata.json and ml_model_runs.params_json). The bundle
+is a pickle, so its digest is verified BEFORE it is unpickled, and a pointer without a
+digest or a bundle that does not match is refused. This catches a bundle that was replaced,
+truncated or corrupted after publication. Remaining trust assumption: the pointer itself
+is trusted. Whoever can write production.json can also write a matching digest, so the
+bucket must stay writable by the training job only (dedicated credentials, no anonymous
+or shared root keys); defending against such a writer needs a signature whose key lives
+outside the bucket, or a non-pickle model format.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import io
 import logging
 from dataclasses import dataclass, fields
@@ -25,7 +36,6 @@ from typing import Any, Protocol
 import joblib
 import pandas as pd
 from artifact_store import JSON_CONTENT_TYPE, ArtifactNotFoundError, ArtifactStore
-from ds_settings import PROMOTION_POLICIES
 from lakehouse_io import ClickHouseGateway
 from rul_modeling import RulModelBundle
 
@@ -41,11 +51,20 @@ ML_MODEL_RUNS_TABLE = "ml_model_runs"
 logger = logging.getLogger(__name__)
 
 
+class ModelIntegrityError(RuntimeError):
+    """A model bundle cannot be verified against the digest production.json recorded for it."""
+
+
 def new_model_version(trained_at: datetime) -> str:
     """Model version for a training run started at ``trained_at`` (UTC)."""
     if trained_at.tzinfo is None:
         raise ValueError("trained_at must be timezone-aware")
     return trained_at.astimezone(UTC).strftime(MODEL_VERSION_FORMAT)
+
+
+def bundle_digest(data: bytes) -> str:
+    """Hex SHA-256 of serialized bundle bytes."""
+    return hashlib.sha256(data).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -70,13 +89,14 @@ class ArtifactLayout:
 
 @dataclass(frozen=True)
 class ProductionPointer:
-    """Content of production.json."""
+    """Content of production.json (``bundle_sha256`` is None for pointers written before digests)."""
 
     model_version: str
     artifact_prefix: str
     promoted_at: str
     metrics: dict[str, Any]
     feature_columns: list[str]
+    bundle_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON document of the pointer."""
@@ -87,12 +107,14 @@ class ProductionPointer:
         """Parse production.json, rejecting documents without the required keys."""
         if not isinstance(payload, dict) or not {"model_version", "artifact_prefix"} <= payload.keys():
             raise ValueError("production.json must contain model_version and artifact_prefix")
+        digest = str(payload.get("bundle_sha256") or "").strip().lower()
         return cls(
             model_version=str(payload["model_version"]),
             artifact_prefix=str(payload["artifact_prefix"]).strip("/"),
             promoted_at=str(payload.get("promoted_at", "")),
             metrics=dict(payload.get("metrics") or {}),
             feature_columns=list(payload.get("feature_columns") or []),
+            bundle_sha256=digest or None,
         )
 
 
@@ -106,6 +128,14 @@ class ModelArtifacts:
     feature_importance: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class PublishedModel:
+    """Where a model version was published and the digest of its bundle."""
+
+    uri: str
+    bundle_sha256: str
+
+
 def serialize_bundle(bundle: RulModelBundle) -> bytes:
     """Serialise a bundle to joblib bytes."""
     buffer = io.BytesIO()
@@ -114,24 +144,32 @@ def serialize_bundle(bundle: RulModelBundle) -> bytes:
 
 
 def deserialize_bundle(data: bytes) -> RulModelBundle:
-    """Load a bundle from joblib bytes (artifacts are trusted: written by this platform only)."""
+    """Unpickle a bundle. Only call this on bytes whose digest was verified (see load_production_bundle)."""
     return RulModelBundle.from_payload(joblib.load(io.BytesIO(data)))
 
 
-def publish_artifacts(store: ArtifactStore, layout: ArtifactLayout, artifacts: ModelArtifacts) -> str:
-    """Upload every artifact of one model version; return the URI of its prefix."""
+def publish_artifacts(
+    store: ArtifactStore, layout: ArtifactLayout, artifacts: ModelArtifacts
+) -> PublishedModel:
+    """Upload every artifact of one model version; metadata.json records the bundle digest."""
     version = artifacts.bundle.model_version
+    bundle_bytes = serialize_bundle(artifacts.bundle)
+    digest = bundle_digest(bundle_bytes)
+    # The regressor holds only the trees up to its best iteration, so the native JSON
+    # reproduces the served predictions with a plain xgboost.Booster.
     regressor_json = bytes(artifacts.bundle.regressor.get_booster().save_raw(raw_format="json"))
     store.put_bytes(layout.artifact_key(version, REGRESSOR_FILE), regressor_json, JSON_CONTENT_TYPE)
-    store.put_json(layout.artifact_key(version, METADATA_FILE), artifacts.metadata)
+    store.put_json(
+        layout.artifact_key(version, METADATA_FILE), {**artifacts.metadata, "bundle_sha256": digest}
+    )
     store.put_json(layout.artifact_key(version, METRICS_FILE), artifacts.metrics)
     store.put_bytes(
         layout.artifact_key(version, IMPORTANCE_FILE),
         artifacts.feature_importance.to_csv(index=False).encode("utf-8"),
         "text/csv",
     )
-    store.put_bytes(layout.artifact_key(version, BUNDLE_FILE), serialize_bundle(artifacts.bundle))
-    return store.uri(layout.version_prefix(version)) + "/"
+    store.put_bytes(layout.artifact_key(version, BUNDLE_FILE), bundle_bytes)
+    return PublishedModel(uri=store.uri(layout.version_prefix(version)) + "/", bundle_sha256=digest)
 
 
 def read_production_pointer(store: ArtifactStore, layout: ArtifactLayout) -> ProductionPointer | None:
@@ -151,39 +189,30 @@ def write_production_pointer(
 
 
 def load_production_bundle(store: ArtifactStore, pointer: ProductionPointer) -> RulModelBundle:
-    """Download and validate the bundle a production pointer references."""
-    bundle = deserialize_bundle(store.get_bytes(f"{pointer.artifact_prefix}/{BUNDLE_FILE}"))
+    """Download the bundle a production pointer references, verify its digest, then unpickle it.
+
+    Raises ModelIntegrityError, before anything is unpickled, when the pointer has no
+    ``bundle_sha256`` or the downloaded bytes do not match it.
+    """
+    key = f"{pointer.artifact_prefix}/{BUNDLE_FILE}"
+    if not pointer.bundle_sha256:
+        raise ModelIntegrityError(
+            f"production.json ({pointer.model_version}) has no bundle_sha256: refusing to unpickle "
+            f"an unverified {store.uri(key)}; retrain to publish a verifiable model"
+        )
+    data = store.get_bytes(key)
+    actual = bundle_digest(data)
+    if not hmac.compare_digest(actual, pointer.bundle_sha256):
+        raise ModelIntegrityError(
+            f"{store.uri(key)} has SHA-256 {actual}, but production.json ({pointer.model_version}) "
+            f"records {pointer.bundle_sha256}: refusing to unpickle a modified or corrupted bundle"
+        )
+    bundle = deserialize_bundle(data)
     if bundle.model_version != pointer.model_version:
         raise ValueError(
             f"production.json references {pointer.model_version} but its bundle is {bundle.model_version}"
         )
     return bundle
-
-
-@dataclass(frozen=True)
-class PromotionDecision:
-    """Outcome of the champion/challenger comparison."""
-
-    promote: bool
-    reason: str
-
-
-def decide_promotion(policy: str, challenger_rmse: float, champion_rmse: float | None) -> PromotionDecision:
-    """Apply MODEL_PROMOTION_POLICY to holdout RMSEs measured on the same lifecycles.
-
-    ``champion_rmse`` is None when there is no usable production model, in which
-    case the challenger is always promoted.
-    """
-    if policy not in PROMOTION_POLICIES:
-        raise ValueError(f"unknown promotion policy {policy!r}")
-    if champion_rmse is None:
-        return PromotionDecision(True, "no usable production model to compare against")
-    comparison = f"challenger RMSE {challenger_rmse:.3f} vs champion RMSE {champion_rmse:.3f}"
-    if policy == "always":
-        return PromotionDecision(True, f"policy 'always' ({comparison})")
-    if challenger_rmse < champion_rmse:
-        return PromotionDecision(True, f"challenger is better ({comparison})")
-    return PromotionDecision(False, f"challenger is not better ({comparison})")
 
 
 ML_MODEL_RUNS_COLUMNS = (
@@ -241,10 +270,17 @@ class ModelRunRecord:
 
 @dataclass(frozen=True)
 class RunSummary:
-    """The facts of a past training run that --skip-if-unchanged needs."""
+    """The facts of a past training run that --skip-if-unchanged needs.
+
+    ``data_watermark_us`` (end of the newest completed lifecycle the run saw, from
+    params_json) is None for runs recorded before it existed; ``lifecycles`` is then
+    the fallback signal.
+    """
 
     model_version: str
     lifecycles: int
+    promoted: bool = False
+    data_watermark_us: int | None = None
 
 
 class RunRegistry(Protocol):
@@ -268,10 +304,19 @@ class ClickHouseRunRegistry:
     def latest_run(self) -> RunSummary | None:
         """Most recent row of ml_model_runs."""
         rows = self._gateway.query_rows(
-            f"SELECT model_version, train_lifecycles + test_lifecycles FROM {ML_MODEL_RUNS_TABLE} "
-            "ORDER BY trained_at DESC, model_version DESC LIMIT 1"
+            "SELECT model_version, train_lifecycles + test_lifecycles, promoted, "
+            "JSONExtract(params_json, 'data_watermark_us', 'Nullable(Int64)') "
+            f"FROM {ML_MODEL_RUNS_TABLE} ORDER BY trained_at DESC, model_version DESC LIMIT 1"
         )
-        return RunSummary(model_version=str(rows[0][0]), lifecycles=int(rows[0][1])) if rows else None
+        if not rows:
+            return None
+        version, lifecycles, promoted, watermark = rows[0]
+        return RunSummary(
+            model_version=str(version),
+            lifecycles=int(lifecycles),
+            promoted=bool(promoted),
+            data_watermark_us=None if watermark is None else int(watermark),
+        )
 
     def record_run(self, record: ModelRunRecord) -> None:
         """Insert one row into ml_model_runs."""
