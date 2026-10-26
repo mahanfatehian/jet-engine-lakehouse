@@ -1,0 +1,19 @@
+# Connection profile; every value comes from the environment (CONTRACT.md section 2), so the same
+# file works inside the compose stack (CLICKHOUSE_HOST=clickhouse) and on a host (localhost:8123).
+iot_engine:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      driver: http
+      host: "{{ env_var('CLICKHOUSE_HOST', 'localhost') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') | as_number }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'clickhouse') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', 'clickhouse') }}"
+      schema: "{{ env_var('CLICKHOUSE_DB', 'iot_engine') }}"
+      secure: false
+      threads: 4
+      # connection attempts before a model fails (ClickHouse may still be starting)
+      retries: 3
+      connect_timeout: 10
+      send_receive_timeout: 600

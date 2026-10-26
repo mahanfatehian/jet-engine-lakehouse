@@ -1,0 +1,51 @@
+# dbt-clickhouse project of the jet-engine lakehouse.
+#
+#   silver: stg_* (deduplicated CDC images) and int_* (lifecycles, rolling sensor features)
+#   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs)
+#
+# Every model is a ReplacingMergeTree so that consumers can always read it with FINAL;
+# incremental models rely on FINAL for correctness. See models/**/*.yml for column docs.
+name: iot_engine_analytics
+version: "1.0.0"
+profile: iot_engine
+require-dbt-version: [">=1.12.0", "<1.13.0"]
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+clean-targets: ["target", "logs", "dbt_packages"]
+
+flags:
+  send_anonymous_usage_stats: false
+
+vars:
+  # RUL labelling of mart_rul_training_features (CONTRACT.md section 7). The orchestrator exports
+  # the env vars; `--vars` on the command line still takes precedence.
+  rul_failure_horizon_cycles: "{{ env_var('RUL_FAILURE_HORIZON_CYCLES', '25') }}"
+  rul_cap_cycles: "{{ env_var('RUL_CAP_CYCLES', '125') }}"
+  # Healthy reference period of a lifecycle: its first N cycles (drift features compare to it).
+  baseline_cycles: 10
+  # Incremental models re-read rows ingested this long before their watermark, because rows can
+  # become visible in the raw tables slightly out of ingested_at order (concurrent inserts).
+  ingestion_lookback_minutes: 10
+  # fct_engine_health_status anomaly flags: a flag is raised when the KPI exceeds the threshold.
+  anomaly_egt_drift_c: 25.0               # egt_c_drift (5m mean EGT above lifecycle baseline)
+  anomaly_vibration_ratio: 1.5            # vibration_mm_s_ratio (5m mean vibration / baseline)
+  anomaly_oil_pressure_drop_psi: 5.0      # oil_pressure_psi_drop (baseline - 5m mean oil pressure)
+  anomaly_stale_telemetry_seconds: 300    # seconds since the last telemetry pulse
+  # fct_engine_health_status degradation_index: each drift KPI is scaled to 0..1, reaching 1 here.
+  degradation_full_scale_egt_drift_c: 60.0
+  degradation_full_scale_vibration_ratio: 2.5
+  degradation_full_scale_oil_pressure_drop_psi: 15.0
+
+models:
+  iot_engine_analytics:
+    +contract:
+      enforced: true
+    +persist_docs:
+      relation: true
+      columns: true
+    silver:
+      +tags: ["silver"]
+    gold:
+      +tags: ["gold"]

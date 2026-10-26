@@ -1,0 +1,158 @@
+version: 2
+
+sources:
+  - name: engine_raw
+    description: >
+      Landing tables in ClickHouse. The raw_* tables hold the Debezium CDC images of the
+      PostgreSQL operational tables, written by the Spark streaming job (Path B). Every raw
+      table carries the CDC metadata columns cdc_op, cdc_lsn, cdc_source_ts, cdc_emitted_ts,
+      is_deleted, kafka_partition, kafka_offset and the server-assigned ingested_at.
+      gold_engine_rul_predictions is written by data_science/predict_rul.py.
+    schema: "{{ env_var('CLICKHOUSE_DB', 'iot_engine') }}"
+    loader: spark-structured-streaming
+    tables:
+      - name: raw_engine_telemetry
+        description: >
+          One row per CDC event of engine_telemetry (ReplacingMergeTree(cdc_lsn) ordered by
+          engine_id, telemetry_id). Several versions per telemetry_id exist until merged: the
+          highest cdc_lsn is the current one; is_deleted = 1 marks a delete (values from `before`).
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            warn_after: {count: 10, period: minute}
+            error_after: {count: 60, period: minute}
+        columns:
+          - name: telemetry_id
+            description: Primary key of the source pulse (BIGSERIAL).
+          - name: engine_id
+            description: Engine identifier, e.g. CFM56-104.
+          - name: lifecycle_id
+            description: Run-to-failure lifecycle of the engine (increments after each repair).
+          - name: cycle_number
+            description: Operating cycle within the lifecycle (one cycle = SIM_PULSES_PER_CYCLE pulses).
+          - name: event_ts
+            description: Measurement time of the pulse (UTC); differs from created_ts for back-filled history.
+          - name: rpm
+            description: Shaft speed (rev/min).
+          - name: core_temp_c
+            description: Core temperature (degC).
+          - name: egt_c
+            description: Exhaust gas temperature (degC).
+          - name: vibration_mm_s
+            description: Vibration velocity (mm/s).
+          - name: fuel_flow_kg_h
+            description: Fuel flow (kg/h).
+          - name: oil_pressure_psi
+            description: Oil pressure (psi).
+          - name: wear_factor
+            description: Simulator ground-truth wear w(t) in 0..1. Never an ML feature.
+          - name: status
+            description: HEALTHY | WARNING | CRITICAL | FAILURE (derived from wear; never an ML feature).
+          - name: maintenance_id
+            description: Work order back-filled by an UPDATE at failure on WARNING/CRITICAL/FAILURE rows.
+          - name: created_ts
+            description: Insert time in PostgreSQL.
+          - name: cdc_op
+            description: Debezium operation (c insert, u update, d delete, r snapshot read).
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['c', 'u', 'd', 'r']
+                  config:
+                    severity: warn
+          - name: cdc_lsn
+            description: PostgreSQL log sequence number of the change (0 when absent); orders row versions.
+          - name: is_deleted
+            description: 1 when the event is a delete.
+          - name: ingested_at
+            description: Server time the row landed in ClickHouse; drives incremental watermarks.
+        data_tests:
+          - finite_values:
+              arguments:
+                columns: ['rpm', 'core_temp_c', 'egt_c', 'vibration_mm_s', 'fuel_flow_kg_h', 'oil_pressure_psi']
+              config:
+                severity: warn
+
+      - name: raw_engine_status_registry
+        description: >
+          Full change history of engine_status_registry (ReplacingMergeTree ordered by engine_id,
+          cdc_lsn: replays collapse, every real change is kept).
+        columns:
+          - name: engine_id
+            description: Engine identifier.
+          - name: engine_model
+            description: Engine model, e.g. CFM56-7B (categorical ML feature).
+          - name: operational_status
+            description: HEALTHY | WARNING | CRITICAL | FAILURE | MAINTENANCE_RESET.
+          - name: current_lifecycle_id
+            description: Lifecycle the engine is currently in.
+          - name: current_cycle
+            description: Current cycle within that lifecycle.
+          - name: cycles_since_new
+            description: Cycles accumulated since the engine was registered.
+          - name: lifecycles_completed
+            description: Number of run-to-failure lifecycles completed.
+          - name: last_maintenance_ts
+            description: Completion time of the most recent repair.
+          - name: status_changed_ts
+            description: Time operational_status last changed.
+          - name: cdc_lsn
+            description: Log sequence number of the change; the highest one is the current state.
+          - name: ingested_at
+            description: Server time the row landed in ClickHouse.
+
+      - name: raw_maintenance_log
+        description: >
+          CDC images of maintenance_log (ReplacingMergeTree(cdc_lsn) ordered by engine_id,
+          maintenance_id). A work order is inserted OPEN at failure (op c) and updated to COMPLETED
+          after the repair (op u).
+        columns:
+          - name: maintenance_id
+            description: Work order id (BIGSERIAL); unique per engine lifecycle.
+          - name: lifecycle_id
+            description: Lifecycle that ended in this failure.
+          - name: failure_cycle
+            description: Cycle at which the engine failed.
+          - name: failure_mode
+            description: HPT_BLADE_EROSION | BEARING_DEGRADATION | OIL_SYSTEM_LEAK | COMPRESSOR_FOULING.
+          - name: maintenance_status
+            description: OPEN | COMPLETED.
+          - name: cdc_lsn
+            description: Log sequence number of the change; the highest one is the current version.
+          - name: ingested_at
+            description: Server time the row landed in ClickHouse.
+
+      - name: gold_engine_rul_predictions
+        description: >
+          Remaining-useful-life predictions appended by data_science/predict_rul.py (MergeTree, one
+          row per scoring of an engine). May be empty before the first model is promoted.
+        columns:
+          - name: predicted_at
+            description: Scoring time (UTC).
+          - name: engine_id
+            description: Scored engine.
+          - name: lifecycle_id
+            description: Lifecycle of the scored feature row.
+          - name: predicted_rul_cycles
+            description: Predicted remaining cycles until failure.
+          - name: predicted_rul_hours
+            description: predicted_rul_cycles converted with FLIGHT_HOURS_PER_CYCLE.
+          - name: failure_probability
+            description: Probability of failure within the horizon (0..1).
+            data_tests:
+              - accepted_range:
+                  arguments:
+                    min_value: 0
+                    max_value: 1
+                  config:
+                    severity: warn
+          - name: risk_band
+            description: LOW | MEDIUM | HIGH.
+            data_tests:
+              - accepted_values:
+                  arguments:
+                    values: ['LOW', 'MEDIUM', 'HIGH']
+                  config:
+                    severity: warn
+          - name: model_version
+            description: rul-YYYYMMDDTHHMMSSZ of the model that produced the prediction.
