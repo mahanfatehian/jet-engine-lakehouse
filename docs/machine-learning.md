@@ -94,17 +94,24 @@ status columns, identifiers and labels as features.
 
 [`train_rul_model.py`](../data_science/train_rul_model.py):
 
-1. **Load** `mart_rul_training_features` from ClickHouse (default) or the newest gold snapshot in
-   MinIO (`--source minio`). Exit code 3 (skipped) below `MIN_TRAINING_LIFECYCLES` completed lifecycles.
+1. **Load** `mart_rul_training_features` from ClickHouse (default) or the newest non-empty gold
+   snapshot in MinIO (`--source minio`). The mart holds the newest 50 completed lifecycles per
+   engine (dbt var `mart_max_lifecycles_per_engine`) and the trainer loads at most
+   `TRAINING_MAX_ROWS` (600 000) rows, newest lifecycles first, so memory stays bounded however
+   long the stack runs. Exit code 3 (skipped) below `max(MIN_TRAINING_LIFECYCLES, 3)` completed
+   lifecycles, the minimum for a train/validation/test split.
 2. **Split by lifecycle.** A lifecycle never appears on both sides. The assignment is a deterministic
    SHA-256 of the lifecycle key (~25 % test, ~20 % of the rest for validation), so a lifecycle
    never migrates from train to test as data grows, and the champion is never scored on its own
    training data.
 3. **Regressor:** XGBoost (`max_depth` 5, `learning_rate` 0.03, subsampling 0.8, L2 2.0, up to 2 000
-   trees with early stopping on the validation lifecycles) on `rul_cycles_capped`.
-4. **Classifier:** scikit-learn `HistGradientBoostingClassifier` for `failure_within_horizon`, with
-   its decision threshold tuned for F1 on the validation lifecycles. The threshold, not class
-   re-weighting, handles the imbalance, so `failure_probability` is not inflated by sample weights.
+   trees with early stopping on the validation lifecycles) on `rul_cycles_capped`. The saved model
+   is trimmed to the best iteration, so `regressor.json` holds exactly the trees that are served.
+4. **Classifier:** scikit-learn `HistGradientBoostingClassifier` for `failure_within_horizon`,
+   **calibrated** with Platt scaling fitted on out-of-fold scores from a lifecycle-grouped 5-fold
+   cross-validation, so `failure_probability` means what it says. The decision threshold maximises
+   F1 on those out-of-fold calibrated probabilities, restricted to [0.05, 0.95] with ties broken
+   towards 0.5; the threshold, not class re-weighting, handles the imbalance.
 5. **Evaluate on the holdout lifecycles:**
 
 | Metric | Meaning |
@@ -113,22 +120,37 @@ status columns, identifiers and labels as features.
 | late-life RMSE | rows with true RUL ≤ cap: the part of life where the prediction matters |
 | NASA score | asymmetric C-MAPSS score, mean per row: late predictions (d > 0) cost `e^(d/10) − 1`, early ones `e^(−d/13) − 1` |
 | F1, precision, recall, ROC-AUC | imminent-failure classifier at the tuned threshold |
+| Brier score, ECE | calibration of `failure_probability` (expected calibration error over 10 bins) |
 
-Example run on the 24 backfilled lifecycles (21 train/validation, 3 test): **RMSE 9.6 cycles,
-MAE 6.8, R² 0.947, late-life RMSE 7.2, ROC-AUC 0.998**.
+Example run on the live stack after nine hours (69 calibration lifecycles): **RMSE 15.2 cycles,
+R² 0.87**, failure classifier at threshold 0.37 with **F1 0.87 (precision 0.90, recall 0.84),
+ROC-AUC 0.99, Brier 0.028, ECE 0.017**. The live backtest of the models trained that day, scored on
+the lifecycles that failed after each went live, agrees: RMSE 13–17 cycles, recall 0.88–0.96 and a
+median warning 17–30 cycles before the failure.
 
 ## 5. Promotion, artifacts and the registry
 
-- **Champion/challenger.** When a production model exists it is re-scored on the challenger's
-  holdout; with `MODEL_PROMOTION_POLICY=better` the challenger is promoted only if its RMSE is lower
-  (`always` promotes unconditionally). `production.json` is replaced with a single atomic write.
+- **Quality floors.** Every promotion, under any policy, requires holdout R² ≥ `PROMOTION_MIN_R2`
+  (0.5) and ROC-AUC ≥ `PROMOTION_MIN_ROC_AUC` (0.75).
+- **Champion/challenger.** With `MODEL_PROMOTION_POLICY=better` the production model is re-scored
+  on the challenger's holdout (only lifecycles the champion was not fitted on); the challenger must
+  have a lower RMSE and may lose at most `PROMOTION_F1_TOLERANCE` (0.05) classifier F1. The gate
+  fails **closed**: if the champion cannot be loaded or scored, nothing is promoted and the run is
+  recorded with `promoted = 0`. Only a planned change (a different feature schema or bundle format,
+  or a legacy pointer without a digest) lets the floors decide alone. `always` skips the
+  comparison, never the floors; `make train-ml ARGS="--promotion-policy always"` is the escape
+  hatch when a champion is permanently unloadable. `production.json` is replaced atomically.
 - **Artifacts** go to `s3://lakehouse/ml-artifacts/rul_model/rul-<UTC timestamp>/`:
-  `model_bundle.joblib` (both models, threshold, feature list, categories, horizon, cap, library
-  versions), `regressor.json` (portable XGBoost format), `metadata.json`, `metrics.json` and
-  `feature_importance.csv`.
+  `model_bundle.joblib` (both models, calibration, threshold, feature list, categories, horizon,
+  cap, library versions), `regressor.json` (portable XGBoost format, served trees only),
+  `metadata.json`, `metrics.json` and `feature_importance.csv`.
+- **Integrity.** The SHA-256 of `model_bundle.joblib` is stored in `production.json`
+  (`bundle_sha256`), `metadata.json` and the run registry; inference verifies it before unpickling
+  and refuses a missing or mismatching digest.
 - **Registry.** Every run, promoted or not, appends a row to `ml_model_runs` with data volume,
   holdout metrics, the promotion decision and the artifact URI.
-- **Scheduled retraining** uses `--skip-if-unchanged`: no new completed lifecycle, no new model.
+- **Scheduled retraining** uses `--skip-if-unchanged`: it retrains only when the newest completed
+  lifecycle moved past the data watermark of the last run.
 
 ## 6. Inference
 
@@ -140,7 +162,7 @@ engine_id`) and writes to `gold_engine_rul_predictions`:
 |---|---|
 | `predicted_rul_cycles` | regressor output clipped to `[0, cap]` |
 | `predicted_rul_hours` | cycles × `FLIGHT_HOURS_PER_CYCLE` (2.0) |
-| `failure_probability`, `failure_within_horizon` | classifier probability and the tuned decision |
+| `failure_probability`, `failure_within_horizon` | calibrated classifier probability and the decision at the tuned threshold |
 | `risk_band` | `HIGH` if a failure is predicted within the horizon or RUL ≤ horizon; `MEDIUM` if the probability exceeds half the threshold or RUL ≤ 2 × horizon; otherwise `LOW` |
 | sensor columns, `operational_status` | the readings the prediction was made from |
 
@@ -150,6 +172,11 @@ engine_id`) and writes to `gold_engine_rul_predictions`:
 ## 7. Known limitations
 
 - The data is simulated: the physics is plausible, not calibrated against a real engine type.
-- The mart holds one row per pulse of every completed lifecycle (~0.5 M rows per simulated day);
-  for long-running stacks add retention or train on a window of recent lifecycles.
-- `model_bundle.joblib` is a pickle: load it only from a bucket that only the training job can write.
+- Training is bounded (newest 50 lifecycles per engine, `TRAINING_MAX_ROWS`), and the silver
+  snapshot exports only the last `SNAPSHOT_WINDOW_DAYS`; non-promoted model artifacts are still
+  kept forever (~1 MB per run).
+- A training run fits the classifier about seven times (calibration folds plus the final fit):
+  ~40 s at a few hundred thousand rows, a few minutes near the row cap.
+- `model_bundle.joblib` is a pickle. The digest protects against a bundle swapped or corrupted
+  under an unchanged pointer, not against someone who can rewrite `production.json` as well: keep
+  the bucket writable only by the training job (and the ports bound to loopback).

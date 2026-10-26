@@ -44,11 +44,20 @@ its own checkpoint under `/opt/spark-checkpoints/<query>`:
 
 | Query | Source | Sink | Trigger | Guarantee |
 |---|---|---|---|---|
-| `bronze_<table>` × 3 | one topic each | `s3a://lakehouse/bronze/<table>/ingest_date=…` | 60 s | exactly-once (file sink + `_spark_metadata`) |
-| `silver_<table>` × 3 | one topic each | `s3a://lakehouse/silver/<table>/event_date=…` | 60 s | exactly-once |
+| `bronze_<table>` × 3 | one topic each | `s3a://lakehouse/bronze/<table>/ingest_date=…` | 60 s | exactly-once for Spark readers of the table root (`_spark_metadata`); other readers dedup by `(kafka_topic, kafka_partition, kafka_offset)` |
+| `silver_<table>` × 3 | one topic each | `s3a://lakehouse/silver/<table>/event_date=…` | 60 s | exactly-once for Spark readers; other readers dedup by primary key, highest `cdc_lsn` |
 | `clickhouse_raw` | all three topics | `raw_engine_telemetry`, `raw_engine_status_registry`, `raw_maintenance_log` | 5 s | at-least-once + idempotent tables |
 
-Independent queries mean ClickHouse being down never blocks the lake, and the other way round.
+A supervisor inside the driver keeps the two paths independent. The lake queries start as soon as
+Kafka and MinIO answer; `clickhouse_raw` starts once Kafka and ClickHouse (with its tables)
+answer. A failing query is restarted from its own checkpoint with backoff (2 s up to 60 s) while
+the others keep running, and the process exits only on invalid configuration, SIGTERM or a dead
+driver. The supervisor rewrites `/tmp/streaming.heartbeat` (per-query state, last progress, last
+error) every few seconds; the container healthcheck turns unhealthy when it goes stale.
+
+CDC queries run with `failOnDataLoss=true` (`KAFKA_FAIL_ON_DATA_LOSS`): if the job was down for
+longer than the Kafka retention, a query stops loudly at the gap instead of silently skipping
+change events.
 
 **Parsing rules** (shared by silver and ClickHouse): the record is the `after` image for `c`/`u`/`r`
 and the `before` image for `d` (stored with `is_deleted = 1`); `cdc_lsn` is the Postgres log
@@ -64,8 +73,8 @@ crash-looping the job on every replay.
 
 ```text
 lakehouse/
-├── bronze/<table>/ingest_date=YYYY-MM-DD/part-*.parquet       raw Kafka records, verbatim
-├── silver/<table>/event_date=YYYY-MM-DD/part-*.parquet        typed images, append-only (dedup by max cdc_lsn)
+├── bronze/<table>/ingest_date=YYYY-MM-DD/part-*.parquet       raw Kafka records, verbatim (non-Spark readers: dedup by topic/partition/offset)
+├── silver/<table>/event_date=YYYY-MM-DD/part-*.parquet        typed images, append-only (non-Spark readers: dedup by key, max cdc_lsn)
 ├── silver/int_sensor_rolling_features/snapshot_ts=<TS>/data.parquet
 ├── gold/mart_rul_training_features/snapshot_ts=<TS>/data.parquet
 ├── gold/fct_engine_health_status/snapshot_ts=<TS>/data.parquet
@@ -92,7 +101,9 @@ lakehouse/
 | silver | `int_engine_lifecycles` | dbt, table | `ReplacingMergeTree` | one row per engine lifecycle, failure cycle and mode |
 | silver | `int_sensor_rolling_features` | dbt, incremental | `ReplacingMergeTree(feature_computed_at, is_deleted)` | 46 point-in-time ML features per pulse |
 | gold | `mart_rul_training_features` | dbt, table | `ReplacingMergeTree` | features + RUL labels of completed lifecycles |
-| gold | `fct_engine_health_status` | dbt, table | `ReplacingMergeTree` | one row per engine: state, KPIs, anomaly flags, latest prediction |
+| gold | `fct_engine_health_status` | dbt, table | `ReplacingMergeTree` | one row per engine: state, KPIs, calibrated anomaly flags, latest prediction aged to the current cycle |
+| gold | `fct_rul_prediction_backtest` | dbt, table | `ReplacingMergeTree` | first scoring of every pre-failure pulse of a failed lifecycle, scored against the truth |
+| gold | `rpt_model_live_performance` | dbt, table | `ReplacingMergeTree` | live RMSE, MAE, bias, NASA score, horizon precision/recall/F1 and warning lead time per model version |
 | serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL | every prediction with its sensor readings |
 | serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree` | training-run registry |
 | serving | `v_engine_rul_latest` | view | – | latest prediction per engine |
@@ -112,6 +123,9 @@ flowchart LR
     STR --> FCT
     LC --> FCT
     P[(gold_engine_rul_predictions)] --> FCT
+    P --> BT[fct_rul_prediction_backtest]
+    LC --> BT
+    BT --> RPT[rpt_model_live_performance]
 ```
 
 ## 5. Correctness and idempotency, end to end
@@ -125,7 +139,10 @@ flowchart LR
 - **Late data is recomputed, not appended.** `stg_engine_telemetry` re-reads a 10-minute
   ingestion-time lookback. `int_sensor_rolling_features` recomputes every engine lifecycle that
   received a new or corrected pulse, because one late pulse shifts the windows of its neighbours.
-  The integration harness proves the incremental result equals a `--full-refresh`.
+  The integration harness proves the incremental result equals a `--full-refresh`. Every feature
+  row also records the `baseline_cycles` it was computed with, so changing that variable
+  recomputes every lifecycle on the next run (`assert_features_use_current_baseline_cycles` fails
+  until it has).
 - **No future leakage.** Every feature uses only rows at or before its own `event_ts`: backward
   time windows, lag-1 deltas and an *expanding* lifecycle baseline.
 
@@ -133,11 +150,17 @@ flowchart LR
 
 | Event | Behaviour |
 |---|---|
-| `docker compose down` → `up` | everything resumes: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry (bit-identical wear trajectory) |
-| ClickHouse down | Path B fails, the job exits non-zero and Docker restarts it; it resumes from the last committed batch while Path A keeps writing the lake |
-| Postgres down | the simulator drops ticks with bounded reconnect backoff; after 10 failed attempts it exits and Docker restarts it |
-| A task fails in the orchestrator | logged as FAILED with its output tail; the loop continues; repeated failures back off exponentially |
-| Debezium connector stopped | the replication slot retains WAL; `make verify` shows the slot lag; `make register-cdc` restores it |
+| `docker compose down` → `up` | everything resumes within the 7-day Kafka retention: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry and the generation settings it stores per lifecycle in `simulator_lifecycle_params` (bit-identical wear trajectory; changed `SIM_SEED` / `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` apply from each engine's next lifecycle) |
+| ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (backoff 2–60 s) once ClickHouse answers; the six lake queries keep committing; the process stays up |
+| MinIO down | the lake queries stall or fail and resume from their checkpoints once MinIO answers; `clickhouse_raw` keeps running |
+| Outage longer than the Kafka retention | queries whose unread records were deleted stop loudly (`KAFKA_FAIL_ON_DATA_LOSS=true`) with recovery steps in the log |
+| Postgres down | the simulator drops ticks with bounded reconnect backoff and re-takes its single-writer lock on reconnect; after 10 failed attempts it exits and Docker restarts it |
+| A second simulator against the same database | refused: every session takes the advisory lock `jet-engine-simulator`; the newcomer waits up to 60 s, then exits 2 while the first keeps writing |
+| Simulator killed during the first-boot backfill | each engine's history is one transaction; the next start backfills exactly the engines that still have no telemetry |
+| A task fails in the orchestrator | logged as FAILED with its output tail; the loop continues; repeated failures back off exponentially; a failed dbt test skips that cycle's training and snapshot |
+| A manual `make` job while the loop runs the same job | it waits for the per-job lock (shared volume) instead of colliding |
+| Debezium connector stopped, PAUSED or FAILED | the replication slot retains WAL (capped by `max_slot_wal_keep_size`, 4 GB); `make register-cdc` restarts or resumes it; `make cdc-status` exits 1 until it is RUNNING |
+| Driver loop of the streaming job wedged | `/tmp/streaming.heartbeat` goes stale and the container turns unhealthy |
 | `make clean` | all volumes are deleted; the next `make up` rebuilds history from the backfill |
 
 ## 7. Design decisions
@@ -150,4 +173,5 @@ flowchart LR
 | Incremental dbt by touched lifecycle | rolling windows stay correct under late data at a fraction of a full rebuild | recomputes whole lifecycles (~1 800 rows) per touched engine |
 | Features in dbt, not in Python | one definition serves training, inference and BI, which removes train/serve skew | windowed SQL is harder to unit test (hence the integration harness) |
 | Lightweight scheduler instead of Airflow | one small container, zero extra infrastructure for a single-node stack | no UI or backfill semantics; the same tasks map one to one onto Airflow operators |
-| Community MinIO build (`pgsty/minio`) | the official images are no longer published | pinned by tag; override with `MINIO_IMAGE` |
+| Community MinIO build (`pgsty/minio`) | the official images are no longer published | pinned by digest; override with `MINIO_IMAGE` |
+| Ports bound to `127.0.0.1` by default | default credentials stay unreachable from the network | set `BIND_HOST` to expose the stack deliberately |

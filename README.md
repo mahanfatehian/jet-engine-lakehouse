@@ -38,7 +38,7 @@ This repository builds the complete data platform behind that answer:
 | Need | How this platform meets it |
 |---|---|
 | Capture every operational change, not periodic snapshots | Debezium reads the Postgres WAL: inserts **and** updates arrive as CDC events |
-| Keep an immutable, replayable history | Bronze/silver Parquet in an S3 lakehouse, written exactly-once |
+| Keep an immutable, replayable history | Bronze/silver Parquet in an S3 lakehouse, written exactly-once for Spark readers (`_spark_metadata`) |
 | Fleet KPIs in seconds | ClickHouse receives CDC rows ~4 s after the source commit (p95 6 s) |
 | Features without leakage | dbt computes point-in-time rolling windows per engine lifecycle |
 | Reproducible models | Versioned artifacts, champion/challenger promotion, run registry |
@@ -53,8 +53,9 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 47 dbt data tests per run, 360+ unit tests, a verification report (`make verify`) |
-| **Model (example run)** | holdout RMSE 9.6 cycles, R² 0.95, failure classifier ROC-AUC 0.998 |
+| **Quality gates** | 93 dbt data tests per run (a failure blocks training and lake snapshots), 580+ unit tests plus 187 Spark tests, `make verify` (exits non-zero on any failed check), CI on every push |
+| **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
+| **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
 ## Architecture
 
@@ -78,7 +79,7 @@ flowchart LR
     subgraph OLAP["Real-time OLAP · ClickHouse"]
         RAW[("raw_* tables<br/>ReplacingMergeTree")]
         DBT["dbt-clickhouse<br/>silver → gold"]
-        MART[("mart_rul_training_features<br/>fct_engine_health_status")]
+        MART[("mart_rul_training_features<br/>fct_engine_health_status<br/>rpt_model_live_performance")]
         PRED[("gold_engine_rul_predictions")]
     end
     subgraph DS["Data science"]
@@ -100,6 +101,7 @@ flowchart LR
     GOLD -. "--source minio" .-> TRAIN
     TRAIN --> ART --> INFER
     MART --> INFER --> PRED
+    PRED -. "live backtest" .-> DBT
     ORCH -. schedules .-> DBT
     ORCH -. schedules .-> TRAIN
     ORCH -. schedules .-> INFER
@@ -135,9 +137,9 @@ cp infrastructure/.env.example infrastructure/.env
 
 make up            # build 3 images and start 11 services; the CDC connector registers itself
 make ps            # wait until services are healthy and the init jobs exited with 0
-make register-cdc  # idempotent: (re)registers the Debezium connector and waits for RUNNING
+make register-cdc  # registers or updates the connector, restarts a FAILED task, waits for RUNNING
 make stream        # follow Spark: "clickhouse batch N: engine_telemetry=30 ..." every 5 s
-make dbt-run       # dbt build: 7 models + 47 data tests
+make dbt-run       # dbt build: 9 models + 93 data tests
 make train-ml      # train, evaluate and promote the RUL model; artifacts land in MinIO
 make predict-ml    # score every engine; predictions land in ClickHouse
 make verify        # end-to-end report across Postgres, Debezium, MinIO and ClickHouse
@@ -149,7 +151,8 @@ wheels, which takes a while on a slow link; later builds come from the Docker ca
 You do not have to run the last five steps by hand: the **orchestrator** runs dbt every two
 minutes, trains a first model as soon as enough completed lifecycles exist (immediately, thanks to
 the backfill), predicts after every dbt cycle and retrains every 30 minutes when new failures have
-been observed. The `make` targets run the same jobs on demand.
+been observed. The `make` targets run the same jobs on demand and share the scheduler's per-job
+locks, so a manual `make dbt-run` waits for a scheduled dbt run instead of colliding with it.
 
 <a id="without-make"></a>
 <details>
@@ -160,14 +163,14 @@ C="docker compose -f infrastructure/docker-compose.yml"
 $C up -d --build                                                   # make up
 $C run --rm cdc-register                                           # make register-cdc
 $C logs -f streaming                                               # make stream
-$C run --rm -w /app/analytics orchestrator dbt build --profiles-dir /app/analytics   # make dbt-run
-$C run --rm orchestrator python data_science/train_rul_model.py    # make train-ml
-$C run --rm orchestrator python data_science/predict_rul.py --mode batch             # make predict-ml
+$C run --rm orchestrator python orchestration/pipeline_runner.py task dbt-build   # make dbt-run
+$C run --rm orchestrator python orchestration/pipeline_runner.py task train       # make train-ml
+$C run --rm orchestrator python orchestration/pipeline_runner.py task predict     # make predict-ml
 $C down                                                            # make down (data is kept)
 ```
 
-In Git Bash, prefix the `-w /app/analytics` line with `MSYS_NO_PATHCONV=1` so the path is not
-rewritten into a Windows path.
+Extra arguments for the underlying script go after `--`, for example
+`... task train -- --promotion-policy always`.
 </details>
 
 ## Verify the data flow
@@ -244,10 +247,11 @@ FROM v_engine_rul_latest ORDER BY predicted_rul_cycles;
 ```
 
 ```sql
--- Fleet health board (gold): drift KPIs, anomaly flags, health score, latest prediction
+-- Fleet health board (gold): drift KPIs, anomaly flags, health score and the latest prediction,
+-- aged to the current cycle (the raw prediction is up to one dbt interval old)
 SELECT engine_id, operational_status, current_cycle, round(egt_c_drift, 1) AS egt_drift_c,
        round(vibration_mm_s_ratio, 2) AS vib_ratio, anomaly_count, round(health_score, 1) AS health,
-       round(predicted_rul_cycles, 1) AS rul_cycles, risk_band
+       round(predicted_rul_cycles_adjusted, 1) AS rul_cycles_now, risk_band_adjusted AS risk_now
 FROM fct_engine_health_status ORDER BY health_score;
 
 -- Training labels: RUL counts down to exactly 0 at the failure pulse of every lifecycle
@@ -260,12 +264,28 @@ SELECT model_version, train_lifecycles, test_lifecycles, round(rmse, 2) AS rmse,
        round(r2, 3) AS r2, round(clf_f1, 3) AS f1, promoted
 FROM ml_model_runs ORDER BY trained_at DESC;
 
--- ClickHouse can query the silver lake in MinIO directly
-SELECT count() FROM s3('http://minio:9000/lakehouse/silver/engine_telemetry/*/*.parquet',
-                       'minioadmin', 'minioadmin', 'Parquet');
+-- Live backtest (gold): every prediction scored against the failures that have happened since
+SELECT model_version, engine_model, predictions_scored AS n, lifecycles_covered AS lifecycles,
+       round(rmse_cycles, 2) AS rmse, round(bias_cycles, 2) AS bias, round(clf_f1, 3) AS f1,
+       median_warning_lead_cycles AS lead_cycles
+FROM rpt_model_live_performance ORDER BY model_version, engine_model;
+
+-- ClickHouse can query the silver lake in MinIO directly. s3() lists every part file and
+-- ignores Spark's _spark_metadata, so count distinct change events rather than rows.
+SELECT uniqExact(telemetry_id, cdc_lsn)
+FROM s3('http://minio:9000/lakehouse/silver/engine_telemetry/*/*.parquet',
+        'minioadmin', 'minioadmin', 'Parquet');
 ```
 
+After nine hours the backtest covered four model versions, each scored on the 11–28 lifecycles
+that failed after it went live: RMSE 13–17 cycles, failure recall 0.88–0.96, and a HIGH-risk
+warning a median of 17–30 cycles before the failure.
+
 ## Service endpoints
+
+Every port binds to `127.0.0.1` by default, so the default credentials are only reachable from
+this machine; set `BIND_HOST=0.0.0.0` to expose them, after changing the passwords. `make urls`
+prints the addresses with the ports from your `infrastructure/.env`.
 
 | Service | Address | Credentials (defaults) |
 |---|---|---|
@@ -288,9 +308,12 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | Variable | Default | Effect |
 |---|---|---|
 | `SIM_ENGINE_IDS` | 6 engines | fleet composition; the prefix picks the engine type (JT9D, CFM56, GE90) |
-| `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` | `180` / `10` | lifecycle length: ~30 min of 1 Hz pulses per engine |
-| `SIM_BACKFILL_LIFECYCLES` | `4` | historical lifecycles generated on an empty database |
+| `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` | `180` / `10` | lifecycle length: ~30 min of 1 Hz pulses per engine; a change applies from each engine's next lifecycle |
+| `SIM_BACKFILL_LIFECYCLES` | `4` | history generated for every engine without telemetry (first boot, an interrupted first boot, an engine added later) |
 | `LAKE_TRIGGER_SECONDS` / `CLICKHOUSE_TRIGGER_SECONDS` | `60` / `5` | micro-batch cadence of Path A / Path B |
+| `KAFKA_FAIL_ON_DATA_LOSS` | `true` | a CDC query fails loudly if Kafka retention deleted records it had not read |
+| `PIPELINE_GATE_ON_DBT_TESTS` | `true` | a failed dbt test skips training and lake snapshots in that cycle |
+| `BIND_HOST` | `127.0.0.1` | interface every published port binds to |
 | `DBT_INTERVAL_SECONDS` / `TRAIN_INTERVAL_SECONDS` | `120` / `1800` | orchestration cadence |
 | `RUL_FAILURE_HORIZON_CYCLES` / `RUL_CAP_CYCLES` | `25` / `125` | "imminent failure" horizon and RUL target cap (dbt reads the same values) |
 | `FLIGHT_HOURS_PER_CYCLE` | `2.0` | converts predicted cycles into hours |
@@ -302,26 +325,39 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | Command | What it does |
 |---|---|
 | `make ps`, `make logs SERVICE=simulator` | status of every service; follow one service's logs |
-| `make cdc-status` | Debezium connector and task state |
+| `make urls` | addresses of every web UI and API |
+| `make cdc-status` | Debezium connector and task state (exit 1 unless RUNNING) |
+| `make register-cdc ARGS=--dry-run` | show what registration would change, without changing it |
 | `make pipeline-once` | dbt → snapshot → train → predict once, outside the schedule |
 | `make snapshot` | export silver/gold feature tables to MinIO Parquet now |
 | `make train-ml ARGS="--promotion-policy always"` | force-promote a freshly trained model |
 | `make dbt-run ARGS="--full-refresh"` | rebuild every dbt model from the raw CDC tables |
 | `make ch-init` | re-apply the idempotent ClickHouse schema |
-| `make down` / `make up` | stop and start again; all data and stream offsets are kept |
+| `make down` / `make up` | stop and start again; all data and stream offsets are kept (for outages shorter than the 7-day Kafka retention) |
 | `make clean` | **deletes every volume** (Postgres, Kafka, MinIO, ClickHouse, Spark checkpoints) |
-| `make test`, `make lint` | unit tests in the data-platform image; ruff lint and format check |
+| `make test`, `make lint` | every unit test (data-platform image, then the Spark tests in the streaming image); ruff lint and format check |
 
 <details>
 <summary><b>Troubleshooting</b></summary>
 
 - **A port is already in use:** set the matching `*_PORT` variable in `infrastructure/.env`.
-- **`streaming` restarts in a loop:** `make logs SERVICE=streaming`. The job exits non-zero on
-  purpose when a query dies (for example while ClickHouse is down) and resumes from its
-  checkpoints after the restart, so nothing is lost or duplicated in the lake.
+- **`streaming` logs "query ... failed ... restarting it from its checkpoint":** a dependency of
+  that query is down (ClickHouse for `clickhouse_raw`, MinIO for the lake queries). The supervisor
+  restarts it with backoff (2 s up to 60 s) while the other queries keep running.
+  `docker exec de_streaming cat /tmp/streaming.heartbeat` shows every query's state and last error.
+- **`streaming` stops a query "at a gap in the Kafka CDC log":** the job was down longer than the
+  Kafka retention, so records it never read are gone. For `clickhouse_raw`, delete its checkpoint
+  (`/opt/spark-checkpoints/clickhouse_raw`; the raw tables are idempotent); for a lake query, run
+  once with `KAFKA_FAIL_ON_DATA_LOSS=false` until it commits past the gap, then set it back.
+- **`simulator` exits with code 2:** either another simulator is already writing to the database
+  (stop it; the container takes over within a minute), or a database written before per-lifecycle
+  settings existed was restarted with different `SIM_*` values: restore them for one start.
 - **No predictions yet:** the first model trains right after the first dbt run;
   `make logs SERVICE=orchestrator` shows each task as SUCCESS, SKIPPED or FAILED.
-- **Connector not RUNNING:** `make cdc-status`, then `make register-cdc`.
+- **Connector not RUNNING:** `make cdc-status`, then `make register-cdc` (it restarts a FAILED task
+  and resumes a PAUSED connector).
+- **A manual `make dbt-run` or `make train-ml` seems to hang:** it is waiting for the scheduled run
+  of the same job to finish (shared locks), then runs with the scheduler's timeouts.
 - **MinIO image:** MinIO Inc. no longer publishes the `minio/minio` and `minio/mc` images, so the
   stack pins the maintained community builds `pgsty/minio` and `pgsty/mc` (same binaries, CLI
   and S3 API). Override them with `MINIO_IMAGE` / `MC_IMAGE`.
@@ -354,11 +390,15 @@ jet-engine-lakehouse/
 
 ## Testing
 
-- **Unit tests:** `make test` runs 360+ tests across the simulator physics and state machine, CDC
-  parsing and ClickHouse sink, the ML pipeline, the registry and the scheduler. The Spark tests run
-  inside the streaming image.
-- **Data tests:** every orchestrated dbt cycle runs 47 tests (CDC dedup, label consistency, finite
-  features, one fleet row per engine, ...).
+- **Unit tests:** `make test` runs `make test-platform` (simulator physics and state machine,
+  ML pipeline, registry, scheduler, in the data-platform image) and `make test-streaming` (CDC
+  parsing, the query supervisor and the ClickHouse sink with real Spark, in the streaming image,
+  failing on any skipped test).
+- **Data tests:** every orchestrated dbt cycle runs the dbt tests (CDC dedup, label consistency,
+  finite features, calibrated anomaly thresholds, one fleet row per engine, backtest invariants,
+  ...); a failure blocks training and lake snapshots for that cycle.
+- **CI:** GitHub Actions runs lint, both unit-test suites, the dbt integration harness and a
+  compose check on every push and pull request, plus a nightly full-stack smoke test.
 - **dbt integration harness:** `bash tests/analytics/run_dbt_integration.sh` seeds a throwaway
   ClickHouse with synthetic CDC (duplicates, updates, deletes, late rows) and proves that the
   incremental models equal a full refresh.
@@ -366,9 +406,20 @@ jet-engine-lakehouse/
 
 ## Production hardening notes
 
-This is a single-node reference platform. Before running it anywhere real: replace every default
-credential (MinIO, ClickHouse, Postgres) and keep `.env` out of version control; give Debezium a
-dedicated replication role instead of the superuser; run Kafka with three brokers and replication
-factor 3; enable TLS on every endpoint; add retention or TTL to the silver and gold layers; and
-treat `model_bundle.joblib` as trusted code (it is a pickle), loading models only from a bucket that
-only the training job can write.
+This is a single-node reference platform. What is already in place:
+- every published port binds to `127.0.0.1` unless `BIND_HOST` says otherwise;
+- model bundles are verified by SHA-256 before they are unpickled;
+- ClickHouse's own log tables expire after 3–7 days (profiling logs are off);
+- a stalled CDC replication slot can pin at most `PG_MAX_SLOT_WAL_KEEP_SIZE` (4 GB) of WAL;
+- the third-party MinIO images are pinned by digest.
+
+Before running it anywhere real: replace every default credential (MinIO, ClickHouse, Postgres)
+and keep `.env` out of version control; give Debezium a dedicated replication role instead of the
+superuser; run Kafka with three brokers and replication factor 3; enable TLS on every endpoint;
+add retention to the silver and gold lake layers; and keep the lakehouse bucket writable only by
+the training job, because whoever can rewrite `production.json` can also forge its digest.
+
+**Upgrading an existing stack:** a `production.json` written before bundle digests existed is not
+loaded; the next scheduled training promotes a digest-carrying model (in its first cycle), and
+predictions resume. One-off: run `make dbt-run ARGS="--full-refresh --select int_sensor_rolling_features+"`
+once, because that incremental model gained a column.
