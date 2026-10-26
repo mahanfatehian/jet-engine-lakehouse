@@ -1,0 +1,24 @@
+<!-- Read-only ClickHouse account for Grafana: SELECT only, no table functions (url/s3/file/remote need
+     source grants it does not have), no writes or DDL. The password comes from the container env. -->
+<clickhouse>
+    <profiles>
+        <grafana_readonly>
+            <!-- 2, not 1: the Grafana plugin sets per-query settings, which readonly = 1 rejects -->
+            <readonly>2</readonly>
+            <max_execution_time>60</max_execution_time>
+        </grafana_readonly>
+    </profiles>
+    <users>
+        <grafana>
+            <password from_env="GRAFANA_CLICKHOUSE_PASSWORD"/>
+            <profile>grafana_readonly</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <grants>
+                <query>GRANT SELECT ON *.*</query>
+            </grants>
+        </grafana>
+    </users>
+</clickhouse>

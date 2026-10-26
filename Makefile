@@ -50,6 +50,8 @@ DEBEZIUM_PORT ?= $(call knob,DEBEZIUM_PORT,8083)
 SPARK_UI_PORT ?= $(call knob,SPARK_UI_PORT,4040)
 POSTGRES_PORT ?= $(call knob,POSTGRES_PORT,5432)
 KAFKA_PORT ?= $(call knob,KAFKA_PORT,9092)
+GRAFANA_PORT ?= $(call knob,GRAFANA_PORT,3000)
+SCHEMA_REGISTRY_PORT ?= $(call knob,SCHEMA_REGISTRY_PORT,8081)
 DATA_PLATFORM_IMAGE ?= iot-engine/data-platform:latest
 STREAMING_IMAGE ?= iot-engine/streaming:latest
 RUFF_IMAGE ?= ghcr.io/astral-sh/ruff:0.17.1
@@ -177,7 +179,9 @@ build: ## Build the application images (or only SERVICE=<name>)
 
 urls: ## Print the host addresses of the web UIs and APIs (ports follow infrastructure/.env)
 	@printf '  %-28s %s\n' \
+		'Grafana dashboards' 'http://$(HOST_ADDRESS):$(GRAFANA_PORT)' \
 		'MinIO console' 'http://$(HOST_ADDRESS):$(MINIO_CONSOLE_PORT)' \
+		'Schema Registry' 'http://$(HOST_ADDRESS):$(SCHEMA_REGISTRY_PORT)/subjects' \
 		'ClickHouse Play (web SQL)' 'http://$(HOST_ADDRESS):$(CLICKHOUSE_HTTP_PORT)/play' \
 		'Spark UI' 'http://$(HOST_ADDRESS):$(SPARK_UI_PORT)' \
 		'Debezium connector status' 'http://$(HOST_ADDRESS):$(DEBEZIUM_PORT)/connectors/$(CONNECTOR)/status' \

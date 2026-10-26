@@ -1,0 +1,41 @@
+# =============================================================================
+# ClickHouse datasource for the Jet Engine Lakehouse dashboards (plugin
+# grafana-clickhouse-datasource, baked into the image by infrastructure/grafana/Dockerfile).
+#
+# Grafana expands $VAR / ${VAR} from its own environment when it reads this file, so the
+# connection comes from docker-compose (the shared CLICKHOUSE_* variables) and no
+# credential is ever written to git. The datasource is read-only in the UI (editable: false)
+# and its uid is the one every provisioned dashboard references.
+# =============================================================================
+apiVersion: 1
+
+# Remove datasources that an earlier version of this file provisioned but no longer lists.
+prune: true
+
+datasources:
+  - name: ClickHouse lakehouse
+    uid: clickhouse-lakehouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    editable: false
+    jsonData:
+      # HTTP interface of the clickhouse service on the compose network (not the host port).
+      protocol: http
+      host: ${CLICKHOUSE_HOST}
+      port: ${CLICKHOUSE_PORT}
+      secure: false
+      username: ${CLICKHOUSE_USER}
+      # Dashboards use unqualified table names, resolved in this database (like init-db.sql).
+      defaultDatabase: ${CLICKHOUSE_DB}
+      dialTimeout: 10
+      queryTimeout: 60
+      # Every query runs with readonly = 2: ClickHouse rejects INSERT, ALTER, DROP and any other
+      # write or DDL against the database (session settings stay allowed, the plugin sets some).
+      # It does not restrict table functions such as url() or file(); for that, point
+      # CLICKHOUSE_USER at an account with SELECT grants only (no URL/S3/FILE/REMOTE grants).
+      customSettings:
+        - setting: readonly
+          value: "2"
+    secureJsonData:
+      password: ${CLICKHOUSE_PASSWORD}

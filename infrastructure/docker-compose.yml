@@ -256,11 +256,14 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-iot_engine}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # Password of the SELECT-only `grafana` account defined in users.d/grafana-reader.xml.
+      GRAFANA_CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana-readonly}
     volumes:
       - chdata:/var/lib/clickhouse
       - ./clickhouse/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
       - ./clickhouse/init-db.sql:/opt/clickhouse-init/init-db.sql:ro
       - ./clickhouse/config.d/system-log-retention.xml:/etc/clickhouse-server/config.d/system-log-retention.xml:ro
+      - ./clickhouse/users.d/grafana-reader.xml:/etc/clickhouse-server/users.d/grafana-reader.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -422,6 +425,48 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  # --------------------------------------------------------------- dashboards
+  # Grafana with the ClickHouse plugin baked into the image at build time (offline restarts);
+  # the datasource and the four dashboards are provisioned read-only from infrastructure/grafana.
+  grafana:
+    build:
+      context: ./grafana
+    image: iot-engine/grafana:latest
+    container_name: de_grafana
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # CLICKHOUSE_HOST/PORT/DB feed provisioning/datasources/clickhouse.yml; Grafana logs in
+      # with its own SELECT-only account (clickhouse/users.d/grafana-reader.xml).
+      <<: *clickhouse-env
+      CLICKHOUSE_USER: grafana
+      CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana-readonly}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Off by default: every Grafana user, an anonymous Viewer too, can send SQL to the datasource.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:-false}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}/
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/fleet-health-rul.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    mem_limit: ${GRAFANA_MEM_LIMIT:-1g}
+    restart: unless-stopped
+    logging: *default-logging
+
 volumes:
   pgdata:
   kafkadata:
@@ -429,3 +474,4 @@ volumes:
   chdata:
   spark-checkpoints:
   pipeline-locks:
+  grafana-data:

@@ -1,0 +1,21 @@
+# =============================================================================
+# Dashboards as code: every JSON file in infrastructure/grafana/dashboards (mounted read-only
+# at /etc/grafana/dashboards) is loaded into the "Jet Engine Lakehouse" folder. Each
+# dashboard keeps the uid in its file, so links and bookmarks survive reloads. Edits made in
+# the UI cannot be saved over the provisioned version (allowUiUpdates: false): change the
+# JSON instead (Grafana re-reads the directory every 30 s) or use "Save as" for a copy.
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: jet-engine-lakehouse
+    orgId: 1
+    type: file
+    folder: Jet Engine Lakehouse
+    folderUid: jet-engine-lakehouse
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
