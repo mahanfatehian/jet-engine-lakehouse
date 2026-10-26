@@ -1,11 +1,15 @@
 """Spark Structured Streaming job: Debezium CDC in Kafka -> MinIO lakehouse + ClickHouse.
 
-Startup: wait for ClickHouse, MinIO and Kafka, check the ClickHouse tables, start the
-seven queries (see ``streaming_queries``) in one local-mode driver, then supervise them.
+Startup: write the first heartbeat, build the local-mode driver and hand the seven queries
+(see ``streaming_queries``) to the supervisor (see ``streaming_supervisor``). The lake
+queries start once Kafka and MinIO answer, ``clickhouse_raw`` once Kafka and ClickHouse
+(with its tables) answer; a query that fails is restarted from its checkpoint with a capped
+exponential backoff while the others keep running. The supervisor keeps the heartbeat file
+(STREAMING_HEARTBEAT_FILE) fresh for the container healthcheck.
 
-Exit codes: 0 after a requested shutdown (SIGTERM/SIGINT), 1 when startup or any query
-fails (Docker's ``restart: unless-stopped`` then restarts the job, which resumes from its
-checkpoints), 2 for an invalid configuration.
+Exit codes: 0 after a requested shutdown (SIGTERM/SIGINT), 1 when the Spark driver cannot be
+started or stops (Docker's ``restart: unless-stopped`` then restarts the job, which resumes
+from its checkpoints), 2 for an invalid configuration.
 """
 
 from __future__ import annotations
@@ -16,16 +20,16 @@ import signal
 import sys
 import threading
 import time
-from contextlib import closing
+from functools import partial
+from pathlib import Path
 from types import FrameType
 
 import clickhouse_sink
-from cdc_schemas import DEAD_LETTER_TABLE, TABLES
 from pyspark.sql import SparkSession
 from streaming_config import ConfigError, StreamingSettings, load_settings, spark_conf
-from streaming_queries import EXIT_OK, start_queries, supervise
-from streaming_readiness import wait_for_dependencies
-from streaming_retry import RetryAbortedError
+from streaming_heartbeat import HeartbeatWriter
+from streaming_queries import build_query_groups
+from streaming_supervisor import QuerySupervisor
 
 logger = logging.getLogger("spark_kafka_to_lakehouse")
 
@@ -71,25 +75,27 @@ def build_spark_session(settings: StreamingSettings) -> SparkSession:
     return spark
 
 
-def run(settings: StreamingSettings, stop_event: threading.Event) -> int:
-    """Startup sequence followed by supervision of the streaming queries."""
-    wait_for_dependencies(settings, stop_event.wait)
-    with closing(clickhouse_sink.connect(settings, stop_event.wait)) as client:
-        required_tables = [table.clickhouse_table for table in TABLES] + [DEAD_LETTER_TABLE]
-        clickhouse_sink.verify_tables(client, settings.clickhouse_db, required_tables, stop_event.wait)
-        spark = build_spark_session(settings)
-        try:
-            # Creating the SparkContext replaced our SIGINT handler with PySpark's own.
-            install_signal_handlers(stop_event)
-            if stop_event.is_set():
-                logger.info("shutdown requested before the queries started")
-                return EXIT_OK
-            writer = clickhouse_sink.ClickHouseWriter(client, settings.clickhouse_db, stop_event.wait)
-            queries = start_queries(spark, settings, writer)
-            logger.info("started %d queries: %s", len(queries), ", ".join(query.name for query in queries))
-            return supervise(spark, queries, stop_event)
-        finally:
-            spark.stop()
+def driver_alive(spark: SparkSession) -> bool:
+    """False once the SparkContext has stopped or its JVM is gone: no query can run any more."""
+    try:
+        return not spark.sparkContext._jsc.sc().isStopped()
+    except Exception:  # the py4j gateway died with the JVM
+        return False
+
+
+def run(settings: StreamingSettings, stop_event: threading.Event, heartbeat: HeartbeatWriter) -> int:
+    """Build the driver, then supervise the streaming queries until shutdown."""
+    spark = build_spark_session(settings)
+    clickhouse = clickhouse_sink.ClickHouseTarget(settings, stop_event.wait)
+    try:
+        # Creating the SparkContext replaced our SIGINT handler with PySpark's own.
+        install_signal_handlers(stop_event)
+        groups = build_query_groups(spark, settings, clickhouse)
+        supervisor = QuerySupervisor(groups, stop_event, heartbeat, driver_alive=partial(driver_alive, spark))
+        return supervisor.run()
+    finally:
+        clickhouse.close()
+        spark.stop()
 
 
 def main() -> int:
@@ -103,12 +109,16 @@ def main() -> int:
     configure_logging(settings.log_level)
     stop_event = threading.Event()
     install_signal_handlers(stop_event)
+    heartbeat = HeartbeatWriter(Path(settings.heartbeat_file))
+    heartbeat.publish({"status": "starting", "queries": {}}, force=True)  # fresh before Spark boots
     logger.info("starting with %s", settings)
+    if not settings.kafka_fail_on_data_loss:
+        logger.warning(
+            "KAFKA_FAIL_ON_DATA_LOSS=false: records deleted by the Kafka topic retention before a "
+            "query read them are skipped with only a Spark warning"
+        )
     try:
-        exit_code = run(settings, stop_event)
-    except RetryAbortedError as exc:
-        logger.info("shutdown requested during startup: %s", exc)
-        return EXIT_OK
+        exit_code = run(settings, stop_event, heartbeat)
     except Exception:
         logger.exception("streaming job failed")
         return EXIT_FAILURE
