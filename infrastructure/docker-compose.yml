@@ -36,13 +36,17 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: de_postgres
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
+    # max_slot_wal_keep_size caps the WAL a stalled replication slot may pin on disk;
+    # beyond it the slot is invalidated (Debezium then needs a re-snapshot) instead of
+    # filling the volume.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10",
+              "-c", "max_slot_wal_keep_size=${PG_MAX_SLOT_WAL_KEEP_SIZE:-4GB}"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
       POSTGRES_USER: ${POSTGRES_USER:-admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -62,7 +66,7 @@ services:
     image: confluentinc/cp-kafka:7.5.0
     container_name: de_kafka
     ports:
-      - "${KAFKA_PORT:-9092}:9092"
+      - "${BIND_HOST:-127.0.0.1}:${KAFKA_PORT:-9092}:9092"
     environment:
       KAFKA_NODE_ID: ${KAFKA_NODE_ID:-1}
       KAFKA_PROCESS_ROLES: ${KAFKA_PROCESS_ROLES:-broker,controller}
@@ -120,7 +124,7 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "${DEBEZIUM_PORT:-8083}:8083"
+      - "${BIND_HOST:-127.0.0.1}:${DEBEZIUM_PORT:-8083}:8083"
     environment:
       BOOTSTRAP_SERVERS: kafka:29092
       GROUP_ID: ${DEBEZIUM_GROUP_ID:-engine-cdc-connect}
@@ -146,32 +150,34 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  # Creates the connector, applies config changes, restarts a FAILED task or resumes a
+  # PAUSED connector, then waits for RUNNING (standard library only, no extra image).
   cdc-register:
-    image: curlimages/curl:8.11.1
+    image: python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
     container_name: de_cdc_register
+    user: "65534:65534"
     depends_on:
       debezium:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "/scripts/register-connector.sh"]
+    entrypoint: ["python", "/scripts/register_connector.py"]
     environment:
       CONNECT_URL: http://debezium:8083
-      CONNECTOR_CONFIG: /config/register-postgres-connector.json
+      CONNECTOR_CONFIG: /scripts/register-postgres-connector.json
     volumes:
-      - ./debezium/register-connector.sh:/scripts/register-connector.sh:ro
-      - ./debezium/register-postgres-connector.json:/config/register-postgres-connector.json:ro
+      - ./debezium:/scripts:ro
     restart: "no"
     logging: *default-logging
 
   # ------------------------------------------------- lakehouse object store
   # Community MinIO build (MinIO Inc. no longer publishes minio/minio images);
-  # same binary, CLI and S3 API. Override with MINIO_IMAGE / MC_IMAGE.
+  # same binary, CLI and S3 API, pinned by digest. Override with MINIO_IMAGE / MC_IMAGE.
   minio:
-    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372}
     container_name: de_minio
     command: ["server", "/data", "--console-address", ":9001"]
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${BIND_HOST:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
+      - "${BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -187,7 +193,7 @@ services:
     logging: *default-logging
 
   minio-init:
-    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-25T00-00-00Z}
+    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-25T00-00-00Z@sha256:770d5f14a70ecb88e0086d3a8061de726309bee986298fef06f09429fdd683cf}
     container_name: de_minio_init
     depends_on:
       minio:
@@ -209,8 +215,8 @@ services:
     image: clickhouse/clickhouse-server:26.8
     container_name: de_clickhouse
     ports:
-      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
-      - "${CLICKHOUSE_TCP_PORT:-19000}:9000"
+      - "${BIND_HOST:-127.0.0.1}:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${BIND_HOST:-127.0.0.1}:${CLICKHOUSE_TCP_PORT:-19000}:9000"
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
@@ -220,6 +226,7 @@ services:
       - chdata:/var/lib/clickhouse
       - ./clickhouse/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
       - ./clickhouse/init-db.sql:/opt/clickhouse-init/init-db.sql:ro
+      - ./clickhouse/config.d/system-log-retention.xml:/etc/clickhouse-server/config.d/system-log-retention.xml:ro
     ulimits:
       nofile:
         soft: 262144
@@ -271,10 +278,12 @@ services:
         condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
+      # The job gates its ClickHouse query on ClickHouse itself, so a slow ClickHouse
+      # never delays the lake path.
       clickhouse:
-        condition: service_healthy
+        condition: service_started
     ports:
-      - "${SPARK_UI_PORT:-4040}:4040"
+      - "${BIND_HOST:-127.0.0.1}:${SPARK_UI_PORT:-4040}:4040"
     environment:
       <<: [*clickhouse-env, *s3-env]
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
@@ -286,8 +295,18 @@ services:
       MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-20000}
       SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
       SPARK_LOG_LEVEL: ${SPARK_LOG_LEVEL:-WARN}
+      KAFKA_FAIL_ON_DATA_LOSS: ${KAFKA_FAIL_ON_DATA_LOSS:-true}
+      STREAMING_HEARTBEAT_FILE: /tmp/streaming.heartbeat
     volumes:
       - spark-checkpoints:/opt/spark-checkpoints
+    healthcheck:
+      # The supervisor rewrites the heartbeat every few seconds, also while a query
+      # waits for a dependency or restarts; a stale file means the driver is wedged.
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/streaming.heartbeat -mmin -2 2>/dev/null)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     stop_grace_period: 30s
     restart: unless-stopped
     logging: *default-logging
@@ -306,6 +325,9 @@ services:
     command: ["python", "orchestration/pipeline_runner.py", "loop"]
     # tini as PID 1 reaps grandchildren of the dbt/ML subprocesses.
     init: true
+    # Training is bounded by TRAINING_MAX_ROWS (~1.3 GiB RSS near the cap); the limit keeps
+    # a runaway job from starving Spark and ClickHouse on the same host.
+    mem_limit: ${ORCHESTRATOR_MEM_LIMIT:-3g}
     environment:
       <<: [*clickhouse-env, *s3-env]
       DBT_PROJECT_DIR: /app/analytics
@@ -321,7 +343,18 @@ services:
       FLIGHT_HOURS_PER_CYCLE: ${FLIGHT_HOURS_PER_CYCLE:-2.0}
       MODEL_PROMOTION_POLICY: ${MODEL_PROMOTION_POLICY:-better}
       ML_ARTIFACT_PREFIX: ${ML_ARTIFACT_PREFIX:-ml-artifacts/rul_model}
+      TRAINING_MAX_ROWS: ${TRAINING_MAX_ROWS:-600000}
+      SNAPSHOT_WINDOW_DAYS: ${SNAPSHOT_WINDOW_DAYS:-7}
+      PROMOTION_MIN_R2: ${PROMOTION_MIN_R2:-0.5}
+      PROMOTION_MIN_ROC_AUC: ${PROMOTION_MIN_ROC_AUC:-0.75}
+      PROMOTION_F1_TOLERANCE: ${PROMOTION_F1_TOLERANCE:-0.05}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PIPELINE_GATE_ON_DBT_TESTS: ${PIPELINE_GATE_ON_DBT_TESTS:-true}
+      # Shared with every `docker compose run --rm orchestrator` container, so manual
+      # make targets and the scheduled loop never run the same job concurrently.
+      PIPELINE_LOCK_DIR: /locks
+    volumes:
+      - pipeline-locks:/locks
     healthcheck:
       # The scheduler rewrites its heartbeat at least every 10 s, even mid-task.
       test: ["CMD-SHELL", "test -n \"$$(find /tmp/pipeline_runner.heartbeat -mmin -2 2>/dev/null)\""]
@@ -339,3 +372,4 @@ volumes:
   miniodata:
   chdata:
   spark-checkpoints:
+  pipeline-locks:

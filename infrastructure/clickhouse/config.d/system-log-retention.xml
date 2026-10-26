@@ -1,0 +1,32 @@
+<!--
+  Keeps ClickHouse's own observability tables from growing without bound on the
+  persistent volume. The logs that help operate this platform (queries, parts,
+  errors, async inserts) are kept for a few days; the high-volume profiling logs
+  are switched off. Re-enable one by deleting its line when you need to profile.
+-->
+<clickhouse>
+    <query_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </part_log>
+    <error_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </error_log>
+    <asynchronous_insert_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </asynchronous_insert_log>
+
+    <text_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <background_schedule_pool_log remove="1"/>
+    <instrumentation_trace_log remove="1"/>
+</clickhouse>
