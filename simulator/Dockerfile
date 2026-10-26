@@ -15,7 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin simulator
 
 # Code stays root-owned and read-only for the unprivileged runtime user.
-COPY engine_generator.py fleet_bootstrap.py fleet_runtime.py fleet_db.py ./
+COPY engine_generator.py fleet_bootstrap.py fleet_config.py fleet_runtime.py fleet_db.py fleet_writer.py \
+     fleet_lease.py ./
 
 USER simulator
 
