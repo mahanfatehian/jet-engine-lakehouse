@@ -1,34 +1,32 @@
-"""ML feature contract, feature-matrix construction, feature loaders and snapshot export.
+"""ML feature contract, feature-matrix construction, the inference loader and snapshot export.
 
 CLI::
 
-    python data_science/feature_pipeline.py snapshot [--retention N]
+    python data_science/feature_pipeline.py snapshot [--retention N] [--window-days D]
 
-exports int_sensor_rolling_features (silver) plus mart_rul_training_features and
-fct_engine_health_status (gold) from ClickHouse to the lakehouse bucket as
-``<zone>/<table>/snapshot_ts=<TS>/data.parquet`` and keeps the newest N
-snapshots per dataset (default SNAPSHOT_RETENTION).
-Exit codes: 0 done, 3 source tables missing, 1 failure, 143 terminated.
+exports int_sensor_rolling_features (silver, last D days of event time, default
+SNAPSHOT_WINDOW_DAYS) plus mart_rul_training_features and fct_engine_health_status
+(gold) from ClickHouse to the lakehouse bucket as
+``<zone>/<table>/snapshot_ts=<TS>/data.parquet`` and keeps the newest N snapshots per
+dataset (default SNAPSHOT_RETENTION). Datasets with 0 rows are not published.
+Exit codes: 0 done, 3 skipped (source tables missing or every source empty),
+1 failure, 143 terminated.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import logging
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
-from artifact_store import ArtifactStore, S3ArtifactStore
+from artifact_store import S3ArtifactStore
 from ds_runtime import EXIT_OK, PreconditionsNotMetError, StopToken, configure_logging, positive_int, run_cli
 from ds_settings import load_settings
 from lakehouse_io import ClickHouseGateway, final_modifier
-from lakehouse_snapshots import GOLD_TRAINING_FEATURES, latest_snapshot_key, run_snapshot
+from lakehouse_snapshots import run_snapshot
 
 RAW_SENSOR_COLUMNS: tuple[str, ...] = (
     "rpm",
@@ -116,7 +114,6 @@ _FORBIDDEN_SUFFIXES = ("_id", "_ts", "_at")
 _FORBIDDEN_PREFIXES = ("cdc_", "kafka_")
 _FORBIDDEN_FRAGMENTS = ("wear", "rul", "failure", "status", "maintenance")
 
-TRAINING_SOURCE_TABLE = "mart_rul_training_features"
 INFERENCE_SOURCE_TABLE = "int_sensor_rolling_features"
 REGISTRY_TABLE = "raw_engine_status_registry"
 
@@ -226,111 +223,10 @@ def build_feature_matrix(
     )
 
 
-@dataclass(frozen=True)
-class TrainingFrame:
-    """Training rows (one per telemetry pulse of a completed lifecycle) and their origin."""
-
-    frame: pd.DataFrame
-    data_source: str
-    source_uri: str
-
-    @property
-    def completed_lifecycles(self) -> int:
-        """Number of distinct lifecycles (split groups) in the frame."""
-        return int(self.frame["split_group"].nunique())
-
-
-class TrainingDataSource(Protocol):
-    """Where training rows come from (ClickHouse mart or a MinIO gold snapshot)."""
-
-    name: str
-
-    def count_completed_lifecycles(self) -> int:
-        """Number of completed lifecycles available for training."""
-        ...
-
-    def load(self) -> TrainingFrame:
-        """Load the training rows."""
-        ...
-
-
-def prepare_training_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Validate raw training rows and order them deterministically."""
-    _require_columns(frame, TRAINING_FRAME_COLUMNS)
-    ordered = frame.loc[:, list(TRAINING_FRAME_COLUMNS)].copy()
-    for column in ("engine_id", "engine_model", "split_group"):
-        ordered[column] = ordered[column].astype(str)
-    return ordered.sort_values(
-        ["engine_id", "lifecycle_id", "event_ts", "telemetry_id"], kind="mergesort"
-    ).reset_index(drop=True)
-
-
-def _column_list(columns: Iterable[str], table_alias: str = "") -> str:
+def column_list(columns: Iterable[str], table_alias: str = "") -> str:
+    """SELECT list of ``columns``, each quoted and aliased to its own name."""
     qualifier = f"{table_alias}." if table_alias else ""
     return ", ".join(f"{qualifier}`{column}` AS `{column}`" for column in columns)
-
-
-class ClickHouseTrainingSource:
-    """Training rows straight from the dbt gold mart in ClickHouse."""
-
-    name = "clickhouse"
-
-    def __init__(self, gateway: ClickHouseGateway) -> None:
-        self._gateway = gateway
-
-    def _from_clause(self) -> str:
-        engines = self._gateway.table_engines([TRAINING_SOURCE_TABLE])
-        if TRAINING_SOURCE_TABLE not in engines:
-            raise PreconditionsNotMetError(
-                f"{TRAINING_SOURCE_TABLE} does not exist yet (dbt has not built it)"
-            )
-        return f"FROM `{TRAINING_SOURCE_TABLE}` {final_modifier(engines[TRAINING_SOURCE_TABLE])}"
-
-    def count_completed_lifecycles(self) -> int:
-        """Count distinct split groups in the mart."""
-        rows = self._gateway.query_rows(f"SELECT uniqExact(split_group) {self._from_clause()}")
-        return int(rows[0][0])
-
-    def load(self) -> TrainingFrame:
-        """Load the mart columns the model needs."""
-        frame = self._gateway.query_df(f"SELECT {_column_list(TRAINING_FRAME_COLUMNS)} {self._from_clause()}")
-        return TrainingFrame(prepare_training_frame(frame), self.name, f"clickhouse:{TRAINING_SOURCE_TABLE}")
-
-
-class SnapshotTrainingSource:
-    """Training rows from the newest gold snapshot in the lakehouse (downloaded once)."""
-
-    name = "minio"
-
-    def __init__(self, store: ArtifactStore) -> None:
-        self._store = store
-        self._snapshot: tuple[str, bytes] | None = None
-
-    def _download(self) -> tuple[str, bytes]:
-        if self._snapshot is None:
-            key = latest_snapshot_key(self._store, GOLD_TRAINING_FEATURES)
-            if key is None:
-                raise PreconditionsNotMetError(
-                    f"no gold snapshot of {TRAINING_SOURCE_TABLE} in the lakehouse yet"
-                )
-            self._snapshot = (key, self._store.get_bytes(key))
-        return self._snapshot
-
-    def count_completed_lifecycles(self) -> int:
-        """Count distinct split groups in the newest snapshot."""
-        _, payload = self._download()
-        groups = pq.read_table(io.BytesIO(payload), columns=["split_group"]).column("split_group")
-        return len(groups.unique())
-
-    def load(self) -> TrainingFrame:
-        """Load the snapshot columns the model needs."""
-        key, payload = self._download()
-        parquet = pq.ParquetFile(io.BytesIO(payload))
-        missing = sorted(set(TRAINING_FRAME_COLUMNS) - set(parquet.schema_arrow.names))
-        if missing:
-            raise FeatureSchemaError(f"snapshot {self._store.uri(key)} lacks columns: {', '.join(missing)}")
-        frame = parquet.read(columns=list(TRAINING_FRAME_COLUMNS)).to_pandas()
-        return TrainingFrame(prepare_training_frame(frame), self.name, self._store.uri(key))
 
 
 def load_inference_frame(gateway: ClickHouseGateway) -> pd.DataFrame:
@@ -343,9 +239,9 @@ def load_inference_frame(gateway: ClickHouseGateway) -> pd.DataFrame:
     if missing:
         raise PreconditionsNotMetError(f"tables do not exist yet: {', '.join(missing)}")
     sql = f"""
-        SELECT {_column_list(INFERENCE_FRAME_COLUMNS, "f")}, r.operational_status AS operational_status
+        SELECT {column_list(INFERENCE_FRAME_COLUMNS, "f")}, r.operational_status AS operational_status
         FROM (
-            SELECT {_column_list(INFERENCE_FRAME_COLUMNS)}
+            SELECT {column_list(INFERENCE_FRAME_COLUMNS)}
             FROM `{INFERENCE_SOURCE_TABLE}` {final_modifier(engines[INFERENCE_SOURCE_TABLE])}
             ORDER BY event_ts DESC, telemetry_id DESC
             LIMIT 1 BY engine_id
@@ -364,7 +260,7 @@ def load_inference_frame(gateway: ClickHouseGateway) -> pd.DataFrame:
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Feature pipeline jobs of the RUL platform.",
-        epilog="Exit codes: 0 done, 3 skipped (source tables missing), 1 failure.",
+        epilog="Exit codes: 0 done, 3 skipped (source tables missing or all empty), 1 failure.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     snapshot = commands.add_parser(
@@ -377,6 +273,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="snapshots kept per dataset (default: SNAPSHOT_RETENTION, 5)",
     )
+    snapshot.add_argument(
+        "--window-days",
+        type=positive_int,
+        default=None,
+        help="days of event time exported from int_sensor_rolling_features "
+        "(default: SNAPSHOT_WINDOW_DAYS, 7)",
+    )
     return parser.parse_args(argv)
 
 
@@ -387,9 +290,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(settings.log_level)
     stop = StopToken().install_signal_handlers()
     retention = args.retention or settings.snapshot_retention
+    window_days = args.window_days or settings.snapshot_window_days
     store = S3ArtifactStore(settings.s3)
     with ClickHouseGateway(settings.clickhouse) as gateway:
-        written = run_snapshot(gateway, store, retention=retention, now=datetime.now(UTC), stop=stop)
+        written = run_snapshot(
+            gateway, store, retention=retention, now=datetime.now(UTC), stop=stop, window_days=window_days
+        )
     logger.info("snapshot complete (%d datasets, retention %d)", len(written), retention)
     return EXIT_OK
 
