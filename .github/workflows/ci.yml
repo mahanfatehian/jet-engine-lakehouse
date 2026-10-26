@@ -1,0 +1,367 @@
+# =============================================================================
+# CI of the IoT Jet Engine Lakehouse
+#
+# Every job drives the developer entry points (make lint, the test images, the dbt
+# integration harness, make up / verify / clean), so a green run means the documented
+# workflow works on a clean machine that has nothing but docker and make.
+#
+#   lint              push to main, PR   make lint (ruff check + format check), pinned ruff
+#   unit-tests        push to main, PR   images built from docker-compose.yml (GHA layer cache),
+#                                        pytest inside them like make test-platform (tests/) and
+#                                        make test-streaming (tests/streaming, Spark + Java)
+#   dbt-integration   push to main, PR   tests/analytics/run_dbt_integration.sh
+#   compose-config    push to main, PR   docker-compose.yml renders without any .env file
+#                                        (inline defaults) and with .env.example
+#   full-stack-smoke  nightly, manual    make up, make verify until every check is OK, make clean
+#
+# Nightly and manual runs execute every job. No secrets are used, so pull requests from
+# forks get the same checks.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * *" # nightly, 03:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per event and ref (pull request number for PRs): a new push cancels the run it
+  # supersedes, while nightly and manual runs never cancel push or PR runs (or each other).
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash # bash --noprofile --norc -eo pipefail
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Same ruff as `make lint` runs locally (RUFF_IMAGE in the Makefile): bump both pins together.
+      # Passed explicitly, so CI stays pinned even if the Makefile default ever floats again.
+      RUFF_IMAGE: ghcr.io/astral-sh/ruff:0.17.1
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: ruff check and ruff format --check (make lint)
+        run: make lint RUFF_IMAGE="$RUFF_IMAGE"
+
+      - name: Annotate every ruff finding
+        if: failure()
+        run: |
+          # The repository is mounted at the runner's own path so the reported paths map onto it.
+          ruff() {
+            docker run --rm -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" -w "$GITHUB_WORKSPACE" \
+              "$RUFF_IMAGE" "$@" --no-cache --output-format=github .
+          }
+          ruff check || true
+          ruff format --check || true
+
+  unit-tests:
+    name: unit-tests (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `make test-platform`: tests/ inside the data-platform image (compose service
+          # `orchestrator`). tests/simulator runs here as well (numpy is all it needs), so the
+          # simulator image has no suite of its own; it is built in this leg so that a broken
+          # Dockerfile still fails CI. Only the PySpark modules may skip here (they run in the
+          # streaming leg): any other import skip means the image lost a dependency.
+          - suite: data-platform
+            targets: orchestrator,simulator
+            image: iot-engine/data-platform:latest
+            tests: tests
+            fail-on-skip: "could not import '(?!pyspark')"
+          # `make test-streaming`: tests/streaming inside the streaming image, the only one with
+          # Spark, Java and the connector jars. As in the Makefile, any skip fails the leg.
+          - suite: streaming
+            targets: streaming
+            image: iot-engine/streaming:latest
+            tests: tests/streaming
+            fail-on-skip: "."
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.targets }} from docker-compose.yml
+        uses: docker/bake-action@v7
+        with:
+          # Bake takes the build sections of the compose file. Their contexts (.., ../simulator)
+          # are relative to it, so bake runs in infrastructure/ and may read the repository root.
+          source: ./infrastructure
+          files: ./docker-compose.yml
+          allow: fs.read=..
+          targets: ${{ matrix.targets }}
+          load: true
+          # GitHub Actions layer cache, one scope per image so they do not overwrite each other.
+          set: |
+            orchestrator.cache-from=type=gha,scope=data-platform
+            orchestrator.cache-to=type=gha,mode=max,scope=data-platform
+            simulator.cache-from=type=gha,scope=simulator
+            simulator.cache-to=type=gha,mode=max,scope=simulator
+            streaming.cache-from=type=gha,scope=streaming
+            streaming.cache-to=type=gha,mode=max,scope=streaming
+
+      - name: pytest ${{ matrix.tests }} inside ${{ matrix.image }}
+        id: pytest
+        env:
+          SUITE: ${{ matrix.suite }}
+          IMAGE: ${{ matrix.image }}
+          TEST_PATHS: ${{ matrix.tests }}
+        run: |
+          results="$RUNNER_TEMP/test-results"
+          # The images run as an unprivileged user (uid 10001), which writes the report.
+          install -d -m 0777 "$results"
+          # As in `make test`, the repository is mounted read-only and nothing is written into it.
+          # Hang protection inside the container: faulthandler prints every thread's stack once a
+          # single test runs for 5 minutes, and after 15 minutes timeout interrupts pytest, which
+          # still writes the JUnit report (the step then fails with exit code 124).
+          docker run --rm --init \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$results:/test-results" -w /src \
+            -e PYTHONDONTWRITEBYTECODE=1 --entrypoint timeout "$IMAGE" --signal=INT --kill-after=1m 15m \
+            python -m pytest -p no:cacheprovider -rfEs -o faulthandler_timeout=300 \
+            --junitxml="/test-results/$SUITE.xml" -o junit_suite_name="$SUITE" "$TEST_PATHS"
+
+      - name: Summarise the JUnit report, fail on forbidden skips
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        env:
+          SUITE: ${{ matrix.suite }}
+          FAIL_ON_SKIP: ${{ matrix.fail-on-skip }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import xml.etree.ElementTree as ET
+          from collections import Counter
+          from pathlib import Path
+
+
+          def skip_reason(node):
+              # Skips at collection time (pytest.importorskip at module level) are reported as
+              # "collection skipped" with the real reason only in the text: ('path', line, 'Skipped: ...').
+              message = node.get("message") or ""
+              found = re.search(r"Skipped: (.*?)[\"']?\)$", (node.text or "").strip())
+              return found.group(1) if message == "collection skipped" and found else message
+
+
+          suite = os.environ["SUITE"]
+          report = Path(os.environ["RUNNER_TEMP"], "test-results", f"{suite}.xml")
+          if not report.is_file():
+              print(f"::warning title=unit-tests ({suite})::pytest wrote no JUnit report")
+              sys.exit(0)
+
+          outcomes, skips, blocked = Counter(), Counter(), set()
+          pattern = os.environ["FAIL_ON_SKIP"]
+          for case in ET.parse(report).getroot().iter("testcase"):
+              result = next((child for child in case if child.tag in ("failure", "error", "skipped")), None)
+              outcomes["passed" if result is None else result.tag] += 1
+              if result is not None and result.tag == "skipped":
+                  reason = skip_reason(result)
+                  skips[reason] += 1
+                  if pattern and re.search(pattern, f"{reason} {result.text or ''}"):
+                      blocked.add(reason)
+
+          lines = [
+              f"### unit-tests ({suite}): {outcomes['passed']} passed, {outcomes['failure']} failed, "
+              f"{outcomes['error']} errors, {outcomes['skipped']} skipped"
+          ]
+          if skips:
+              lines += ["", "| skipped | reason |", "| ---: | --- |"]
+              lines += [f"| {count} | {reason.replace('|', '/')} |" for reason, count in skips.most_common()]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n\n")
+          print("\n".join(lines))
+          for reason in sorted(blocked):
+              print(f"::error title=unit-tests ({suite})::skipped instead of run: {reason}")
+          sys.exit(1 if blocked else 0)
+          PY
+
+      - name: Upload the JUnit report
+        if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.suite }}
+          path: ${{ runner.temp }}/test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  dbt-integration:
+    runs-on: ubuntu-latest
+    # The harness bounds its own waits (ClickHouse readiness, apt and pip retries).
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: dbt against a throwaway ClickHouse (run_dbt_integration.sh)
+        env:
+          # Keep the tmp-analytics-* containers for the failure log below; the last step removes them.
+          ANALYTICS_IT_KEEP: "1"
+        run: bash tests/analytics/run_dbt_integration.sh
+
+      - name: Dump the container and ClickHouse server logs
+        if: failure()
+        run: |
+          docker ps -a --filter name=tmp-analytics- --format '{{.Names}}' | while read -r container; do
+            echo "::group::$container"
+            docker logs --tail 200 "$container" 2>&1 || true
+            docker exec "$container" tail -n 200 /var/log/clickhouse-server/clickhouse-server.err.log 2>/dev/null || true
+            echo "::endgroup::"
+          done
+
+      - name: Remove the integration containers and network
+        if: always()
+        run: |
+          docker ps -aq --filter name=tmp-analytics- | xargs -r docker rm -f
+          docker network ls -q --filter name=tmp-analytics- | xargs -r docker network rm
+
+  compose-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COMPOSE_YML: infrastructure/docker-compose.yml
+      ENV_EXAMPLE: infrastructure/.env.example
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Render without any .env file (every variable needs an inline default)
+        run: |
+          # Compose would silently read infrastructure/.env, which is git-ignored and must stay so.
+          if [ -e infrastructure/.env ]; then
+            echo "::error file=infrastructure/.env::remove the committed .env: it holds local overrides and secrets"
+            exit 1
+          fi
+          # Empty environment: no runner variable may stand in for a missing default.
+          env -i PATH="$PATH" HOME="$HOME" docker compose -f "$COMPOSE_YML" config --quiet 2>&1 \
+            | tee "$RUNNER_TEMP/compose-config.log"
+          if grep -q 'variable is not set' "$RUNNER_TEMP/compose-config.log"; then
+            echo "::error file=$COMPOSE_YML::give every variable an inline default: \${VAR:-default}"
+            exit 1
+          fi
+
+      - name: Render with infrastructure/.env.example
+        run: env -i PATH="$PATH" HOME="$HOME" docker compose -f "$COMPOSE_YML" --env-file "$ENV_EXAMPLE" config --quiet
+
+      - name: Check that .env.example documents exactly the compose variables
+        run: |
+          compose() { env -i PATH="$PATH" HOME="$HOME" docker compose -f "$COMPOSE_YML" "$@"; }
+          if ! diff <(compose config --variables --format json | jq -r 'keys[]' | sort) \
+            <(sed -nE 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' "$ENV_EXAMPLE" | sort -u); then
+            echo "::error file=$ENV_EXAMPLE::document exactly the variables of $COMPOSE_YML (<: compose only, >: .env.example only)"
+            exit 1
+          fi
+          # .env.example states that its values are the inline defaults: report any drift.
+          if ! diff -u <(compose config) <(compose --env-file "$ENV_EXAMPLE" config); then
+            echo "::warning file=$ENV_EXAMPLE::values differ from the inline defaults of $COMPOSE_YML (diff above)"
+          fi
+
+      - name: Check that every bind-mounted file exists
+        run: |
+          missing=0
+          while IFS= read -r source; do
+            if [ ! -e "$source" ]; then
+              echo "::error file=$COMPOSE_YML::bind mount source is missing: ${source#"$GITHUB_WORKSPACE/"}"
+              missing=1
+            fi
+          done < <(docker compose -f "$COMPOSE_YML" config --format json \
+            | jq -r '.services[] | .volumes[]? | select(.type == "bind") | .source' | sort -u)
+          exit "$missing"
+
+  full-stack-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: compose-config
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SMOKE_TIMEOUT_MINUTES: 15
+      SMOKE_POLL_SECONDS: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Free disk space for the images and data volumes
+        run: |
+          # ~10 GB of images and build cache: drop preinstalled SDKs the stack never uses.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build the images and start the stack (make up)
+        run: make up
+
+      - name: Wait until make verify reports every check OK
+        run: |
+          mkdir -p "$RUNNER_TEMP/stack-logs"
+          report="$RUNNER_TEMP/stack-logs/verify-report.txt"
+          deadline=$((SECONDS + SMOKE_TIMEOUT_MINUTES * 60))
+          for ((attempt = 1; ; attempt++)); do
+            status=0
+            timeout --kill-after=10s 5m make verify >"$report" 2>&1 || status=$?
+            # Status words of the OK / WARN / FAIL summary that ends infrastructure/clickhouse/verify.sql
+            # (its title line names all three, so it is skipped). Beyond make verify passing, the
+            # smoke test waits out every WARN: a model promoted and fresh predictions.
+            summary=$(awk '/== [0-9]+\. Summary/ { found = 1; next } found' "$report")
+            ok=$(grep -cw 'OK' <<<"$summary" || true)
+            bad=$(grep -cwE 'WARN|FAIL' <<<"$summary" || true)
+            echo "attempt $attempt: make verify exit $status, summary $ok OK, $bad WARN or FAIL"
+            if ((status == 0 && ok > 0 && bad == 0)); then
+              break
+            fi
+            if ((SECONDS >= deadline)); then
+              cat "$report"
+              echo "::error::make verify did not report every check OK within $SMOKE_TIMEOUT_MINUTES minutes"
+              exit 1
+            fi
+            sleep "$SMOKE_POLL_SECONDS"
+          done
+          cat "$report"
+          { echo "### make verify summary"; echo '```text'; echo "$summary"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Dump the stack state and logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/stack-logs"
+          make ps || true
+          df -h / && free -m
+          compose=(docker compose -f infrastructure/docker-compose.yml)
+          "${compose[@]}" logs --no-color --timestamps >"$RUNNER_TEMP/stack-logs/compose.log" 2>&1 || true
+          "${compose[@]}" logs --no-color --tail=100 || true
+
+      - name: Upload the stack logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-stack-logs
+          path: ${{ runner.temp }}/stack-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Tear down the stack and delete its volumes
+        if: always()
+        run: make clean CLEAN_GRACE_SECONDS=0
