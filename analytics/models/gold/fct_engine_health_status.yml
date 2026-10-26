@@ -1,0 +1,182 @@
+version: 2
+
+models:
+  - name: fct_engine_health_status
+    description: >
+      Fleet health board, one row per engine (registered and not deregistered, or seen in
+      telemetry): current registry state, latest sensor readings, 5-minute rolling means, drift
+      KPIs, anomaly flags, a sensor-driven degradation index and the latest RUL prediction for
+      the engine's current lifecycle. Thresholds and scales are the anomaly_* and
+      degradation_full_scale_* vars. Table (rebuilt every run) on ReplacingMergeTree ordered by
+      engine_id; rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["kpi"]
+    data_tests:
+      - expression_is_true:
+          name: fct_engine_health_status_anomaly_count_consistent
+          arguments:
+            expression: >
+              anomaly_count = is_egt_drift_anomaly + is_vibration_growth_anomaly
+              + is_oil_pressure_drop_anomaly + is_telemetry_stale
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+        data_tests:
+          - unique_under_final
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model from the registry (else from telemetry features; UNKNOWN if neither).
+      - name: operational_status
+        data_type: LowCardinality(String)
+        description: Current registry status; UNKNOWN when the engine has no registry row yet.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HEALTHY', 'WARNING', 'CRITICAL', 'FAILURE', 'MAINTENANCE_RESET', 'UNKNOWN']
+      - name: status_changed_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Time operational_status last changed (registry).
+      - name: current_lifecycle_id
+        data_type: UInt32
+        description: Lifecycle the engine is in (registry, else latest telemetry; 0 when unknown).
+      - name: current_cycle
+        data_type: UInt32
+        description: Cycle within the current lifecycle (registry, else latest telemetry).
+      - name: cycles_since_new
+        data_type: UInt32
+        description: Cycles accumulated since registration (registry; 0 when unknown).
+      - name: lifecycles_completed
+        data_type: UInt32
+        description: Run-to-failure lifecycles completed (registry, else counted from telemetry).
+      - name: last_maintenance_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Completion time of the most recent repair (registry).
+      - name: registry_updated_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Last update time of the engine's registry row.
+      - name: last_telemetry_id
+        data_type: Nullable(UInt64)
+        description: telemetry_id of the newest pulse (NULL without telemetry).
+      - name: last_telemetry_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: event_ts of the newest pulse.
+      - name: telemetry_staleness_seconds
+        data_type: Nullable(Float64)
+        description: Seconds between refreshed_at and last_telemetry_ts (never negative).
+        data_tests:
+          - non_negative
+      - name: rpm
+        data_type: Nullable(Float64)
+        description: Latest shaft speed (rev/min).
+      - name: core_temp_c
+        data_type: Nullable(Float64)
+        description: Latest core temperature (degC).
+      - name: egt_c
+        data_type: Nullable(Float64)
+        description: Latest exhaust gas temperature (degC).
+      - name: vibration_mm_s
+        data_type: Nullable(Float64)
+        description: Latest vibration velocity (mm/s).
+      - name: fuel_flow_kg_h
+        data_type: Nullable(Float64)
+        description: Latest fuel flow (kg/h).
+      - name: oil_pressure_psi
+        data_type: Nullable(Float64)
+        description: Latest oil pressure (psi).
+      - name: vibration_mm_s_mean_5m
+        data_type: Nullable(Float64)
+        description: 5-minute rolling mean vibration at the latest pulse.
+      - name: egt_c_mean_5m
+        data_type: Nullable(Float64)
+        description: 5-minute rolling mean EGT at the latest pulse.
+      - name: oil_pressure_psi_mean_5m
+        data_type: Nullable(Float64)
+        description: 5-minute rolling mean oil pressure at the latest pulse.
+      - name: egt_c_drift
+        data_type: Nullable(Float64)
+        description: EGT drift KPI (5m mean minus lifecycle baseline, degC).
+      - name: core_temp_c_drift
+        data_type: Nullable(Float64)
+        description: Core temperature minus lifecycle baseline (degC).
+      - name: vibration_mm_s_ratio
+        data_type: Nullable(Float64)
+        description: Vibration growth KPI (5m mean / lifecycle baseline).
+      - name: oil_pressure_psi_drop
+        data_type: Nullable(Float64)
+        description: Oil pressure loss KPI (lifecycle baseline minus 5m mean, psi).
+      - name: fuel_flow_kg_h_drift_pct
+        data_type: Nullable(Float64)
+        description: Fuel flow drift vs lifecycle baseline (%).
+      - name: rpm_drift_pct
+        data_type: Nullable(Float64)
+        description: Shaft speed drift vs lifecycle baseline (%).
+      - name: is_egt_drift_anomaly
+        data_type: UInt8
+        description: 1 when egt_c_drift > var anomaly_egt_drift_c.
+      - name: is_vibration_growth_anomaly
+        data_type: UInt8
+        description: 1 when vibration_mm_s_ratio > var anomaly_vibration_ratio.
+      - name: is_oil_pressure_drop_anomaly
+        data_type: UInt8
+        description: 1 when oil_pressure_psi_drop > var anomaly_oil_pressure_drop_psi.
+      - name: is_telemetry_stale
+        data_type: UInt8
+        description: >
+          1 when telemetry_staleness_seconds > var anomaly_stale_telemetry_seconds, or when the
+          engine never reported telemetry.
+      - name: anomaly_count
+        data_type: UInt8
+        description: Number of raised anomaly flags (0..4).
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 4
+      - name: degradation_index
+        data_type: Nullable(Float64)
+        description: >
+          0 (healthy) .. 1 (fully degraded): the largest of the EGT drift, vibration growth and
+          oil pressure drop KPIs, each scaled linearly to its degradation_full_scale_* var.
+          NULL without telemetry.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: health_score
+        data_type: Nullable(Float64)
+        description: 100 * (1 - degradation_index), rounded to 0.1 (100 = healthy).
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 100
+      - name: avg_completed_lifecycle_cycles
+        data_type: Nullable(Float64)
+        description: Mean length in cycles of the engine's completed lifecycles (NULL before the first failure).
+      - name: predicted_rul_cycles
+        data_type: Nullable(Float64)
+        description: Latest predicted remaining cycles for the current lifecycle (NULL until predicted).
+      - name: predicted_rul_hours
+        data_type: Nullable(Float64)
+        description: Latest predicted remaining flight hours for the current lifecycle.
+      - name: failure_probability
+        data_type: Nullable(Float64)
+        description: Latest predicted probability of failure within the horizon.
+      - name: risk_band
+        data_type: Nullable(String)
+        description: LOW | MEDIUM | HIGH of the latest prediction.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['LOW', 'MEDIUM', 'HIGH']
+      - name: model_version
+        data_type: Nullable(String)
+        description: Model that produced the latest prediction.
+      - name: predicted_at
+        data_type: "Nullable(DateTime64(3, 'UTC'))"
+        description: Time of the latest prediction for the current lifecycle.
+      - name: refreshed_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Build time of this table (UTC).

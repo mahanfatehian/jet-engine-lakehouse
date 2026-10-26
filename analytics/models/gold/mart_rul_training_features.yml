@@ -1,0 +1,237 @@
+version: 2
+
+models:
+  - name: mart_rul_training_features
+    description: >
+      RUL training set (CONTRACT.md section 7): every feature row of int_sensor_rolling_features
+      that belongs to a COMPLETED lifecycle (one with a FAILURE pulse), up to and including the
+      failure cycle, labelled with the remaining useful life. Group-aware train/test splits use
+      split_group so that no lifecycle leaks across the split. The 46 numeric model inputs are
+      cycle_number plus the 45 Float64 feature columns; engine_model is the only categorical
+      input. wear_factor, status, maintenance ids and timestamps are deliberately absent.
+      Table (rebuilt every run) on ReplacingMergeTree ordered by (engine_id, lifecycle_id,
+      telemetry_id); rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["features", "ml"]
+    columns:
+      - name: telemetry_id
+        data_type: UInt64
+        description: Source pulse id; identifier, never a feature.
+        data_tests:
+          - unique_under_final
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier; identifier, never a feature.
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model (categorical ML feature, one-hot encoded by the trainer).
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Completed lifecycle the pulse belongs to.
+      - name: cycle_number
+        data_type: UInt32
+        description: Operating cycle within the lifecycle (numeric ML feature).
+      - name: event_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Measurement time of the pulse (UTC); never a feature.
+      - name: rpm
+        data_type: Float64
+        description: Shaft speed (rev/min) of the pulse.
+      - name: core_temp_c
+        data_type: Float64
+        description: Core temperature (degC) of the pulse.
+      - name: egt_c
+        data_type: Float64
+        description: Exhaust gas temperature (degC) of the pulse.
+      - name: vibration_mm_s
+        data_type: Float64
+        description: Vibration velocity (mm/s) of the pulse.
+      - name: fuel_flow_kg_h
+        data_type: Float64
+        description: Fuel flow (kg/h) of the pulse.
+      - name: oil_pressure_psi
+        data_type: Float64
+        description: Oil pressure (psi) of the pulse.
+      - name: vibration_mm_s_mean_5m
+        data_type: Float64
+        description: Mean of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of vibration_mm_s (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_min_5m
+        data_type: Float64
+        description: Minimum of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_max_5m
+        data_type: Float64
+        description: Maximum of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_mean_15m
+        data_type: Float64
+        description: Mean of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of vibration_mm_s (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_min_15m
+        data_type: Float64
+        description: Minimum of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_max_15m
+        data_type: Float64
+        description: Maximum of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_mean_5m
+        data_type: Float64
+        description: Mean of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of egt_c (0 for a single pulse) over the lifecycle's pulses
+          in [event_ts - 300 s, event_ts].
+      - name: egt_c_min_5m
+        data_type: Float64
+        description: Minimum of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_max_5m
+        data_type: Float64
+        description: Maximum of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_mean_15m
+        data_type: Float64
+        description: Mean of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of egt_c (0 for a single pulse) over the lifecycle's pulses
+          in [event_ts - 900 s, event_ts].
+      - name: egt_c_min_15m
+        data_type: Float64
+        description: Minimum of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_max_15m
+        data_type: Float64
+        description: Maximum of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_mean_5m
+        data_type: Float64
+        description: Mean of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of oil_pressure_psi (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_min_5m
+        data_type: Float64
+        description: Minimum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_max_5m
+        data_type: Float64
+        description: Maximum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_mean_15m
+        data_type: Float64
+        description: Mean of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of oil_pressure_psi (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_min_15m
+        data_type: Float64
+        description: Minimum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_max_15m
+        data_type: Float64
+        description: Maximum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_delta_1
+        data_type: Float64
+        description: vibration_mm_s minus the previous pulse's value in the lifecycle (0 for the first pulse).
+      - name: vibration_mm_s_roc_5m
+        data_type: Float64
+        description: >
+          Change of vibration_mm_s per minute since the oldest pulse of the 5m window; 0 when no
+          time has elapsed.
+      - name: vibration_mm_s_roc_15m
+        data_type: Float64
+        description: >
+          Change of vibration_mm_s per minute since the oldest pulse of the 15m window; 0 when no
+          time has elapsed.
+      - name: egt_c_delta_1
+        data_type: Float64
+        description: egt_c minus the previous pulse's value in the lifecycle (0 for the first pulse).
+      - name: egt_c_roc_5m
+        data_type: Float64
+        description: >
+          Change of egt_c per minute since the oldest pulse of the 5m window; 0 when no time has
+          elapsed.
+      - name: egt_c_roc_15m
+        data_type: Float64
+        description: >
+          Change of egt_c per minute since the oldest pulse of the 15m window; 0 when no time has
+          elapsed.
+      - name: oil_pressure_psi_delta_1
+        data_type: Float64
+        description: >
+          oil_pressure_psi minus the previous pulse's value in the lifecycle (0 for the first
+          pulse).
+      - name: oil_pressure_psi_roc_5m
+        data_type: Float64
+        description: >
+          Change of oil_pressure_psi per minute since the oldest pulse of the 5m window; 0 when no
+          time has elapsed.
+      - name: oil_pressure_psi_roc_15m
+        data_type: Float64
+        description: >
+          Change of oil_pressure_psi per minute since the oldest pulse of the 15m window; 0 when no
+          time has elapsed.
+      - name: egt_c_drift
+        data_type: Float64
+        description: egt_c_mean_5m minus the lifecycle baseline EGT (degC).
+      - name: core_temp_c_drift
+        data_type: Float64
+        description: core_temp_c minus the lifecycle baseline core temperature (degC).
+      - name: vibration_mm_s_ratio
+        data_type: Float64
+        description: >
+          vibration_mm_s_mean_5m divided by the lifecycle baseline vibration (1 when the baseline is
+          0).
+      - name: oil_pressure_psi_drop
+        data_type: Float64
+        description: >
+          Lifecycle baseline oil pressure minus oil_pressure_psi_mean_5m (positive = pressure loss,
+          psi).
+      - name: fuel_flow_kg_h_drift_pct
+        data_type: Float64
+        description: 100 * (fuel_flow_kg_h - baseline) / baseline (0 when the baseline is 0).
+      - name: rpm_drift_pct
+        data_type: Float64
+        description: 100 * (rpm - baseline) / baseline (0 when the baseline is 0).
+      - name: failure_cycle
+        data_type: UInt32
+        description: Cycle of the lifecycle's FAILURE pulse (label source).
+      - name: rul_cycles
+        data_type: Int32
+        description: Remaining useful life label = failure_cycle - cycle_number (>= 0).
+        data_tests:
+          - non_negative
+      - name: rul_cycles_capped
+        data_type: Int32
+        description: Piecewise-linear RUL target = least(rul_cycles, var rul_cap_cycles).
+        data_tests:
+          - non_negative
+      - name: failure_within_horizon
+        data_type: UInt8
+        description: 1 when rul_cycles <= var rul_failure_horizon_cycles (imminent-failure classifier label).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: failure_mode
+        data_type: String
+        description: >
+          Failure mode from the lifecycle's maintenance work order; UNKNOWN until the work order
+          has landed. Label metadata, never a feature.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HPT_BLADE_EROSION', 'BEARING_DEGRADATION', 'OIL_SYSTEM_LEAK', 'COMPRESSOR_FOULING', 'UNKNOWN']
+              config:
+                severity: warn
+      - name: split_group
+        data_type: String
+        description: engine_id || '#' || lifecycle_id; the grouping key for group-aware splits.
+        data_tests:
+          - not_null
