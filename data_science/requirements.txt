@@ -1,0 +1,15 @@
+# Platform job image: dbt (analytics/), RUL model training/inference (data_science/)
+# and the pipeline runner (orchestration/). Versions are pinned by the interface
+# contract (section 9) and were resolved together for linux x86_64 / Python 3.12.
+dbt-core==1.12.6
+dbt-clickhouse==1.10.3
+clickhouse-connect==1.11.0
+xgboost==3.4.1
+scikit-learn==1.9.1
+pandas==3.1.0
+numpy==2.5.4
+pyarrow==26.0.0
+boto3==1.43.118
+joblib==1.6.0
+# The image doubles as the test runner: tests/ is bind-mounted, never baked in.
+pytest==9.1.1
