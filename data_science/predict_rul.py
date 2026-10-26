@@ -7,7 +7,12 @@ of int_sensor_rolling_features (plus the registry's operational status) from
 ClickHouse, and appends one prediction per engine to gold_engine_rul_predictions.
 ``--mode live`` repeats every ``--interval-seconds`` until SIGTERM/SIGINT.
 
-Exit codes: 0 done, 3 skipped (batch: no production model or no feature rows), 1 failure.
+The bundle is a pickle: its SHA-256 must match the ``bundle_sha256`` production.json
+records, checked before anything is unpickled. A pointer without a digest or a bundle
+that does not match is refused (exit 1); see model_registry.py for the trust model.
+
+Exit codes: 0 done, 3 skipped (batch: no production model or no feature rows),
+1 failure (including a model bundle that fails verification).
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import numpy as np
 import pandas as pd
 from artifact_store import ArtifactStore, S3ArtifactStore
 from ds_runtime import (
+    EXIT_FAILURE,
     EXIT_OK,
     PreconditionsNotMetError,
     StopToken,
@@ -32,7 +38,12 @@ from ds_runtime import (
 from ds_settings import load_settings
 from feature_pipeline import RAW_SENSOR_COLUMNS, load_inference_frame
 from lakehouse_io import ClickHouseGateway
-from model_registry import ArtifactLayout, load_production_bundle, read_production_pointer
+from model_registry import (
+    ArtifactLayout,
+    ModelIntegrityError,
+    load_production_bundle,
+    read_production_pointer,
+)
 from rul_modeling import RulModelBundle
 
 PREDICTIONS_TABLE = "gold_engine_rul_predictions"
@@ -141,21 +152,32 @@ def prediction_rows(predictions: pd.DataFrame) -> list[list[Any]]:
 
 
 class ProductionModelCache:
-    """Holds the production bundle in memory; reloads it only when production.json moves."""
+    """Holds the verified production bundle in memory; reloads it only when production.json moves."""
 
     def __init__(self, store: ArtifactStore, layout: ArtifactLayout) -> None:
         self._store = store
         self._layout = layout
         self._bundle: RulModelBundle | None = None
+        self._loaded_from: tuple[str, str | None] | None = None
 
     def current(self) -> RulModelBundle:
-        """Return the production bundle; raise PreconditionsNotMetError when no model was promoted yet."""
+        """Return the production bundle.
+
+        Raises PreconditionsNotMetError when no model was promoted yet and
+        ModelIntegrityError when the bundle cannot be verified against production.json.
+        """
         pointer = read_production_pointer(self._store, self._layout)
         if pointer is None:
             raise PreconditionsNotMetError("no production model yet (production.json does not exist)")
-        if self._bundle is None or self._bundle.model_version != pointer.model_version:
+        identity = (pointer.model_version, pointer.bundle_sha256)
+        if self._bundle is None or self._loaded_from != identity:
             self._bundle = load_production_bundle(self._store, pointer)
-            logger.info("loaded production model %s from %s", pointer.model_version, pointer.artifact_prefix)
+            self._loaded_from = identity
+            logger.info(
+                "loaded production model %s from %s (bundle sha256 verified)",
+                pointer.model_version,
+                pointer.artifact_prefix,
+            )
         return self._bundle
 
 
@@ -202,6 +224,8 @@ def run_live(
             predict_once(gateway, models, hours_per_cycle=hours_per_cycle)
         except PreconditionsNotMetError as exc:
             logger.info("nothing scored: %s", exc)
+        except ModelIntegrityError as exc:
+            logger.error("nothing scored: %s", exc)
         except Exception:
             logger.exception("prediction cycle failed; next attempt in %.0fs", interval_seconds)
         if stop.wait(interval_seconds):
@@ -249,7 +273,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stop=stop,
             )
         else:
-            predict_once(gateway, models, hours_per_cycle=hours_per_cycle)
+            try:
+                predict_once(gateway, models, hours_per_cycle=hours_per_cycle)
+            except ModelIntegrityError as exc:
+                logger.error("refusing to serve the production model: %s", exc)
+                return EXIT_FAILURE
     return EXIT_OK
 
 

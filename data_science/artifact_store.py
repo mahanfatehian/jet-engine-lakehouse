@@ -30,10 +30,13 @@ _T = TypeVar("_T")
 OCTET_STREAM = "application/octet-stream"
 JSON_CONTENT_TYPE = "application/json"
 _DELETE_BATCH_SIZE = 1000  # S3 DeleteObjects limit
+_COPY_BUFFER_BYTES = 1 << 20
 _TRANSIENT_S3_CODES = frozenset(
     {"RequestTimeout", "SlowDown", "Throttling", "ServiceUnavailable", "InternalError"}
 )
 _MISSING_KEY_CODES = frozenset({"NoSuchKey", "404", "NotFound"})
+# A suffix range on an empty object is unsatisfiable (HTTP 416).
+_EMPTY_RANGE_CODES = frozenset({"InvalidRange", "416"})
 
 
 class ArtifactNotFoundError(KeyError):
@@ -66,6 +69,14 @@ class ArtifactStore(abc.ABC):
     @abc.abstractmethod
     def get_bytes(self, key: str) -> bytes:
         """Read the object at ``key``; raise ArtifactNotFoundError when it is missing."""
+
+    @abc.abstractmethod
+    def get_tail(self, key: str, length: int) -> bytes:
+        """Read the last ``length`` bytes of the object at ``key`` (all of it when shorter)."""
+
+    @abc.abstractmethod
+    def download_file(self, key: str, path: Path) -> None:
+        """Stream the object at ``key`` into the local file ``path`` without buffering it in memory."""
 
     @abc.abstractmethod
     def list_keys(self, prefix: str) -> list[str]:
@@ -161,24 +172,61 @@ class S3ArtifactStore(ArtifactStore):
 
         self._retry(f"upload {self.uri(key)}", _upload)
 
+    def _get_object(self, key: str, **request: str) -> Any:
+        """GetObject, mapping a missing key to ArtifactNotFoundError."""
+        try:
+            return self._client.get_object(Bucket=self._bucket, Key=validate_key(key), **request)
+        except ClientError as exc:
+            if _is_missing_key(exc):
+                raise ArtifactNotFoundError(self.uri(key)) from exc
+            raise
+
     def get_bytes(self, key: str) -> bytes:
         """Read the object at ``key``."""
         validate_key(key)
 
         def _get() -> bytes:
-            try:
-                response = self._client.get_object(Bucket=self._bucket, Key=key)
-            except ClientError as exc:
-                if _is_missing_key(exc):
-                    raise ArtifactNotFoundError(self.uri(key)) from exc
-                raise
-            body = response["Body"]
+            body = self._get_object(key)["Body"]
             try:
                 return body.read()
             finally:
                 body.close()
 
         return self._retry(f"get {self.uri(key)}", _get)
+
+    def get_tail(self, key: str, length: int) -> bytes:
+        """Read the last ``length`` bytes with one suffix-range GET."""
+        validate_key(key)
+        if length < 1:
+            raise ValueError("length must be >= 1")
+
+        def _get() -> bytes:
+            try:
+                body = self._get_object(key, Range=f"bytes=-{length}")["Body"]
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code", "") in _EMPTY_RANGE_CODES:
+                    return b""
+                raise
+            try:
+                return body.read()
+            finally:
+                body.close()
+
+        return self._retry(f"get the last {length} bytes of {self.uri(key)}", _get)
+
+    def download_file(self, key: str, path: Path) -> None:
+        """Stream the object into ``path`` in 1 MiB chunks; every attempt rewrites the file."""
+        validate_key(key)
+
+        def _download() -> None:
+            body = self._get_object(key)["Body"]
+            try:
+                with path.open("wb") as sink:
+                    shutil.copyfileobj(body, sink, _COPY_BUFFER_BYTES)
+            finally:
+                body.close()
+
+        self._retry(f"download {self.uri(key)}", _download)
 
     def list_keys(self, prefix: str) -> list[str]:
         """List every key under ``prefix`` (all pages)."""
@@ -241,12 +289,28 @@ class LocalArtifactStore(ArtifactStore):
         """Copy ``path`` via a temporary file and an atomic rename."""
         self._replace_atomically(key, lambda temp: shutil.copyfile(path, temp))
 
-    def get_bytes(self, key: str) -> bytes:
-        """Read the file stored at ``key``."""
+    def _existing_path(self, key: str) -> Path:
         path = self._path(key)
         if not path.is_file():
             raise ArtifactNotFoundError(self.uri(key))
-        return path.read_bytes()
+        return path
+
+    def get_bytes(self, key: str) -> bytes:
+        """Read the file stored at ``key``."""
+        return self._existing_path(key).read_bytes()
+
+    def get_tail(self, key: str, length: int) -> bytes:
+        """Read the last ``length`` bytes of the file stored at ``key``."""
+        if length < 1:
+            raise ValueError("length must be >= 1")
+        path = self._existing_path(key)
+        with path.open("rb") as source:
+            source.seek(max(0, path.stat().st_size - length))
+            return source.read()
+
+    def download_file(self, key: str, path: Path) -> None:
+        """Copy the file stored at ``key`` to ``path``."""
+        shutil.copyfile(self._existing_path(key), path)
 
     def list_keys(self, prefix: str) -> list[str]:
         """List stored keys under ``prefix``, ignoring in-flight temporary files."""
