@@ -1,0 +1,1634 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Spectral and statistical features of the kHz vibration waveforms and the redundant process channels (raw_engine_hf_features): bearing defect tone, kurtosis, crest factor, core unbalance, oil system.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "jet-engine-lakehouse"
+      ],
+      "targetBlank": false,
+      "title": "Jet Engine Lakehouse",
+      "tooltip": "",
+      "type": "dashboards",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "type": "table",
+      "title": "Current vibration signature per engine",
+      "description": "Mean of each spectral feature over the last 5 minutes of the range (raw_engine_hf_features FINAL: one row per HF frame, i.e. per 1 Hz pulse). Kurtosis is ~3 for Gaussian vibration and rises with bearing impacts; the BPFO tone is the fan bearing outer-race defect frequency. Empty until the HF path is deployed. NaN/infinite values count as missing, as in the dbt staging model.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    engine_id AS `Engine`,\n    any(engine_model) AS `Model`,\n    count() AS `Frames (5 min)`,\n    max(frame_start_ts) AS `Newest frame`,\n    avg(if(isFinite(fan_amp_bpfo) AND fan_amp_bpfo >= 0, toFloat64(fan_amp_bpfo), NULL)) AS `Fan BPFO amplitude`,\n    avg(if(isFinite(fan_kurtosis) AND fan_kurtosis >= 0, toFloat64(fan_kurtosis), NULL)) AS `Fan kurtosis`,\n    avg(if(isFinite(fan_crest_factor) AND fan_crest_factor >= 0, toFloat64(fan_crest_factor), NULL)) AS `Fan crest factor`,\n    avg(if(isFinite(core_amp_1x_n2) AND core_amp_1x_n2 >= 0, toFloat64(core_amp_1x_n2), NULL)) AS `Core 1xN2 amplitude`,\n    avg(if(isFinite(fan_band_energy_hf) AND fan_band_energy_hf >= 0, toFloat64(fan_band_energy_hf), NULL)) AS `Fan HF band energy`,\n    avg(if(mapContains(process_means, 'OIL_QTY_A'), if(isFinite(process_means['OIL_QTY_A']) AND process_means['OIL_QTY_A'] >= 0, toFloat64(process_means['OIL_QTY_A']), NULL), NULL)) AS `Oil quantity`,\n    avg(if(mapContains(process_means, 'OIL_DP_A'), if(isFinite(process_means['OIL_DP_A']) AND process_means['OIL_DP_A'] >= 0, toFloat64(process_means['OIL_DP_A']), NULL), NULL)) AS `Oil filter dP`,\n    avg(if(mapContains(process_means, 'SCAV_T_A'), if(isFinite(process_means['SCAV_T_A']), toFloat64(process_means['SCAV_T_A']), NULL), NULL)) AS `Scavenge oil temp`,\n    avg(if(isFinite(egt_ab_split) AND egt_ab_split >= 0, toFloat64(egt_ab_split), NULL)) AS `EGT A/B split`\nFROM raw_engine_hf_features FINAL\nWHERE frame_start_ts > $__toTime - INTERVAL 5 MINUTE\n  AND frame_start_ts <= $__toTime\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY engine_id\nORDER BY engine_id",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 3
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Frames (5 min)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fan kurtosis"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 4
+                    },
+                    {
+                      "color": "red",
+                      "value": 6
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fan HF band energy"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Fan BPFO amplitude"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: mm/s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Core 1xN2 amplitude"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: mm/s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "EGT A/B split"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "celsius"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Oil quantity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "litre"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Oil filter dP"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "suffix: psid"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Scavenge oil temp"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "celsius"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 1
+    },
+    {
+      "type": "row",
+      "title": "Bearing & rotor signatures (5-minute rolling means per engine lifecycle, as the RUL model sees them)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "panels": [],
+      "id": 2
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan bearing defect tone (BPFO amplitude)",
+      "description": "Amplitude of the fan bearing outer-race defect frequency (bpfo_order x N1) in the fan-frame velocity spectrum. Grows roughly with w^3..w^4, strongest for BEARING_DEGRADATION. 5-minute rolling mean per engine lifecycle (the contract's fan_amp_bpfo_mean_5m).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS fan_amp_bpfo_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(fan_amp_bpfo) AND fan_amp_bpfo >= 0, toFloat64(fan_amp_bpfo), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "suffix: mm/s",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 3
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan vibration kurtosis",
+      "description": "Pearson kurtosis of the fan-frame waveform: ~3 for Gaussian vibration (dashed line), higher when bearing impacts make the signal impulsive. 5-minute rolling mean per engine lifecycle (the contract's fan_kurtosis_mean_5m).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS fan_kurtosis_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(fan_kurtosis) AND fan_kurtosis >= 0, toFloat64(fan_kurtosis), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "none",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 4
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan crest factor (peak / RMS)",
+      "description": "Peak-to-RMS ratio of the fan-frame waveform; impulsive bearing defects raise it before the RMS level moves. 5-minute rolling mean per engine lifecycle (the contract's fan_crest_factor_mean_5m).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS fan_crest_factor_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(fan_crest_factor) AND fan_crest_factor >= 0, toFloat64(fan_crest_factor), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 5
+    },
+    {
+      "type": "timeseries",
+      "title": "Core 1xN2 amplitude (core unbalance)",
+      "description": "Amplitude of the core-spool (N2) tone at the turbine rear frame; grows with HPT blade erosion and compressor fouling. 5-minute rolling mean per engine lifecycle (the contract's core_amp_1x_n2_mean_5m).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS core_amp_1x_n2_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(core_amp_1x_n2) AND core_amp_1x_n2 >= 0, toFloat64(core_amp_1x_n2), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "suffix: mm/s",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 6
+    },
+    {
+      "type": "row",
+      "title": "Oil system (process-channel frame means, sensor A; 5-minute rolling means)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "panels": [],
+      "id": 7
+    },
+    {
+      "type": "timeseries",
+      "title": "Oil quantity (OIL_QTY_A)",
+      "description": "Oil tank quantity; drops through an OIL_SYSTEM_LEAK lifecycle. 5-minute rolling mean per engine lifecycle of process_means['OIL_QTY_A'] (the channel's mean over each frame); no line where the frames do not carry the channel.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS oil_quantity_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(mapContains(process_means, 'OIL_QTY_A'), if(isFinite(process_means['OIL_QTY_A']) AND process_means['OIL_QTY_A'] >= 0, toFloat64(process_means['OIL_QTY_A']), NULL), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "litre",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 8
+    },
+    {
+      "type": "timeseries",
+      "title": "Oil filter differential pressure (OIL_DP_A)",
+      "description": "Pressure drop across the oil filter; rises as bearing debris loads it (about 20 psid at a bearing failure). 5-minute rolling mean per engine lifecycle of process_means['OIL_DP_A'] (the channel's mean over each frame); no line where the frames do not carry the channel.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS oil_filter_dp_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(mapContains(process_means, 'OIL_DP_A'), if(isFinite(process_means['OIL_DP_A']) AND process_means['OIL_DP_A'] >= 0, toFloat64(process_means['OIL_DP_A']), NULL), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "suffix: psid",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Oil temperature (OIL_T_A)",
+      "description": "Oil temperature; rises with wear in every failure mode. 5-minute rolling mean per engine lifecycle of process_means['OIL_T_A'] (the channel's mean over each frame); no line where the frames do not carry the channel.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS oil_temp_c_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(mapContains(process_means, 'OIL_T_A'), if(isFinite(process_means['OIL_T_A']), toFloat64(process_means['OIL_T_A']), NULL), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "celsius",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Scavenge oil temperature (SCAV_T_A)",
+      "description": "Bearing-sump scavenge oil temperature; heats up with a failing bearing. 5-minute rolling mean per engine lifecycle of process_means['SCAV_T_A'] (the channel's mean over each frame); no line where the frames do not carry the channel.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS scavenge_oil_temp_c_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(mapContains(process_means, 'SCAV_T_A'), if(isFinite(process_means['SCAV_T_A']), toFloat64(process_means['SCAV_T_A']), NULL), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "celsius",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 11
+    },
+    {
+      "type": "row",
+      "title": "Impulsiveness peaks, spectral shape & HF data health",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 33
+      },
+      "panels": [],
+      "id": 12
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan kurtosis frame-level peaks",
+      "description": "Highest per-frame fan kurtosis in each time bucket. The 5-minute means above smooth single bearing impact bursts away; the peaks show them.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    max(if(isFinite(fan_kurtosis) AND fan_kurtosis >= 0, toFloat64(fan_kurtosis), NULL)) AS fan_kurtosis_max\nFROM raw_engine_hf_features FINAL\nWHERE $__timeFilter(frame_start_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "transparent",
+                "value": null
+              },
+              {
+                "color": "text",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "none",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 13
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan high-frequency band energy",
+      "description": "Share of the fan-frame spectral energy above fs/4 (broadband noise grows with wear), 5-minute rolling mean.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS fan_band_energy_hf_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(fan_band_energy_hf) AND fan_band_energy_hf >= 0, toFloat64(fan_band_energy_hf), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 14
+    },
+    {
+      "type": "timeseries",
+      "title": "HF frames per minute",
+      "description": "Feature rows (one per HF frame) landed per engine and minute, by frame time. Each operating engine emits one frame per 1 Hz tick, so a steady engine sits near 60.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    count() * 60 / $__interval_s AS frames_per_minute\nFROM raw_engine_hf_features FINAL\nWHERE $__timeFilter(frame_start_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "EGT sensor A/B split",
+      "description": "Mean |EGT_A - EGT_B| over each frame (egt_ab_split): disagreement of the redundant thermocouples, a sensor-health signal rather than an engine-health one. 5-minute rolling mean.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    argMax(mean_5m, frame_start_ts) AS egt_ab_split_mean_5m\nFROM\n(\n    SELECT\n        engine_id,\n        frame_start_ts,\n        avg(if(isFinite(egt_ab_split) AND egt_ab_split >= 0, toFloat64(egt_ab_split), NULL)) OVER (\n            PARTITION BY engine_id, lifecycle_id\n            ORDER BY toUnixTimestamp64Milli(frame_start_ts)\n            RANGE BETWEEN 300000 PRECEDING AND CURRENT ROW\n        ) AS mean_5m\n    FROM raw_engine_hf_features FINAL\n    WHERE frame_start_ts >= $__fromTime - INTERVAL 5 MINUTE\n      AND frame_start_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE frame_start_ts >= $__fromTime\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "celsius",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Fan spool speed N1",
+      "description": "Mean fan (low-pressure) spool speed per bucket from the HF frames: the reference of the order analysis (the BPFO tone sits at bpfo_order x N1 / 60 Hz). The core speed N2 is the 1 Hz rpm.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(frame_start_ts) AS time,\n    engine_id,\n    avg(if(isFinite(n1_rpm) AND n1_rpm >= 0, toFloat64(n1_rpm), NULL)) AS n1_rpm_avg\nFROM raw_engine_hf_features FINAL\nWHERE $__timeFilter(frame_start_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "rotrpm",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 17
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 42,
+  "tags": [
+    "jet-engine-lakehouse",
+    "vibration",
+    "hf"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse-lakehouse"
+        },
+        "definition": "-- engines that are registered and not deleted (current CDC state of the registry)\nSELECT engine_id\nFROM raw_engine_status_registry\nGROUP BY engine_id\nHAVING argMax(is_deleted, cdc_lsn) = 0\nORDER BY engine_id",
+        "description": "Engines currently in the registry (raw_engine_status_registry, latest CDC version per engine).",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Engine",
+        "multi": true,
+        "name": "engine_id",
+        "options": [],
+        "query": {
+          "editorType": "sql",
+          "rawSql": "-- engines that are registered and not deleted (current CDC state of the registry)\nSELECT engine_id\nFROM raw_engine_status_registry\nGROUP BY engine_id\nHAVING argMax(is_deleted, cdc_lsn) = 0\nORDER BY engine_id"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "1h"
+    ]
+  },
+  "timezone": "utc",
+  "title": "Vibration Analytics (HF Sensor Frames)",
+  "uid": "jet-engine-vibration",
+  "version": 1,
+  "weekStart": ""
+}
