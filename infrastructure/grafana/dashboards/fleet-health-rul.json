@@ -1,0 +1,2243 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse-lakehouse"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "red",
+        "name": "Engine failures",
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "-- one region per failure: FAILURE pulse -> repair completed (point while the work order is open)\nSELECT\n    failure_ts AS time,\n    coalesce(completed_ts, failure_ts) AS timeEnd,\n    concat(engine_id, ' failed at cycle ', toString(failure_cycle), ': ', failure_mode,\n           if(maintenance_status = 'COMPLETED',\n              concat(' (repaired in ', toString(downtime_seconds), ' s)'),\n              ' (work order open)')) AS text,\n    concat(engine_id, ',', failure_mode) AS tags\nFROM raw_maintenance_log FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(failure_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY time\nLIMIT 1000",
+          "refId": "Anno"
+        }
+      }
+    ]
+  },
+  "description": "Operations board of the jet-engine fleet: status, health score, anomaly flags and the RUL prediction of every engine, live 1 Hz sensors, and the failure/repair timeline.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [
+        "jet-engine-lakehouse"
+      ],
+      "targetBlank": false,
+      "title": "Jet Engine Lakehouse",
+      "tooltip": "",
+      "type": "dashboards",
+      "url": ""
+    }
+  ],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Engines monitored",
+      "description": "Engines on the fleet board (gold fct_engine_health_status, one row per registered engine).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT count() AS engines\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 1
+    },
+    {
+      "type": "stat",
+      "title": "Operational status",
+      "description": "Current registry status of the selected engines. 'In repair' counts FAILURE and MAINTENANCE_RESET (a work order is open or the engine is being reset to a new lifecycle).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 7,
+        "x": 3,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    countIf(operational_status = 'HEALTHY') AS Healthy,\n    countIf(operational_status = 'WARNING') AS Warning,\n    countIf(operational_status = 'CRITICAL') AS Critical,\n    countIf(operational_status IN ('FAILURE', 'MAINTENANCE_RESET')) AS `In repair`\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Healthy"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Warning"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Critical"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "In repair"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "id": 2
+    },
+    {
+      "type": "stat",
+      "title": "High-risk engines",
+      "description": "Engines whose RUL prediction, aged to the current cycle, is in the HIGH band (failure predicted within the horizon, or RUL at or below RUL_FAILURE_HORIZON_CYCLES).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 10,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT countIf(risk_band_adjusted = 'HIGH') AS high_risk\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 3
+    },
+    {
+      "type": "stat",
+      "title": "Anomaly flags raised",
+      "description": "Sum of the calibrated anomaly flags over the selected engines: EGT drift, vibration growth, oil-pressure drop and stale telemetry (fct_engine_health_status.anomaly_count).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 13,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT sum(anomaly_count) AS flags\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 4
+    },
+    {
+      "type": "stat",
+      "title": "Lowest remaining life",
+      "description": "The engine closest to failure: smallest predicted RUL aged to its current cycle (predicted_rul_cycles_adjusted). Red at or below the 25-cycle horizon, orange within twice it.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT engine_id, predicted_rul_cycles_adjusted AS rul_cycles\nFROM fct_engine_health_status FINAL\nWHERE predicted_rul_cycles_adjusted IS NOT NULL\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY predicted_rul_cycles_adjusted ASC, engine_id\nLIMIT 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 25
+              },
+              {
+                "color": "green",
+                "value": 50
+              }
+            ]
+          },
+          "unit": "suffix: cycles",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "id": 5
+    },
+    {
+      "type": "stat",
+      "title": "Telemetry age",
+      "description": "Seconds between the newest 1 Hz pulse in ClickHouse (raw_engine_telemetry.event_ts) and the end of the time range: the whole simulator -> Postgres -> Debezium -> Kafka -> Spark -> ClickHouse lag. Red past the 300 s stale-telemetry threshold.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT greatest(\n           toUnixTimestamp64Milli($__toTime_ms) - toUnixTimestamp64Milli(maxOrNull(event_ts)),\n           0) / 1000 AS age_s\nFROM raw_engine_telemetry\nWHERE event_ts > $__toTime_ms - INTERVAL 1 DAY\n  AND event_ts <= $__toTime_ms\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "unit": "s",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 6
+    },
+    {
+      "type": "table",
+      "title": "Fleet health board",
+      "description": "One row per engine from gold fct_engine_health_status (rebuilt by dbt every DBT_INTERVAL_SECONDS): registry status, current cycle, the sensor-driven health score (100 = healthy; bands calibrated on the live fleet: HEALTHY pulses p05 80, WARNING median 58, CRITICAL median 3), the four calibrated anomaly flags, and the newest RUL prediction of the current lifecycle aged to the current cycle (cycles, flight hours, risk band). Sorted by risk, then remaining life. Click an engine for its vibration analytics.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    engine_id AS `Engine`,\n    engine_model AS `Model`,\n    operational_status AS `Status`,\n    current_lifecycle_id AS `Lifecycle`,\n    current_cycle AS `Cycle`,\n    health_score AS `Health score`,\n    is_egt_drift_anomaly AS `EGT drift`,\n    is_vibration_growth_anomaly AS `Vibration growth`,\n    is_oil_pressure_drop_anomaly AS `Oil pressure drop`,\n    is_telemetry_stale AS `Stale telemetry`,\n    predicted_rul_cycles_adjusted AS `RUL now (cycles)`,\n    predicted_rul_hours_adjusted AS `RUL now (hours)`,\n    failure_probability AS `P(failure in horizon)`,\n    risk_band_adjusted AS `Risk`,\n    model_version AS `Model version`\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY\n    multiIf(risk_band_adjusted = 'HIGH', 0, risk_band_adjusted = 'MEDIUM', 1,\n            risk_band_adjusted = 'LOW', 2, 3),\n    predicted_rul_cycles_adjusted,\n    health_score,\n    engine_id",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Engine"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "targetBlank": false,
+                    "title": "Vibration analytics of ${__value.raw}",
+                    "url": "/d/jet-engine-vibration?var-engine_id=${__value.raw}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "HEALTHY": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "HEALTHY"
+                      },
+                      "WARNING": {
+                        "color": "yellow",
+                        "index": 1,
+                        "text": "WARNING"
+                      },
+                      "CRITICAL": {
+                        "color": "orange",
+                        "index": 2,
+                        "text": "CRITICAL"
+                      },
+                      "FAILURE": {
+                        "color": "red",
+                        "index": 3,
+                        "text": "FAILURE"
+                      },
+                      "MAINTENANCE_RESET": {
+                        "color": "blue",
+                        "index": 4,
+                        "text": "MAINTENANCE"
+                      },
+                      "UNKNOWN": {
+                        "color": "#8e8e8e",
+                        "index": 5,
+                        "text": "UNKNOWN"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Health score"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 100
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 25
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 50
+                    },
+                    {
+                      "color": "green",
+                      "value": 80
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.minWidth",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "EGT drift"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0,
+                        "text": "ok"
+                      },
+                      "1": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "ALERT"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Vibration growth"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0,
+                        "text": "ok"
+                      },
+                      "1": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "ALERT"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Oil pressure drop"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0,
+                        "text": "ok"
+                      },
+                      "1": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "ALERT"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Stale telemetry"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0,
+                        "text": "ok"
+                      },
+                      "1": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "ALERT"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "RUL now (cycles)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 25
+                    },
+                    {
+                      "color": "green",
+                      "value": 50
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "RUL now (hours)"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 50
+                    },
+                    {
+                      "color": "green",
+                      "value": 100
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "P(failure in horizon)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Risk"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "LOW": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "LOW"
+                      },
+                      "MEDIUM": {
+                        "color": "orange",
+                        "index": 1,
+                        "text": "MEDIUM"
+                      },
+                      "HIGH": {
+                        "color": "red",
+                        "index": 2,
+                        "text": "HIGH"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Model version"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "targetBlank": false,
+                    "title": "Model operations",
+                    "url": "/d/jet-engine-model-ops?var-model_version=${__value.raw}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 7
+    },
+    {
+      "type": "row",
+      "title": "Remaining useful life",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "panels": [],
+      "id": 8
+    },
+    {
+      "type": "bargauge",
+      "title": "RUL now by engine (cycles)",
+      "description": "Predicted remaining cycles of each engine, aged from its scored pulse to the current cycle (fct_engine_health_status.predicted_rul_cycles_adjusted). The regressor's target is capped at RUL_CAP_CYCLES (125). Empty for an engine whose new lifecycle has not been scored yet.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 0,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT engine_id, predicted_rul_cycles_adjusted AS rul_cycles\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY engine_id",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 25
+              },
+              {
+                "color": "green",
+                "value": 50
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 0,
+          "min": 0,
+          "max": 125
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "id": 9
+    },
+    {
+      "type": "timeseries",
+      "title": "Predicted RUL per engine",
+      "description": "Every scoring of gold_engine_rul_predictions (latest prediction per time bucket). The saw-tooth is the lifecycle: RUL falls towards the failure, then resets after the repair. The red band is the 25-cycle failure horizon (risk HIGH).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 8,
+        "y": 13
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(predicted_at) AS time,\n    engine_id,\n    argMax(predicted_rul_cycles, predicted_at) AS rul_cycles\nFROM gold_engine_rul_predictions\nWHERE $__timeFilter(predicted_at)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "cycles",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": 600000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "area"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "transparent",
+                "value": 25
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 10
+    },
+    {
+      "type": "row",
+      "title": "Failure risk",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "panels": [],
+      "id": 11
+    },
+    {
+      "type": "timeseries",
+      "title": "Failure probability within the horizon",
+      "description": "Calibrated probability that the engine fails within RUL_FAILURE_HORIZON_CYCLES (highest scoring per time bucket), with the decision threshold of the model that produced the predictions (tuned for F1 on out-of-fold calibrated probabilities; stored in ml_model_runs.params_json).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(predicted_at) AS time,\n    engine_id,\n    max(failure_probability) AS p_failure\nFROM gold_engine_rul_predictions\nWHERE $__timeFilter(predicted_at)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(p.predicted_at) AS time,\n    max(JSONExtract(r.params_json, 'decision_threshold', 'Nullable(Float64)')) AS decision_threshold\nFROM gold_engine_rul_predictions AS p\nINNER JOIN ml_model_runs AS r ON r.model_version = p.model_version\nWHERE $__timeFilter(p.predicted_at)\nGROUP BY time\nORDER BY time",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": 600000,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 1,
+          "min": 0,
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Decision threshold (scoring model)"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    8,
+                    6
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 12
+    },
+    {
+      "type": "bargauge",
+      "title": "Health score by engine",
+      "description": "Sensor-driven health score of fct_engine_health_status: 100 x (1 - the largest of the scaled EGT drift, vibration growth and oil-pressure drop KPIs). Bands: red < 25, orange < 50, yellow < 80.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT engine_id, health_score\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY engine_id",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 25
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 1,
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "id": 13
+    },
+    {
+      "type": "row",
+      "title": "Live sensors (1 Hz CDC telemetry, raw_engine_telemetry FINAL)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "panels": [],
+      "id": 14
+    },
+    {
+      "type": "timeseries",
+      "title": "Exhaust gas temperature",
+      "description": "Mean egt_c per time bucket of the current pulse versions (FINAL collapses CDC replays and updates, deleted pulses are excluded). EGT rises with hot-section wear (HPT blade erosion, compressor fouling).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(event_ts) AS time,\n    engine_id,\n    avg(egt_c) AS egt_c_avg\nFROM raw_engine_telemetry FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(event_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "celsius",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 15
+    },
+    {
+      "type": "timeseries",
+      "title": "Vibration",
+      "description": "Mean vibration_mm_s per time bucket of the current pulse versions (FINAL collapses CDC replays and updates, deleted pulses are excluded). Vibration amplitude and its variance grow with bearing wear.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(event_ts) AS time,\n    engine_id,\n    avg(vibration_mm_s) AS vibration_mm_s_avg\nFROM raw_engine_telemetry FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(event_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "suffix: mm/s",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 16
+    },
+    {
+      "type": "timeseries",
+      "title": "Oil pressure",
+      "description": "Mean oil_pressure_psi per time bucket of the current pulse versions (FINAL collapses CDC replays and updates, deleted pulses are excluded). Oil pressure drops shortly before failure, steepest for oil-system leaks.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(event_ts) AS time,\n    engine_id,\n    avg(oil_pressure_psi) AS oil_pressure_psi_avg\nFROM raw_engine_telemetry FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(event_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY time, engine_id\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "pressurepsi",
+          "displayName": "${__field.labels.engine_id}",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 17
+    },
+    {
+      "type": "row",
+      "title": "Failures & maintenance",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "panels": [],
+      "id": 18
+    },
+    {
+      "type": "state-timeline",
+      "title": "Operational status timeline",
+      "description": "Status transitions of every engine from the CDC history of engine_status_registry (raw_engine_status_registry keeps every version): HEALTHY -> WARNING -> CRITICAL -> FAILURE -> MAINTENANCE -> HEALTHY. The state at the start of the range is carried in.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 42
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    time,\n    engine_id,\n    transform(status, ['HEALTHY', 'WARNING', 'CRITICAL', 'FAILURE', 'MAINTENANCE_RESET'],\n              [0, 1, 2, 3, 4], 5) AS status_code\nFROM\n(\n    -- state at the start of the range: the last transition before it\n    SELECT\n        engine_id,\n        toDateTime64($__fromTime, 6, 'UTC') AS time,\n        toString(argMax(operational_status, status_changed_ts)) AS status\n    FROM raw_engine_status_registry\n    WHERE is_deleted = 0\n      AND status_changed_ts <= $__fromTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n    GROUP BY engine_id\n    UNION ALL\n    -- every transition inside the range (status_changed_ts only moves on a change)\n    SELECT DISTINCT\n        engine_id,\n        status_changed_ts AS time,\n        toString(operational_status) AS status\n    FROM raw_engine_status_registry\n    WHERE is_deleted = 0\n      AND status_changed_ts > $__fromTime\n      AND status_changed_ts <= $__toTime\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "fillOpacity": 85,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineWidth": 0,
+            "spanNulls": true
+          },
+          "displayName": "${__field.labels.engine_id}",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "green",
+                  "index": 0,
+                  "text": "HEALTHY"
+                },
+                "1": {
+                  "color": "yellow",
+                  "index": 1,
+                  "text": "WARNING"
+                },
+                "2": {
+                  "color": "orange",
+                  "index": 2,
+                  "text": "CRITICAL"
+                },
+                "3": {
+                  "color": "red",
+                  "index": 3,
+                  "text": "FAILURE"
+                },
+                "4": {
+                  "color": "blue",
+                  "index": 4,
+                  "text": "MAINTENANCE"
+                },
+                "5": {
+                  "color": "#8e8e8e",
+                  "index": 5,
+                  "text": "UNKNOWN"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "perPage": 20,
+        "rowHeight": 0.85,
+        "showValue": "never",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "id": 19
+    },
+    {
+      "type": "table",
+      "title": "Maintenance work orders",
+      "description": "Current version of every work order opened by a failure in the range (raw_maintenance_log FINAL): failure cycle and mode, repair status and downtime, and how many pulses of the lifecycle were back-flagged with the work order (CDC updates of engine_telemetry).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    failure_ts AS `Failed at`,\n    engine_id AS `Engine`,\n    lifecycle_id AS `Lifecycle`,\n    failure_cycle AS `Failure cycle`,\n    failure_mode AS `Failure mode`,\n    maintenance_status AS `Work order`,\n    completed_ts AS `Repaired at`,\n    downtime_seconds AS `Downtime`,\n    warning_rows_flagged AS `Pulses back-flagged`,\n    action_taken AS `Action`\nFROM raw_maintenance_log FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(failure_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY failure_ts DESC\nLIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Work order"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "OPEN": {
+                        "color": "orange",
+                        "index": 0,
+                        "text": "OPEN"
+                      },
+                      "COMPLETED": {
+                        "color": "green",
+                        "index": 1,
+                        "text": "COMPLETED"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Downtime"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failure mode"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 170
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 20
+    },
+    {
+      "type": "barchart",
+      "title": "Failures by mode",
+      "description": "Failures in the range per failure mode (the work order's failure_mode). Each lifecycle draws one mode, which amplifies its dominant sensors.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT failure_mode, count() AS failures\nFROM raw_maintenance_log FINAL\nWHERE is_deleted = 0\n  AND $__timeFilter(failure_ts)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nGROUP BY failure_mode\nORDER BY failures DESC, failure_mode",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "fillOpacity": 70,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.7,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "orientation": "horizontal",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        },
+        "xField": "failure_mode",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
+      },
+      "id": 21
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 42,
+  "tags": [
+    "jet-engine-lakehouse",
+    "fleet",
+    "rul"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse-lakehouse"
+        },
+        "definition": "-- engines that are registered and not deleted (current CDC state of the registry)\nSELECT engine_id\nFROM raw_engine_status_registry\nGROUP BY engine_id\nHAVING argMax(is_deleted, cdc_lsn) = 0\nORDER BY engine_id",
+        "description": "Engines currently in the registry (raw_engine_status_registry, latest CDC version per engine).",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Engine",
+        "multi": true,
+        "name": "engine_id",
+        "options": [],
+        "query": {
+          "editorType": "sql",
+          "rawSql": "-- engines that are registered and not deleted (current CDC state of the registry)\nSELECT engine_id\nFROM raw_engine_status_registry\nGROUP BY engine_id\nHAVING argMax(is_deleted, cdc_lsn) = 0\nORDER BY engine_id"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "1h"
+    ]
+  },
+  "timezone": "utc",
+  "title": "Fleet Health & Remaining Useful Life",
+  "uid": "jet-engine-fleet-health",
+  "version": 1,
+  "weekStart": ""
+}
