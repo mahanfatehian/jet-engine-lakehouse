@@ -1,0 +1,190 @@
+"""Environment configuration of the streaming job (contract section 2).
+
+Variable names and non-network defaults follow the contract. Network endpoints default to
+the host-published ports on ``localhost`` so the job also runs outside Docker with no
+environment set; docker compose always injects the in-network service addresses.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+SPARK_LOG_LEVELS = frozenset({"ALL", "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"})
+PYTHON_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+SHUFFLE_PARTITIONS = 4
+_JVM_MEMORY = re.compile(r"^[1-9]\d*[kmgt]$", re.IGNORECASE)
+_S3A_CREDENTIALS_PROVIDER = "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+
+
+class ConfigError(ValueError):
+    """An environment variable holds an unusable value."""
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingSettings:
+    """Validated runtime settings; secrets are excluded from ``repr`` so it is safe to log."""
+
+    kafka_bootstrap_servers: str
+    cdc_topic_prefix: str
+    kafka_starting_offsets: str
+    max_offsets_per_trigger: int
+    s3_endpoint_url: str
+    aws_access_key_id: str
+    aws_secret_access_key: str = field(repr=False)
+    aws_region: str
+    lakehouse_bucket: str
+    clickhouse_host: str
+    clickhouse_port: int
+    clickhouse_user: str
+    clickhouse_password: str = field(repr=False)
+    clickhouse_db: str
+    checkpoint_dir: str
+    lake_trigger_seconds: float
+    clickhouse_trigger_seconds: float
+    spark_driver_memory: str
+    spark_log_level: str
+    log_level: str
+
+    def topic(self, table: str) -> str:
+        """Debezium topic of a PostgreSQL table in the ``public`` schema."""
+        return f"{self.cdc_topic_prefix}.public.{table}"
+
+    def lake_path(self, zone: str, table: str) -> str:
+        """S3A URI of a table folder inside a medallion zone (bronze/silver)."""
+        return f"s3a://{self.lakehouse_bucket}/{zone}/{table}"
+
+    def checkpoint_path(self, query_name: str) -> str:
+        """Checkpoint location of one streaming query: ``CHECKPOINT_DIR/<query_name>``."""
+        return f"{self.checkpoint_dir.rstrip('/')}/{query_name}"
+
+    @property
+    def clickhouse_ping_url(self) -> str:
+        """Unauthenticated liveness endpoint of the ClickHouse HTTP interface."""
+        return f"http://{self.clickhouse_host}:{self.clickhouse_port}/ping"
+
+    @property
+    def s3_health_url(self) -> str:
+        """MinIO liveness endpoint; any non-5xx answer proves the S3 endpoint is serving."""
+        return f"{self.s3_endpoint_url.rstrip('/')}/minio/health/live"
+
+
+def load_settings(env: Mapping[str, str]) -> StreamingSettings:
+    """Build :class:`StreamingSettings` from ``env``, raising :class:`ConfigError` on bad values."""
+    return StreamingSettings(
+        kafka_bootstrap_servers=_text(env, "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+        cdc_topic_prefix=_text(env, "CDC_TOPIC_PREFIX", "engine_cdc"),
+        kafka_starting_offsets=_text(env, "KAFKA_STARTING_OFFSETS", "earliest"),
+        max_offsets_per_trigger=_positive_int(env, "MAX_OFFSETS_PER_TRIGGER", 20000),
+        s3_endpoint_url=_http_url(env, "S3_ENDPOINT_URL", "http://localhost:9000"),
+        aws_access_key_id=_text(env, "AWS_ACCESS_KEY_ID", "minioadmin"),
+        aws_secret_access_key=_secret(env, "AWS_SECRET_ACCESS_KEY", "minioadmin"),
+        aws_region=_text(env, "AWS_REGION", "us-east-1"),
+        lakehouse_bucket=_text(env, "LAKEHOUSE_BUCKET", "lakehouse"),
+        clickhouse_host=_text(env, "CLICKHOUSE_HOST", "localhost"),
+        clickhouse_port=_positive_int(env, "CLICKHOUSE_PORT", 8123),
+        clickhouse_user=_text(env, "CLICKHOUSE_USER", "clickhouse"),
+        clickhouse_password=_secret(env, "CLICKHOUSE_PASSWORD", "clickhouse"),
+        clickhouse_db=_text(env, "CLICKHOUSE_DB", "iot_engine"),
+        checkpoint_dir=_text(env, "CHECKPOINT_DIR", "/opt/spark-checkpoints"),
+        lake_trigger_seconds=_positive_float(env, "LAKE_TRIGGER_SECONDS", 60.0),
+        clickhouse_trigger_seconds=_positive_float(env, "CLICKHOUSE_TRIGGER_SECONDS", 5.0),
+        spark_driver_memory=_jvm_memory(env, "SPARK_DRIVER_MEMORY", "2g"),
+        spark_log_level=_choice(env, "SPARK_LOG_LEVEL", "WARN", SPARK_LOG_LEVELS),
+        log_level=_choice(env, "LOG_LEVEL", "INFO", PYTHON_LOG_LEVELS),
+    )
+
+
+def spark_conf(settings: StreamingSettings) -> dict[str, str]:
+    """Spark properties for the local-mode driver, UTC semantics and S3A on MinIO."""
+    secure = urlparse(settings.s3_endpoint_url).scheme == "https"
+    return {
+        "spark.driver.memory": settings.spark_driver_memory,
+        # Pin the JVM default zone as well: log4j and a few Hadoop paths ignore the session zone.
+        "spark.driver.extraJavaOptions": "-Duser.timezone=UTC",
+        "spark.sql.session.timeZone": "UTC",
+        "spark.sql.shuffle.partitions": str(SHUFFLE_PARTITIONS),
+        # AQE never applies here (streaming plans reject it with a warning per query, and the
+        # foreachBatch collects have no shuffle), so it is switched off explicitly.
+        "spark.sql.adaptive.enabled": "false",
+        # Spark's default INT96 is legacy; INT64 micros (UTC-adjusted) is what pyarrow/DuckDB expect.
+        "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+        "spark.ui.showConsoleProgress": "false",
+        # A driver that runs for weeks must not accumulate UI history without bound.
+        "spark.ui.retainedJobs": "200",
+        "spark.ui.retainedStages": "200",
+        "spark.sql.ui.retainedExecutions": "100",
+        "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "spark.hadoop.fs.s3a.endpoint": settings.s3_endpoint_url,
+        "spark.hadoop.fs.s3a.endpoint.region": settings.aws_region,
+        "spark.hadoop.fs.s3a.path.style.access": "true",
+        "spark.hadoop.fs.s3a.connection.ssl.enabled": str(secure).lower(),
+        "spark.hadoop.fs.s3a.aws.credentials.provider": _S3A_CREDENTIALS_PROVIDER,
+        "spark.hadoop.fs.s3a.access.key": settings.aws_access_key_id,
+        "spark.hadoop.fs.s3a.secret.key": settings.aws_secret_access_key,
+    }
+
+
+def _raw(env: Mapping[str, str], name: str, default: str) -> str:
+    value = env.get(name)
+    return default if value is None else value.strip()
+
+
+def _text(env: Mapping[str, str], name: str, default: str) -> str:
+    value = _raw(env, name, default)
+    if not value:
+        raise ConfigError(f"{name} must not be empty")
+    return value
+
+
+def _secret(env: Mapping[str, str], name: str, default: str) -> str:
+    # Secrets are taken verbatim: an explicitly empty password is a legitimate setting.
+    value = env.get(name)
+    return default if value is None else value
+
+
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw = _raw(env, name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be an integer, got {raw!r}") from None
+    if value <= 0:
+        raise ConfigError(f"{name} must be > 0, got {value}")
+    return value
+
+
+def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = _raw(env, name, str(default))
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from None
+    if not (math.isfinite(value) and value > 0):
+        raise ConfigError(f"{name} must be a finite number > 0, got {raw!r}")
+    return value
+
+
+def _choice(env: Mapping[str, str], name: str, default: str, allowed: frozenset[str]) -> str:
+    value = _raw(env, name, default).upper()
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of {sorted(allowed)}, got {value!r}")
+    return value
+
+
+def _http_url(env: Mapping[str, str], name: str, default: str) -> str:
+    value = _text(env, name, default)
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ConfigError(f"{name} must be an http(s) URL, got {value!r}")
+    return value
+
+
+def _jvm_memory(env: Mapping[str, str], name: str, default: str) -> str:
+    value = _text(env, name, default)
+    if not _JVM_MEMORY.match(value):
+        raise ConfigError(f"{name} must look like 512m or 2g, got {value!r}")
+    return value
