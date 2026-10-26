@@ -1,0 +1,54 @@
+{
+  "type": "record",
+  "name": "EngineSensorFrame",
+  "namespace": "com.jetengine.telemetry",
+  "doc": "One full-fidelity sensor frame of one engine as streamed by the edge gateway: kHz vibration waveforms plus the redundant (A/B) process-parameter channels for one frame period. Samples are packed little-endian float32 so serialization stays cheap at kHz rates. Registered under subject engine_hf.sensor_frames-value with BACKWARD compatibility.",
+  "fields": [
+    {"name": "schema_version", "type": "int", "default": 1, "doc": "Version of this record layout; bumped on every compatible evolution."},
+    {"name": "engine_id", "type": "string", "doc": "Engine serial, e.g. CFM56-104. Also the Kafka message key."},
+    {"name": "engine_model", "type": "string", "doc": "Engine type, e.g. CFM56-7B."},
+    {"name": "lifecycle_id", "type": "int", "doc": "Overhaul-to-failure lifecycle the frame belongs to."},
+    {"name": "cycle_number", "type": "int", "doc": "Operating cycle within the lifecycle (0-based)."},
+    {"name": "telemetry_id", "type": "long", "doc": "engine_telemetry.telemetry_id of the 1 Hz pulse written in the same tick: the exact join key between the high-frequency features and the operational data."},
+    {"name": "frame_seq", "type": "long", "doc": "Per-engine frame ordinal (1-based count of the engine's pulses), so consumers can detect lost frames; survives restarts."},
+    {"name": "frame_start_ts", "type": {"type": "long", "logicalType": "timestamp-micros"}, "doc": "UTC start of the frame; equals event_ts of the 1 Hz engine_telemetry pulse of the same tick."},
+    {"name": "frame_duration_ms", "type": "int", "doc": "Frame period in milliseconds."},
+    {"name": "n1_rpm", "type": "float", "doc": "Fan (low-pressure) spool speed during the frame."},
+    {"name": "n2_rpm", "type": "float", "doc": "Core (high-pressure) spool speed during the frame."},
+    {"name": "bpfo_order", "type": "float", "doc": "Fan #1 bearing outer-race defect frequency as a multiple of the N1 shaft frequency."},
+    {"name": "vibration_sample_rate_hz", "type": "int", "doc": "Sample rate of every vibration channel."},
+    {
+      "name": "vibration",
+      "doc": "Vibration velocity waveforms, one entry per accelerometer.",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "VibrationChannel",
+          "fields": [
+            {"name": "channel", "type": "string", "doc": "Sensor location, e.g. fan_frame_vel, core_trf_vel."},
+            {"name": "unit", "type": "string", "doc": "Engineering unit of the samples, e.g. mm/s."},
+            {"name": "samples_f32le", "type": "bytes", "doc": "vibration_sample_rate_hz * frame_duration_ms / 1000 little-endian float32 samples."}
+          ]
+        }
+      }
+    },
+    {"name": "process_sample_rate_hz", "type": "int", "doc": "Sample rate of every process channel."},
+    {
+      "name": "process",
+      "doc": "Process parameters (temperatures, pressures, speeds, valve positions, oil system), redundant A/B sensors.",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "ProcessChannel",
+          "fields": [
+            {"name": "parameter", "type": "string", "doc": "Station-style parameter name with sensor suffix, e.g. T3_A, PS3_B, OIL_T_A."},
+            {"name": "unit", "type": "string", "doc": "Engineering unit, e.g. degC, kPa, rpm, pct, deg, L."},
+            {"name": "samples_f32le", "type": "bytes", "doc": "process_sample_rate_hz * frame_duration_ms / 1000 little-endian float32 samples."}
+          ]
+        }
+      }
+    }
+  ]
+}

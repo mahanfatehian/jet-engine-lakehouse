@@ -84,6 +84,8 @@ services:
       KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-168}
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx1g}
+      # Topics are code (kafka-init); a typo'd or early producer must not create one.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
     volumes:
       - kafkadata:/var/lib/kafka/data
     healthcheck:
@@ -107,9 +109,40 @@ services:
       CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-engine_cdc}
       CDC_TOPIC_PARTITIONS: ${CDC_TOPIC_PARTITIONS:-3}
       CDC_TOPIC_RETENTION_MS: ${CDC_TOPIC_RETENTION_MS:-604800000}
+      HF_TOPIC: ${HF_TOPIC:-engine_hf.sensor_frames}
+      HF_BENCHMARK_TOPIC: ${HF_BENCHMARK_TOPIC:-engine_hf.benchmark}
+      HF_TOPIC_PARTITIONS: ${HF_TOPIC_PARTITIONS:-6}
+      HF_TOPIC_RETENTION_MS: ${HF_TOPIC_RETENTION_MS:-7200000}
     volumes:
       - ./kafka/create-topics.sh:/scripts/create-topics.sh:ro
     restart: "no"
+    logging: *default-logging
+
+  # Avro schema governance for the high-frequency sensor frames (BACKWARD compatible
+  # evolution; the producer registers infrastructure/schemas/engine_sensor_frame.avsc).
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.5.0
+    container_name: de_schema_registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${SCHEMA_REGISTRY_PORT:-8081}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: _schemas
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: ${SCHEMA_COMPATIBILITY_LEVEL:-backward}
+      SCHEMA_REGISTRY_HEAP_OPTS: ${SCHEMA_REGISTRY_HEAP_OPTS:--Xms128m -Xmx384m}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
     logging: *default-logging
 
   # --------------------------------------------------- change data capture
@@ -205,6 +238,7 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
       MC_CONFIG_DIR: /tmp/.mc
+      HF_BRONZE_RETENTION_DAYS: ${HF_BRONZE_RETENTION_DAYS:-1}
     volumes:
       - ./minio/init-buckets.sh:/scripts/init-buckets.sh:ro
     restart: "no"
@@ -265,6 +299,22 @@ services:
       SIM_MAINTENANCE_SECONDS: ${SIM_MAINTENANCE_SECONDS:-20}
       SIM_SEED: ${SIM_SEED:-42}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # High-frequency path (Avro frames -> Kafka). Best effort and decoupled: Kafka or
+      # the registry being down never stalls the 1 Hz Postgres/CDC path.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      HF_TOPIC: ${HF_TOPIC:-engine_hf.sensor_frames}
+      HF_BENCHMARK_TOPIC: ${HF_BENCHMARK_TOPIC:-engine_hf.benchmark}
+      HF_SCHEMA_PATH: /schemas/engine_sensor_frame.avsc
+      SIM_HF_ENABLED: ${SIM_HF_ENABLED:-true}
+      SIM_HF_SAMPLE_RATE_HZ: ${SIM_HF_SAMPLE_RATE_HZ:-2048}
+      SIM_HF_VIB_CHANNELS: ${SIM_HF_VIB_CHANNELS:-2}
+      SIM_HF_PROCESS_RATE_HZ: ${SIM_HF_PROCESS_RATE_HZ:-8}
+      SIM_HF_FRAME_MS: ${SIM_HF_FRAME_MS:-1000}
+      SIM_HF_COMPRESSION: ${SIM_HF_COMPRESSION:-zstd}
+      SIM_HF_QUEUE_MAX_MB: ${SIM_HF_QUEUE_MAX_MB:-256}
+    volumes:
+      - ./schemas:/schemas:ro
     restart: unless-stopped
     logging: *default-logging
 
@@ -297,8 +347,14 @@ services:
       SPARK_LOG_LEVEL: ${SPARK_LOG_LEVEL:-WARN}
       KAFKA_FAIL_ON_DATA_LOSS: ${KAFKA_FAIL_ON_DATA_LOSS:-true}
       STREAMING_HEARTBEAT_FILE: /tmp/streaming.heartbeat
+      HF_TOPIC: ${HF_TOPIC:-engine_hf.sensor_frames}
+      HF_SCHEMA_PATH: /schemas/engine_sensor_frame.avsc
+      HF_LAKE_TRIGGER_SECONDS: ${HF_LAKE_TRIGGER_SECONDS:-60}
+      HF_CLICKHOUSE_TRIGGER_SECONDS: ${HF_CLICKHOUSE_TRIGGER_SECONDS:-10}
+      HF_MAX_OFFSETS_PER_TRIGGER: ${HF_MAX_OFFSETS_PER_TRIGGER:-2000}
     volumes:
       - spark-checkpoints:/opt/spark-checkpoints
+      - ./schemas:/schemas:ro
     healthcheck:
       # The supervisor rewrites the heartbeat every few seconds, also while a query
       # waits for a dependency or restarts; a stale file means the driver is wedged.
