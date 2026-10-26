@@ -178,3 +178,74 @@ SELECT *
 FROM gold_engine_rul_predictions
 ORDER BY predicted_at DESC
 LIMIT 1 BY engine_id;
+
+-- -----------------------------------------------------------------------------
+-- High-frequency (HF) telemetry path: Spark reduces every Avro sensor frame
+-- (kHz vibration waveforms + redundant process channels) to one feature row.
+-- The raw frames themselves live only in the bronze lake (ILM-expired).
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS raw_engine_hf_features
+(
+    engine_id                 LowCardinality(String),
+    engine_model              LowCardinality(String),
+    lifecycle_id              UInt32,
+    cycle_number              UInt32,
+    telemetry_id              UInt64,
+    frame_seq                 UInt64,
+    frame_start_ts            DateTime64(6, 'UTC'),
+    frame_duration_ms         UInt32,
+    n1_rpm                    Float32,
+    n2_rpm                    Float32,
+    bpfo_order                Float32,
+    vibration_sample_rate_hz  UInt32,
+    vibration_channels        UInt16,
+    process_channels          UInt16,
+    fan_rms                   Float32,
+    fan_peak                  Float32,
+    fan_crest_factor          Float32,
+    fan_kurtosis              Float32,
+    fan_amp_1x_n1             Float32,
+    fan_amp_1x_n2             Float32,
+    fan_amp_bpfo              Float32,
+    fan_band_energy_hf        Float32,
+    fan_spectral_centroid_hz  Float32,
+    core_rms                  Float32,
+    core_peak                 Float32,
+    core_crest_factor         Float32,
+    core_kurtosis             Float32,
+    core_amp_1x_n1            Float32,
+    core_amp_1x_n2            Float32,
+    core_amp_bpfo             Float32,
+    core_band_energy_hf       Float32,
+    core_spectral_centroid_hz Float32,
+    egt_ab_split              Float32,
+    process_means             Map(LowCardinality(String), Float32),
+    frame_bytes               UInt32,
+    kafka_partition           Int32,
+    kafka_offset              Int64,
+    ingested_at               DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = ReplacingMergeTree
+PARTITION BY toYYYYMM(frame_start_ts)
+ORDER BY (engine_id, telemetry_id)
+TTL toDateTime(frame_start_ts) + INTERVAL 90 DAY
+COMMENT 'Spectral and statistical features of every HF sensor frame; telemetry_id joins the 1 Hz pulse';
+
+CREATE TABLE IF NOT EXISTS hf_ingest_batches
+(
+    batch_id          UInt64,
+    batch_started_at  DateTime64(3, 'UTC'),
+    frames            UInt32,
+    bytes             UInt64,
+    engines           UInt16,
+    min_frame_ts      DateTime64(6, 'UTC'),
+    max_frame_ts      DateTime64(6, 'UTC'),
+    duration_ms       UInt32,
+    ingested_at       DateTime64(3, 'UTC') DEFAULT now64(3)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(batch_started_at)
+ORDER BY batch_started_at
+TTL toDateTime(batch_started_at) + INTERVAL 30 DAY
+COMMENT 'One row per HF micro-batch: frames, bytes and frame-time span, for throughput dashboards';
