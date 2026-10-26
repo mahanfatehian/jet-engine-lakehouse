@@ -11,6 +11,10 @@
     COMPLETED lifecycle (one that has a FAILURE pulse), labelled with the cycles left until that
     failure. Rebuilt on every run so late pulses, corrected rows and late work orders (failure
     mode) are always reflected. Ground truth (wear_factor) and status never become columns here.
+
+    Only the newest `mart_max_lifecycles_per_engine` completed lifecycles of each engine are
+    kept, so the cost of this rebuild and the size of the training set stay bounded however long
+    the fleet runs. Lifecycle ids grow with every repair, so the newest are the highest.
 -#}
 
 with completed_lifecycles as (
@@ -22,6 +26,8 @@ with completed_lifecycles as (
         coalesce(failure_mode, 'UNKNOWN') as lifecycle_failure_mode
     from {{ ref('int_engine_lifecycles') }} final
     where has_failed = 1
+    order by engine_id, lifecycle_id desc
+    limit {{ positive_int_var('mart_max_lifecycles_per_engine') }} by engine_id
 
 ),
 
@@ -30,6 +36,8 @@ pulse_features as (
     select
         {{ feature_output_columns() | join(',\n        ') }}
     from {{ ref('int_sensor_rolling_features') }} final
+    -- the sorting-key prefix prunes every lifecycle outside the training window
+    where (engine_id, lifecycle_id) in (select engine_id, lifecycle_id from completed_lifecycles)
 
 ),
 

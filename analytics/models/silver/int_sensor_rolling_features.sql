@@ -17,12 +17,13 @@
     expanding lifecycle baseline), so a row's values match what was knowable when it was measured.
 
     Incremental contract: a lifecycle is recomputed in full whenever any version of one of its
-    pulses landed in stg_engine_telemetry after this model's watermark (minus the lookback), or
-    when its engine_model changed. A late or corrected pulse shifts the windows, deltas and
-    possibly the baseline of its neighbours, so whole-lifecycle recomputation is what keeps the
-    table identical to a --full-refresh. Recomputed rows win through the feature_computed_at
-    version; pulses that disappeared upstream are retracted with is_deleted = 1. Readers must
-    use FINAL.
+    pulses landed in stg_engine_telemetry after this model's watermark (minus the lookback),
+    when its engine_model changed, or when it was computed with another `baseline_cycles` (each
+    row records the value it used, so a changed definition never leaves old lifecycles behind).
+    A late or corrected pulse shifts the windows, deltas and possibly the baseline of its
+    neighbours, so whole-lifecycle recomputation is what keeps the table identical to a
+    --full-refresh. Recomputed rows win through the feature_computed_at version; pulses that
+    disappeared upstream are retracted with is_deleted = 1. Readers must use FINAL.
     unique_key only makes dbt-clickhouse run its on_schema_change check before appending (it
     skips that check for key-less appends); uniqueness comes from the engine key under FINAL.
 -#}
@@ -30,6 +31,7 @@
 {%- set sensors = raw_sensor_columns() -%}
 {%- set rolled_sensors = rolling_sensor_columns() -%}
 {%- set windows = rolling_windows() -%}
+{%- set baseline_cycles = int_var('baseline_cycles') -%}
 
 with
 
@@ -54,12 +56,14 @@ changed_pulses as (
 
 ),
 
-published_models as (
+published_definitions as (
 
+    -- what each lifecycle was last computed with (lifecycles are always recomputed in full)
     select
         engine_id,
         lifecycle_id,
-        argMaxIf(engine_model, feature_computed_at, is_deleted = 0) as published_engine_model
+        argMaxIf(engine_model, feature_computed_at, is_deleted = 0) as published_engine_model,
+        argMaxIf(baseline_cycles, feature_computed_at, is_deleted = 0) as published_baseline_cycles
     from {{ this }}
     group by engine_id, lifecycle_id
 
@@ -76,9 +80,16 @@ touched_lifecycles as (
 
     -- lifecycles published before their engine's registry row (and model) had landed
     select engine_id, lifecycle_id
-    from published_models
+    from published_definitions
     inner join registry_models using (engine_id)
     where published_engine_model != registry_engine_model
+
+    union distinct
+
+    -- lifecycles computed with another baseline_cycles (a changed var or a one-off --vars run)
+    select engine_id, lifecycle_id
+    from published_definitions
+    where published_baseline_cycles != {{ baseline_cycles }}
 
 ),
 {%- endif %}
@@ -109,7 +120,7 @@ baseline_periods as (
     select
         engine_id,
         lifecycle_id,
-        min(cycle_number) + {{ int_var('baseline_cycles') }} as baseline_end_cycle
+        min(cycle_number) + {{ baseline_cycles }} as baseline_end_cycle
     from telemetry
     group by engine_id, lifecycle_id
 
@@ -215,6 +226,7 @@ features as (
         {{ safe_divide('100.0 * (fuel_flow_kg_h - fuel_flow_kg_h_reference)', 'fuel_flow_kg_h_reference', '0.0') }}
             as fuel_flow_kg_h_drift_pct,
         {{ safe_divide('100.0 * (rpm - rpm_reference)', 'rpm_reference', '0.0') }} as rpm_drift_pct,
+        toUInt32({{ baseline_cycles }}) as baseline_cycles,
         ingested_at as source_ingested_at,
         now64(6, 'UTC') as feature_computed_at,
         toUInt8(0) as is_deleted
@@ -225,6 +237,7 @@ features as (
 
 select
     {{ feature_output_columns() | join(',\n    ') }},
+    baseline_cycles,
     source_ingested_at,
     feature_computed_at,
     is_deleted
@@ -236,6 +249,7 @@ union all
 -- retract published pulses of recomputed lifecycles that no longer exist upstream
 select
     {{ feature_output_columns() | join(',\n    ') }},
+    baseline_cycles,
     source_ingested_at,
     now64(6, 'UTC') as feature_computed_at,
     toUInt8(1) as is_deleted

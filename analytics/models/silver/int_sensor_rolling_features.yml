@@ -13,8 +13,8 @@ models:
       inference time). No feature is NULL or NaN.
       Incremental (append) on ReplacingMergeTree(feature_computed_at, is_deleted) ordered by
       (engine_id, lifecycle_id, telemetry_id): each run recomputes every lifecycle touched by
-      new, late, updated or deleted pulses (or by an engine_model change) and retracts pulses
-      deleted upstream. ALWAYS read it with FINAL.
+      new, late, updated or deleted pulses, by an engine_model change or by a changed
+      `baseline_cycles` var, and retracts pulses deleted upstream. ALWAYS read it with FINAL.
     config:
       tags: ["features"]
     data_tests:
@@ -218,6 +218,12 @@ models:
       - name: rpm_drift_pct
         data_type: Float64
         description: 100 * (rpm - baseline) / baseline (0 when the baseline is 0).
+      - name: baseline_cycles
+        data_type: UInt32
+        description: >
+          Value of the `baseline_cycles` var the row's drift features were computed with. The next
+          run recomputes every lifecycle built with another value, and the test
+          assert_features_use_current_baseline_cycles fails until it has. Not a feature.
       - name: source_ingested_at
         data_type: "DateTime64(3, 'UTC')"
         description: >

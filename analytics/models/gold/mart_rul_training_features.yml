@@ -5,10 +5,14 @@ models:
     description: >
       RUL training set (CONTRACT.md section 7): every feature row of int_sensor_rolling_features
       that belongs to a COMPLETED lifecycle (one with a FAILURE pulse), up to and including the
-      failure cycle, labelled with the remaining useful life. Group-aware train/test splits use
-      split_group so that no lifecycle leaks across the split. The 46 numeric model inputs are
-      cycle_number plus the 45 Float64 feature columns; engine_model is the only categorical
-      input. wear_factor, status, maintenance ids and timestamps are deliberately absent.
+      failure cycle, labelled with the remaining useful life. Only the newest
+      `mart_max_lifecycles_per_engine` (default 50) completed lifecycles of each engine are kept,
+      which bounds the rebuild cost and the training set on a long-running stack; the lifecycle
+      count therefore stops growing once every engine has reached the cap. Group-aware
+      train/test splits use split_group so that no lifecycle leaks across the split. The 46
+      numeric model inputs are cycle_number plus the 45 Float64 feature columns; engine_model is
+      the only categorical input. wear_factor, status, maintenance ids and timestamps are
+      deliberately absent.
       Table (rebuilt every run) on ReplacingMergeTree ordered by (engine_id, lifecycle_id,
       telemetry_id); rows are unique, so it can be read with or without FINAL.
     config:

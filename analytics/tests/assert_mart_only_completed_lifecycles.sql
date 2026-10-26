@@ -1,6 +1,7 @@
 {#-
-    The training mart must hold exactly the feature rows of COMPLETED lifecycles up to their
-    failure cycle: no running lifecycle, no missing and no extra pulse per lifecycle.
+    The training mart must hold exactly the feature rows of the newest
+    `mart_max_lifecycles_per_engine` COMPLETED lifecycles of each engine, up to their failure
+    cycle: no running or older lifecycle, no missing and no extra pulse per lifecycle.
 -#}
 
 with feature_rows as (
@@ -12,7 +13,12 @@ with feature_rows as (
 
 completed_lifecycles as (
 
-    select engine_id, lifecycle_id, failure_cycle
+    -- ranked independently of the model: 1 = the engine's newest completed lifecycle
+    select
+        engine_id,
+        lifecycle_id,
+        failure_cycle,
+        row_number() over (partition by engine_id order by lifecycle_id desc) as recency_rank
     from {{ ref('int_engine_lifecycles') }} final
     where has_failed = 1
 
@@ -24,6 +30,7 @@ expected as (
     from feature_rows
     inner join completed_lifecycles using (engine_id, lifecycle_id)
     where cycle_number <= failure_cycle
+      and recency_rank <= {{ positive_int_var('mart_max_lifecycles_per_engine') }}
     group by engine_id, lifecycle_id
 
 ),
