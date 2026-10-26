@@ -3,38 +3,46 @@
     python data_science/train_rul_model.py [--source clickhouse|minio] [--min-lifecycles N]
         [--promotion-policy better|always] [--skip-if-unchanged] [--dry-run]
 
-Rows come from the dbt gold mart (ClickHouse) or its newest MinIO snapshot. Whole
-lifecycles are split into train / validation / test; the challenger is scored on
-the test lifecycles and, when a production model exists, so is the champion. The
-challenger is promoted per MODEL_PROMOTION_POLICY. Artifacts go to MinIO and every
-non-dry run is recorded in ClickHouse ml_model_runs.
+Rows come from the dbt gold mart (ClickHouse) or its newest non-empty MinIO snapshot, at
+most TRAINING_MAX_ROWS of them (the newest completed lifecycles, see training_window.py).
+Whole lifecycles are split into train / validation / test; the challenger is scored on the
+test lifecycles and, when a production model exists, so is the champion. The promotion
+gate (model_promotion.py) applies absolute quality floors to every promotion and, under
+MODEL_PROMOTION_POLICY=better, the champion comparison; it fails closed. Artifacts go to
+MinIO and every non-dry run is recorded in ClickHouse ml_model_runs.
 
-Exit codes: 0 trained, 3 skipped (preconditions not met), 1 failure, 143 terminated.
+Training needs max(MIN_TRAINING_LIFECYCLES, 3) completed lifecycles: the split needs at
+least one lifecycle per side. ``--skip-if-unchanged`` skips while the newest completed
+lifecycle is the one the latest recorded run already saw.
+
+Exit codes: 0 trained (promoted or not), 3 skipped (preconditions not met), 1 failure,
+143 terminated.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import pandas as pd
 from artifact_store import ArtifactStore, S3ArtifactStore
+from champion_scoring import score_champion
 from ds_runtime import EXIT_OK, PreconditionsNotMetError, StopToken, configure_logging, positive_int, run_cli
-from ds_settings import PROMOTION_POLICIES, load_settings
-from feature_pipeline import ClickHouseTrainingSource, SnapshotTrainingSource, TrainingDataSource
+from ds_settings import MIN_SPLIT_LIFECYCLES, PROMOTION_POLICIES, PromotionSettings, load_settings
 from lakehouse_io import ClickHouseGateway
+from model_promotion import ChampionOutcome, PromotionDecision, decide_promotion
 from model_registry import (
     ArtifactLayout,
     ClickHouseRunRegistry,
     ModelArtifacts,
     ProductionPointer,
-    PromotionDecision,
+    PublishedModel,
     RunRegistry,
-    decide_promotion,
-    load_production_bundle,
+    RunSummary,
     new_model_version,
     publish_artifacts,
     read_production_pointer,
@@ -49,7 +57,9 @@ from rul_modeling import (
     split_groups,
     train_models,
 )
-from training_report import ChampionScore, TrainingReport
+from training_report import DatasetInfo, TrainingReport
+from training_sources import ClickHouseTrainingSource, SnapshotTrainingSource, TrainingDataSource
+from training_window import LifecycleInventory, format_micros, plan_training_window
 
 # Named explicitly: run as a script, __name__ would be "__main__" in every log line.
 logger = logging.getLogger("train_rul_model")
@@ -63,6 +73,13 @@ class TrainingRequest:
     promotion_policy: str
     skip_if_unchanged: bool
     dry_run: bool
+    max_training_rows: int = 600_000
+    gate: PromotionSettings = field(default_factory=PromotionSettings)
+
+    @property
+    def required_lifecycles(self) -> int:
+        """Completed lifecycles needed: ``min_lifecycles``, but at least one per split side (3)."""
+        return max(self.min_lifecycles, MIN_SPLIT_LIFECYCLES)
 
 
 @dataclass(frozen=True)
@@ -80,34 +97,71 @@ class TrainingContext:
 
 @dataclass(frozen=True)
 class TrainingOutcome:
-    """Result of one training run (``artifact_uri`` is None for dry runs)."""
+    """Result of one training run (``artifact_uri`` and ``bundle_sha256`` are None for dry runs)."""
 
     model_version: str
     split: GroupSplit
     holdout: HoldoutMetrics
-    champion: ChampionScore | None
+    champion: ChampionOutcome
     decision: PromotionDecision
     artifact_uri: str | None
+    bundle_sha256: str | None = None
+
+
+def _require_lifecycles(available: int, request: TrainingRequest, what: str) -> None:
+    required = request.required_lifecycles
+    if available < required:
+        floor = (
+            " (the train/validation/test split needs at least 3)" if request.min_lifecycles < required else ""
+        )
+        raise PreconditionsNotMetError(f"{available} completed lifecycles {what}, {required} required{floor}")
+
+
+def _same_data(latest: RunSummary, inventory: LifecycleInventory) -> bool:
+    if latest.data_watermark_us is not None:
+        return latest.data_watermark_us == inventory.watermark_us
+    # Runs recorded before data watermarks existed carry only their lifecycle count.
+    return latest.lifecycles == inventory.completed_lifecycles
+
+
+def _skip_reason(
+    pointer: ProductionPointer | None, latest: RunSummary | None, inventory: LifecycleInventory
+) -> str | None:
+    """Why ``--skip-if-unchanged`` skips this run; None means train."""
+    if latest is None or not _same_data(latest, inventory):
+        return None
+    newest = format_micros(inventory.watermark_us)
+    if pointer is None:
+        if latest.promoted:
+            logger.info(
+                "production.json is missing although %s was promoted: retraining", latest.model_version
+            )
+            return None
+        return (
+            f"no lifecycle completed since {latest.model_version} (newest ends {newest}), "
+            "which was not promoted"
+        )
+    if not pointer.bundle_sha256:
+        logger.info(
+            "production model %s has no bundle digest: training despite --skip-if-unchanged so that a "
+            "verifiable model can replace it",
+            pointer.model_version,
+        )
+        return None
+    return f"no lifecycle completed since {latest.model_version} (newest ends {newest})"
 
 
 def _check_preconditions(
-    request: TrainingRequest, context: TrainingContext, pointer: ProductionPointer | None
+    request: TrainingRequest,
+    context: TrainingContext,
+    pointer: ProductionPointer | None,
+    inventory: LifecycleInventory,
 ) -> None:
-    completed = context.source.count_completed_lifecycles()
-    if completed < request.min_lifecycles:
-        raise PreconditionsNotMetError(
-            f"{completed} completed lifecycles available, {request.min_lifecycles} required"
-        )
-    if not request.skip_if_unchanged:
-        return
-    if pointer is None:
-        logger.info("no production model yet: training despite --skip-if-unchanged")
-        return
-    latest = context.runs.latest_run()
-    if latest is not None and latest.lifecycles == completed:
-        raise PreconditionsNotMetError(
-            f"no new completed lifecycles since {latest.model_version} ({completed} lifecycles)"
-        )
+    _require_lifecycles(inventory.completed_lifecycles, request, "available")
+    if request.skip_if_unchanged:
+        reason = _skip_reason(pointer, context.runs.latest_run(), inventory)
+        if reason is not None:
+            raise PreconditionsNotMetError(reason)
 
 
 def _split_frames(frame: pd.DataFrame, split: GroupSplit) -> dict[str, pd.DataFrame]:
@@ -131,26 +185,8 @@ def _warn_on_label_mismatch(frame: pd.DataFrame, labels: LabelSpec) -> None:
             )
 
 
-def _score_champion(
-    context: TrainingContext, pointer: ProductionPointer | None, test_frame: pd.DataFrame
-) -> ChampionScore | None:
-    if pointer is None:
-        return None
-    try:
-        champion = load_production_bundle(context.store, pointer)
-        return ChampionScore(champion.model_version, evaluate_bundle(champion, test_frame, context.labels))
-    except Exception:
-        # An unreadable or incompatible champion must not block a fresh, working model.
-        logger.warning(
-            "production model %s could not be re-scored; treating it as unusable",
-            pointer.model_version,
-            exc_info=True,
-        )
-        return None
-
-
-def _publish(context: TrainingContext, report: TrainingReport) -> str:
-    """Write artifacts, then (on promotion) the pointer, then the run record; return the artifact URI."""
+def _publish(context: TrainingContext, report: TrainingReport) -> PublishedModel:
+    """Write artifacts, then (on promotion) the pointer, then the run record."""
     bundle = report.trained.bundle
     artifacts = ModelArtifacts(
         bundle=bundle,
@@ -158,8 +194,8 @@ def _publish(context: TrainingContext, report: TrainingReport) -> str:
         metrics=report.metrics(),
         feature_importance=feature_importance(bundle),
     )
-    artifact_uri = publish_artifacts(context.store, context.layout, artifacts)
-    logger.info("published artifacts to %s", artifact_uri)
+    published = publish_artifacts(context.store, context.layout, artifacts)
+    logger.info("published artifacts to %s (bundle sha256 %s)", published.uri, published.bundle_sha256)
     if report.decision.promote:
         pointer = ProductionPointer(
             model_version=bundle.model_version,
@@ -167,25 +203,32 @@ def _publish(context: TrainingContext, report: TrainingReport) -> str:
             promoted_at=datetime.now(UTC).isoformat(),
             metrics=report.holdout.as_dict(),
             feature_columns=list(bundle.feature_columns),
+            bundle_sha256=published.bundle_sha256,
         )
         write_production_pointer(context.store, context.layout, pointer)
         logger.info("production.json now points to %s", bundle.model_version)
-    context.runs.record_run(report.run_record(artifact_uri))
-    return artifact_uri
+    context.runs.record_run(report.run_record(published.uri, published.bundle_sha256))
+    return published
 
 
 def run_training(request: TrainingRequest, context: TrainingContext, *, now: datetime) -> TrainingOutcome:
     """Run one training job end to end; raise PreconditionsNotMetError when it should be skipped."""
     pointer = read_production_pointer(context.store, context.layout)
-    _check_preconditions(request, context, pointer)
-    dataset = context.source.load()
-    if dataset.completed_lifecycles < request.min_lifecycles:
-        raise PreconditionsNotMetError(
-            f"{dataset.completed_lifecycles} completed lifecycles loaded, {request.min_lifecycles} required"
-        )
-    _warn_on_label_mismatch(dataset.frame, context.labels)
-    split = split_groups(dataset.frame["split_group"].unique())
-    frames = _split_frames(dataset.frame, split)
+    inventory = context.source.inventory()
+    _check_preconditions(request, context, pointer, inventory)
+    window = plan_training_window(
+        inventory, max_rows=request.max_training_rows, min_lifecycles=request.required_lifecycles
+    )
+    # Thinning pulses means TRAINING_MAX_ROWS cannot even hold the minimum number of lifecycles.
+    (logger.warning if window.stride > 1 else logger.info)("%s", window.describe())
+    loaded = context.source.load(window)
+    _require_lifecycles(loaded.completed_lifecycles, request, "loaded")
+    dataset = DatasetInfo(loaded.data_source, loaded.source_uri, window, inventory.watermark_us)
+    _warn_on_label_mismatch(loaded.frame, context.labels)
+    split = split_groups(loaded.frame["split_group"].unique())
+    frames = _split_frames(loaded.frame, split)
+    # The three split frames are all training needs: release the loaded copy.
+    del loaded
     model_version = new_model_version(now)
     logger.info(
         "training %s from %s: %d/%d/%d train/validation/test lifecycles (%d/%d/%d rows)",
@@ -209,10 +252,8 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
     )
     context.stop.raise_if_stopped()
     holdout = evaluate_bundle(trained.bundle, frames["test"], context.labels)
-    champion = _score_champion(context, pointer, frames["test"])
-    decision = decide_promotion(
-        request.promotion_policy, holdout.rmse, None if champion is None else champion.holdout.rmse
-    )
+    champion = score_champion(context.store, pointer, frames["test"], trained.bundle, context.labels)
+    decision = decide_promotion(request.promotion_policy, holdout, champion, request.gate)
     report = TrainingReport(
         trained_at=now,
         dataset=dataset,
@@ -223,40 +264,46 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
         champion=champion,
         decision=decision,
         policy=request.promotion_policy,
+        gate=request.gate,
     )
     report.log()
-    artifact_uri = None
     if request.dry_run:
         logger.info("dry run: no artifacts, run record or production pointer written")
-    else:
-        # Last safe point: once publishing starts it runs to completion.
-        context.stop.raise_if_stopped()
-        artifact_uri = _publish(context, report)
-    return TrainingOutcome(model_version, split, holdout, champion, decision, artifact_uri)
+        return TrainingOutcome(model_version, split, holdout, champion, decision, None)
+    # Last safe point: once publishing starts it runs to completion.
+    context.stop.raise_if_stopped()
+    published = _publish(context, report)
+    return TrainingOutcome(
+        model_version, split, holdout, champion, decision, published.uri, published.bundle_sha256
+    )
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train the RUL regressor and imminent-failure classifier, then publish/promote them.",
-        epilog="Exit codes: 0 trained, 3 skipped (preconditions not met), 1 failure.",
+        epilog="Exit codes: 0 trained (promoted or not), 3 skipped (preconditions not met), 1 failure.",
     )
     parser.add_argument(
         "--source",
         choices=("clickhouse", "minio"),
         default="clickhouse",
-        help="clickhouse: mart_rul_training_features; minio: newest gold snapshot (default: clickhouse)",
+        help="clickhouse: mart_rul_training_features; minio: newest non-empty gold snapshot "
+        "(default: clickhouse)",
     )
     parser.add_argument(
         "--min-lifecycles",
         type=positive_int,
         default=None,
-        help="completed lifecycles required to train (default: MIN_TRAINING_LIFECYCLES, 6)",
+        help="completed lifecycles required to train (default: MIN_TRAINING_LIFECYCLES, 6); "
+        "at least 3 are always required, one per train/validation/test side",
     )
     parser.add_argument(
         "--promotion-policy",
         choices=PROMOTION_POLICIES,
         default=None,
-        help="better: promote only on lower holdout RMSE; always (default: MODEL_PROMOTION_POLICY)",
+        help="better: promote when the challenger passes the quality floors and beats the champion's "
+        "holdout RMSE without losing more than PROMOTION_F1_TOLERANCE classifier F1; always: skip the "
+        "champion comparison, the floors still apply (default: MODEL_PROMOTION_POLICY)",
     )
     parser.add_argument(
         "--skip-if-unchanged",
@@ -283,13 +330,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         promotion_policy=args.promotion_policy or model.promotion_policy,
         skip_if_unchanged=args.skip_if_unchanged,
         dry_run=args.dry_run,
+        max_training_rows=model.training_max_rows,
+        gate=model.promotion,
     )
     store = S3ArtifactStore(settings.s3)
-    with ClickHouseGateway(settings.clickhouse) as gateway:
+    with ClickHouseGateway(settings.clickhouse) as gateway, contextlib.ExitStack() as cleanup:
         source: TrainingDataSource = (
             ClickHouseTrainingSource(gateway)
             if args.source == "clickhouse"
-            else SnapshotTrainingSource(store)
+            else cleanup.enter_context(SnapshotTrainingSource(store))
         )
         context = TrainingContext(
             source=source,

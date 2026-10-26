@@ -5,16 +5,17 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
-from feature_pipeline import TrainingFrame
-from model_registry import ModelRunRecord, PromotionDecision
+from ds_settings import PromotionSettings
+from failure_classifier import CLASSIFIER_PARAMS, THRESHOLD_RULE
+from model_promotion import ChampionOutcome, PromotionDecision
+from model_registry import ModelRunRecord
 from rul_metrics import HoldoutMetrics
 from rul_modeling import (
-    CLASSIFIER_PARAMS,
-    F1_TOLERANCE,
+    EARLY_STOPPING_ROUNDS,
     REGRESSOR_PARAMS,
     SPLIT_SEED,
     TEST_FRACTION,
@@ -22,16 +23,19 @@ from rul_modeling import (
     GroupSplit,
     TrainedModel,
 )
+from training_window import TrainingWindow, format_micros
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class ChampionScore:
-    """The production model re-scored on the challenger's holdout lifecycles."""
+class DatasetInfo:
+    """Origin of the training rows: source, the window loaded from it and its data watermark."""
 
-    model_version: str
-    holdout: HoldoutMetrics
+    data_source: str
+    source_uri: str
+    window: TrainingWindow
+    data_watermark_us: int | None
 
 
 @dataclass(frozen=True)
@@ -39,14 +43,15 @@ class TrainingReport:
     """Facts of one training run, rendered into every reporting format."""
 
     trained_at: datetime
-    dataset: TrainingFrame
+    dataset: DatasetInfo
     split: GroupSplit
     rows: dict[str, int]
     trained: TrainedModel
     holdout: HoldoutMetrics
-    champion: ChampionScore | None
+    champion: ChampionOutcome
     decision: PromotionDecision
     policy: str
+    gate: PromotionSettings
 
     @property
     def model_version(self) -> str:
@@ -67,49 +72,91 @@ class TrainingReport:
             holdout.nasa_score_sum,
         )
         logger.info(
-            "holdout classifier | threshold %.3f | F1 %.3f | precision %.3f | recall %.3f | ROC-AUC %.3f",
+            "holdout classifier | threshold %.3f | F1 %.3f | precision %.3f | recall %.3f | ROC-AUC %.3f "
+            "| Brier %.4f | ECE %.4f",
             holdout.clf_threshold,
             holdout.clf_f1,
             holdout.clf_precision,
             holdout.clf_recall,
             holdout.clf_roc_auc,
+            holdout.clf_brier,
+            holdout.clf_ece,
         )
-        if self.champion is not None:
+        calibration = self.trained.calibration
+        logger.info(
+            "classifier calibration | Platt slope %.3f intercept %.3f fitted on %d out-of-fold rows "
+            "(%d lifecycles, %d folds) | OOF F1 %.3f Brier %.4f ECE %.4f | threshold %.3f (%s)",
+            calibration.calibration.slope,
+            calibration.calibration.intercept,
+            calibration.rows,
+            calibration.lifecycles,
+            calibration.folds,
+            calibration.oof_f1,
+            calibration.oof_brier,
+            calibration.oof_ece,
+            calibration.threshold,
+            THRESHOLD_RULE,
+        )
+        champion = self.champion.holdout
+        if champion is not None:
             logger.info(
-                "champion %s on the same holdout | RMSE %.2f | R2 %.3f | F1 %.3f",
+                "champion %s on %s | RMSE %.2f | R2 %.3f | F1 %.3f",
                 self.champion.model_version,
-                self.champion.holdout.rmse,
-                self.champion.holdout.r2,
-                self.champion.holdout.clf_f1,
+                self.champion.detail or "the same holdout",
+                champion.rmse,
+                champion.r2,
+                champion.clf_f1,
+            )
+        challenger = self.champion.challenger_holdout
+        if challenger is not None:
+            logger.info(
+                "challenger on the same lifecycles | RMSE %.2f | R2 %.3f | F1 %.3f",
+                challenger.rmse,
+                challenger.r2,
+                challenger.clf_f1,
             )
         verdict = "promote" if self.decision.promote else "keep champion"
-        logger.info("promotion: %s - %s", verdict, self.decision.reason)
+        log = logger.info if self.decision.promote else logger.warning
+        log("promotion: %s - %s", verdict, self.decision.reason)
         summary = {
             "model_version": self.model_version,
             "data_source": self.dataset.data_source,
             "source_uri": self.dataset.source_uri,
+            "training_window": self.dataset.window.as_dict(),
             "best_iteration": self.trained.best_iteration,
             "holdout": holdout.as_dict(),
             "validation": self.trained.validation.as_dict(),
-            "champion": self._champion_document(),
+            "calibration": calibration.as_dict(),
+            "champion": self.champion.as_dict(),
             "promoted": self.decision.promote,
             "promotion_reason": self.decision.reason,
         }
         logger.info("training summary %s", json.dumps(summary, sort_keys=True))
 
-    def _champion_document(self) -> dict[str, Any] | None:
-        if self.champion is None:
-            return None
-        return {"model_version": self.champion.model_version, "holdout": self.champion.holdout.as_dict()}
+    def _promotion_document(self) -> dict[str, Any]:
+        return {
+            "policy": self.policy,
+            "promoted": self.decision.promote,
+            "reason": self.decision.reason,
+            "champion_version": self.champion.model_version,
+            "champion_status": self.champion.status.value,
+            "champion_detail": self.champion.detail or None,
+            "floors": asdict(self.gate),
+            "floor_failures": list(self.decision.floor_failures),
+        }
 
     def metadata(self) -> dict[str, Any]:
         """Content of metadata.json: data, split, feature contract, parameters, promotion."""
         bundle = self.trained.bundle
+        watermark = self.dataset.data_watermark_us
         return {
             "model_version": self.model_version,
             "trained_at": self.trained_at.isoformat(),
             "data_source": self.dataset.data_source,
             "source_uri": self.dataset.source_uri,
+            "data_watermark_us": watermark,
+            "data_watermark": format_micros(watermark),
+            "training_window": self.dataset.window.as_dict(),
             "lifecycles": {
                 "train": list(self.split.train),
                 "validation": list(self.split.validation),
@@ -125,9 +172,15 @@ class TrainingReport:
             },
             "hours_per_cycle": bundle.hours_per_cycle,
             "decision_threshold": bundle.decision_threshold,
-            "decision_threshold_rule": f"lowest threshold with validation F1 >= best F1 - {F1_TOLERANCE}",
-            "regressor": {"params": REGRESSOR_PARAMS, "best_iteration": self.trained.best_iteration},
+            "decision_threshold_rule": THRESHOLD_RULE,
+            "regressor": {
+                "params": REGRESSOR_PARAMS,
+                "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                "best_iteration": self.trained.best_iteration,
+                "trees": int(bundle.regressor.get_booster().num_boosted_rounds()),
+            },
             "classifier": {"params": CLASSIFIER_PARAMS, "n_iter": int(bundle.classifier.n_iter_)},
+            "calibration": self.trained.calibration.as_dict(),
             "split": {
                 "method": "sha256(seed|split_group) thresholds",
                 "seed": SPLIT_SEED,
@@ -135,46 +188,52 @@ class TrainingReport:
                 "validation_fraction": VALIDATION_FRACTION,
             },
             "library_versions": bundle.library_versions,
-            "promotion": {
-                "policy": self.policy,
-                "promoted": self.decision.promote,
-                "reason": self.decision.reason,
-                "champion_version": None if self.champion is None else self.champion.model_version,
-            },
+            "promotion": self._promotion_document(),
         }
 
     def metrics(self) -> dict[str, Any]:
-        """Content of metrics.json: holdout and validation metrics plus the champion comparison."""
+        """Content of metrics.json: holdout, validation and out-of-fold metrics plus the champion."""
         return {
             "model_version": self.model_version,
             "holdout": self.holdout.as_dict(),
+            # The validation lifecycles early-stopped both models and the classifier is refit
+            # on them, so these are optimistic; holdout and out_of_fold are the honest numbers.
             "validation": self.trained.validation.as_dict(),
-            "champion": self._champion_document(),
+            "out_of_fold": self.trained.calibration.as_dict(),
+            "champion": self.champion.as_dict(),
             "promotion": {"promoted": self.decision.promote, "reason": self.decision.reason},
         }
 
-    def run_record(self, artifact_uri: str) -> ModelRunRecord:
+    def run_record(self, artifact_uri: str, bundle_sha256: str) -> ModelRunRecord:
         """The ml_model_runs row; train_* counts include the validation lifecycles."""
         metadata = self.metadata()
         reproducibility_keys = (
             "regressor",
             "classifier",
+            "calibration",
             "decision_threshold",
             "decision_threshold_rule",
             "labels",
             "hours_per_cycle",
             "split",
+            "training_window",
+            "data_watermark_us",
         )
         params = {key: metadata[key] for key in reproducibility_keys}
+        holdout = self.holdout.as_dict()
+        champion = self.champion.holdout
         params.update(
             source_uri=self.dataset.source_uri,
             validation_lifecycles=len(self.split.validation),
-            late_life_rmse=self.holdout.as_dict()["late_life_rmse"],
-            nasa_score_sum=self.holdout.as_dict()["nasa_score_sum"],
+            late_life_rmse=holdout["late_life_rmse"],
+            nasa_score_sum=holdout["nasa_score_sum"],
+            clf_brier=holdout["clf_brier"],
+            clf_ece=holdout["clf_ece"],
+            bundle_sha256=bundle_sha256,
             promotion=metadata["promotion"],
-            champion_rmse=None if self.champion is None else self.champion.holdout.as_dict()["rmse"],
+            champion_rmse=None if champion is None else champion.as_dict()["rmse"],
+            champion_clf_f1=None if champion is None else champion.as_dict()["clf_f1"],
         )
-        holdout = self.holdout
         return ModelRunRecord(
             model_version=self.model_version,
             trained_at=self.trained_at,
@@ -183,14 +242,14 @@ class TrainingReport:
             test_rows=self.rows["test"],
             train_lifecycles=len(self.split.train) + len(self.split.validation),
             test_lifecycles=len(self.split.test),
-            rmse=holdout.rmse,
-            mae=holdout.mae,
-            r2=holdout.r2,
-            nasa_score=holdout.nasa_score,
-            clf_f1=holdout.clf_f1,
-            clf_precision=holdout.clf_precision,
-            clf_recall=holdout.clf_recall,
-            clf_roc_auc=holdout.clf_roc_auc,
+            rmse=self.holdout.rmse,
+            mae=self.holdout.mae,
+            r2=self.holdout.r2,
+            nasa_score=self.holdout.nasa_score,
+            clf_f1=self.holdout.clf_f1,
+            clf_precision=self.holdout.clf_precision,
+            clf_recall=self.holdout.clf_recall,
+            clf_roc_auc=self.holdout.clf_roc_auc,
             promoted=self.decision.promote,
             artifact_uri=artifact_uri,
             params_json=json.dumps(params, sort_keys=True),
