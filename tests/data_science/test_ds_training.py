@@ -1,19 +1,28 @@
-"""Lifecycle-aware split, model quality on synthetic data, metrics and threshold tuning."""
+"""Lifecycle-aware split, model quality on synthetic data, metrics, calibration and the threshold."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import pytest
-from rul_metrics import evaluate_predictions, nasa_scores
+from failure_classifier import (
+    CALIBRATION_FOLDS,
+    NEUTRAL_THRESHOLD,
+    THRESHOLD_BOUNDS,
+    PlattCalibration,
+    fit_platt,
+    group_folds,
+    select_threshold,
+)
+from rul_metrics import brier_score, evaluate_predictions, expected_calibration_error, nasa_scores
 from rul_modeling import (
-    F1_TOLERANCE,
+    IncompatibleModelError,
     LabelSpec,
     RulModelBundle,
     feature_importance,
     split_groups,
-    tune_threshold,
 )
+from scipy.special import expit
 from sklearn.metrics import f1_score
 
 
@@ -68,6 +77,7 @@ def test_regressor_and_classifier_learn_the_planted_signal(synthetic_training) -
     assert holdout.late_life_rmse < 25.0
     assert holdout.clf_f1 > 0.7
     assert holdout.clf_roc_auc > 0.9
+    assert holdout.clf_brier < 0.1 and holdout.clf_ece < 0.1
     assert holdout.rows == len(synthetic_training.frames["test"])
     assert holdout.lifecycles == len(synthetic_training.split.test)
 
@@ -78,13 +88,51 @@ def test_bundle_carries_its_contract(synthetic_training, label_spec: LabelSpec) 
 
     assert bundle.rul_cap_cycles == label_spec.rul_cap_cycles
     assert bundle.failure_horizon_cycles == label_spec.failure_horizon_cycles
-    assert 0.0 < bundle.decision_threshold < 1.0
+    assert THRESHOLD_BOUNDS[0] <= bundle.decision_threshold <= THRESHOLD_BOUNDS[1]
+    assert bundle.decision_threshold == trained.calibration.threshold
+    assert bundle.calibration == trained.calibration.calibration and bundle.calibration.slope > 0
     assert bundle.categories == {
         "engine_model": sorted(synthetic_training.frames["train"]["engine_model"].unique())
     }
     assert 0 < trained.best_iteration < 2000
     predictions = bundle.predict_rul_cycles(bundle.feature_matrix(synthetic_training.frames["test"]))
     assert predictions.min() >= 0.0 and predictions.max() <= label_spec.rul_cap_cycles
+
+
+def test_published_probability_is_the_calibrated_classifier_score(synthetic_training) -> None:
+    bundle = synthetic_training.trained.bundle
+    matrix = bundle.feature_matrix(synthetic_training.frames["test"])
+
+    probability = bundle.predict_failure_probability(matrix)
+
+    raw = bundle.classifier.decision_function(matrix)
+    np.testing.assert_allclose(
+        probability, expit(bundle.calibration.slope * raw + bundle.calibration.intercept)
+    )
+    assert ((probability > 0) & (probability < 1)).all()
+
+
+def test_calibration_report_comes_from_out_of_fold_lifecycles(synthetic_training) -> None:
+    report = synthetic_training.trained.calibration
+    development = synthetic_training.split.train + synthetic_training.split.validation
+
+    assert report.lifecycles == len(development)
+    assert report.folds == min(CALIBRATION_FOLDS, len(development))
+    assert report.rows == len(synthetic_training.frames["train"]) + len(
+        synthetic_training.frames["validation"]
+    )
+    assert report.n_iter == synthetic_training.trained.bundle.classifier.n_iter_
+    assert report.oof_roc_auc > 0.9 and 0 <= report.oof_brier < 0.1 and 0 <= report.oof_ece < 0.1
+    document = report.as_dict()
+    assert document["method"] == "platt" and document["threshold"] == report.threshold
+    assert "out-of-fold" in document["threshold_rule"]
+
+
+def test_regressor_keeps_only_the_trees_up_to_its_best_iteration(synthetic_training) -> None:
+    trained = synthetic_training.trained
+    booster = trained.bundle.regressor.get_booster()
+
+    assert booster.num_boosted_rounds() == trained.best_iteration + 1
 
 
 def test_feature_importance_covers_every_model_input(synthetic_training) -> None:
@@ -95,6 +143,20 @@ def test_feature_importance_covers_every_model_input(synthetic_training) -> None
     assert sorted(importance["feature"]) == sorted(bundle.matrix_columns)
     assert importance["gain"].is_monotonic_decreasing
     assert importance["gain_share"].sum() == pytest.approx(1.0)
+    trees = bundle.regressor.get_booster().trees_to_dataframe()
+    assert importance["weight"].sum() == (trees["Feature"] != "Leaf").sum()
+
+
+def test_bundle_payload_round_trip_and_format_check(synthetic_training) -> None:
+    bundle = synthetic_training.trained.bundle
+    payload = bundle.to_payload()
+
+    restored = RulModelBundle.from_payload(payload)
+
+    assert restored.calibration == bundle.calibration
+    assert restored.decision_threshold == bundle.decision_threshold
+    with pytest.raises(IncompatibleModelError, match="format 1"):
+        RulModelBundle.from_payload({**payload, "bundle_format": 1})
 
 
 def test_label_spec_targets_and_mismatch_detection(synthetic_mart: pd.DataFrame) -> None:
@@ -135,27 +197,107 @@ def test_metrics_use_capped_target_and_late_life_rows() -> None:
     assert metrics.late_life_rmse == pytest.approx(np.sqrt((0 + 100 + 100) / 3))
     assert metrics.clf_f1 == 1.0 and metrics.clf_roc_auc == 1.0
     assert metrics.positive_rate == 0.25
+    assert metrics.clf_brier == pytest.approx((0.01 + 0.04 + 0.09 + 0.01) / 4)
+    assert metrics.clf_ece == pytest.approx((0.1 + 0.2 + 0.3 + 0.1) / 4)
 
 
-def test_threshold_tuning_maximises_f1() -> None:
-    truth = np.array([0, 0, 0, 0, 1, 1, 1])
-    probability = np.array([0.05, 0.1, 0.2, 0.35, 0.3, 0.6, 0.9])
+def test_brier_score_and_calibration_error_known_values() -> None:
+    assert brier_score(np.array([0, 1]), np.array([0.2, 0.6])) == pytest.approx(0.1)
+    outcome = np.array([0, 0, 1, 1])
+    assert expected_calibration_error(outcome, np.array([0.05, 0.15, 0.95, 0.85])) == pytest.approx(0.1)
+    # Four rows stated at 25 % with one positive: perfectly calibrated.
+    assert expected_calibration_error(np.array([1, 0, 0, 0]), np.full(4, 0.25)) == pytest.approx(0.0)
+    assert expected_calibration_error(np.array([1]), np.array([1.0])) == pytest.approx(0.0)
 
-    threshold = tune_threshold(truth, probability)
 
-    assert threshold == pytest.approx(0.3)
-    assert tune_threshold(np.zeros(4, dtype=int), np.linspace(0, 1, 4)) == 0.5
+def test_platt_scaling_recovers_a_known_sigmoid() -> None:
+    rng = np.random.default_rng(3)
+    score = rng.normal(0.0, 2.0, 40_000)
+    outcome = rng.random(score.size) < expit(1.7 * score - 0.8)
+
+    calibration = fit_platt(score, outcome)
+
+    assert calibration.slope == pytest.approx(1.7, abs=0.08)
+    assert calibration.intercept == pytest.approx(-0.8, abs=0.08)
+
+
+def test_platt_scaling_stays_finite_on_separable_scores() -> None:
+    score = np.array([-3.0, -2.0, -1.0, 1.0, 2.0, 3.0])
+    outcome = np.array([0, 0, 0, 1, 1, 1])
+
+    calibration = fit_platt(score, outcome)
+    probability = calibration.probability(score)
+
+    assert np.isfinite([calibration.slope, calibration.intercept]).all()
+    assert ((probability > 0) & (probability < 1)).all()
+    assert probability[3:].min() > 0.5 > probability[:3].max()
+    with pytest.raises(ValueError, match="both sides"):
+        fit_platt(score, np.zeros(6))
+
+
+def test_platt_payload_round_trip() -> None:
+    calibration = PlattCalibration(slope=1.25, intercept=-0.5)
+
+    assert PlattCalibration.from_payload(calibration.to_payload()) == calibration
+    with pytest.raises(ValueError, match="isotonic"):
+        PlattCalibration.from_payload({"method": "isotonic"})
+
+
+def test_group_folds_score_every_lifecycle_exactly_once() -> None:
+    groups = np.repeat([f"E#{index}" for index in range(8)], 5)
+
+    folds = group_folds(groups)
+
+    assert len(folds) == CALIBRATION_FOLDS
+    scored = np.concatenate([scored_rows for _, scored_rows in folds])
+    assert sorted(scored) == list(range(groups.size))
+    for fit_rows, scored_rows in folds:
+        assert set(groups[fit_rows]).isdisjoint(groups[scored_rows])
+    assert len(group_folds(groups[:10])) == 2
+    with pytest.raises(ValueError, match="at least 2"):
+        group_folds(groups[:5])
+
+
+def _f1_at(outcome: np.ndarray, probability: np.ndarray, threshold: float) -> float:
+    return float(f1_score(outcome, (probability >= threshold).astype(int), zero_division=0))
 
 
 @pytest.mark.parametrize("seed", range(5))
-def test_threshold_is_the_lowest_near_optimal_one(seed: int) -> None:
+def test_threshold_maximises_f1_within_the_bounds(seed: int) -> None:
     rng = np.random.default_rng(seed)
-    truth = rng.integers(0, 2, 400)
-    probability = np.clip(0.35 * truth + rng.normal(0.3, 0.2, 400), 0.0, 1.0)
+    outcome = rng.integers(0, 2, 400)
+    probability = np.clip(0.35 * outcome + rng.normal(0.3, 0.2, 400), 0.0, 1.0)
 
-    threshold = tune_threshold(truth, probability)
+    threshold = select_threshold(outcome, probability)
 
-    candidates = np.unique(probability)
-    f1 = np.array([f1_score(truth, (probability >= c).astype(int)) for c in candidates])
-    assert f1_score(truth, (probability >= threshold).astype(int)) >= f1.max() - F1_TOLERANCE - 1e-12
-    assert not (f1[candidates < threshold] >= f1.max() - F1_TOLERANCE).any()
+    low, high = THRESHOLD_BOUNDS
+    assert low <= threshold <= high
+    grid = [low, high, *probability[(probability >= low) & (probability <= high)]]
+    best = max(_f1_at(outcome, probability, candidate) for candidate in grid)
+    assert _f1_at(outcome, probability, threshold) == pytest.approx(best)
+
+
+def test_threshold_never_drops_to_the_probability_floor() -> None:
+    # A perfect F1 would need a threshold of 0.01, right above the negatives' floor of 0.001.
+    outcome = np.array([0] * 50 + [1] * 10)
+    probability = np.array([0.001] * 50 + [0.01] * 5 + [0.2] * 5)
+
+    threshold = select_threshold(outcome, probability)
+
+    assert _f1_at(outcome, probability, 0.01) == 1.0
+    # Within the bounds 0.05 and 0.2 flag the same rows; the tie goes towards 0.5.
+    assert threshold == pytest.approx(0.2)
+    assert _f1_at(outcome, probability, threshold) == pytest.approx(2 / 3)
+
+
+def test_threshold_ties_break_towards_one_half() -> None:
+    outcome = np.array([0, 0, 0, 1, 1, 1])
+    probability = np.array([0.02, 0.08, 0.1, 0.9, 0.93, 0.99])
+
+    assert select_threshold(outcome, probability) == NEUTRAL_THRESHOLD
+    shifted = np.array([0.02, 0.08, 0.1, 0.3, 0.32, 0.35])
+    assert select_threshold(outcome, shifted) == pytest.approx(0.3)
+
+
+def test_threshold_without_both_classes_is_neutral() -> None:
+    assert select_threshold(np.zeros(4, dtype=int), np.linspace(0, 1, 4)) == NEUTRAL_THRESHOLD
