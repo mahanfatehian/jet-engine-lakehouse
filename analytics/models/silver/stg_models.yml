@@ -1,0 +1,248 @@
+version: 2
+
+models:
+  - name: stg_engine_telemetry
+    description: >
+      Cleaned CDC versions of engine_telemetry. Incremental (append) on
+      ReplacingMergeTree(cdc_lsn, is_deleted) ordered by (engine_id, telemetry_id): each run
+      appends raw versions ingested after max(ingested_at) - ingestion_lookback_minutes that are
+      not published yet, so late-arriving pulses and late-visible inserts are both picked up.
+      Read with FINAL: it keeps the highest cdc_lsn per pulse and hides pulses whose current
+      version is retracted. Reading without FINAL returns every published version.
+    data_tests:
+      - finite_values:
+          arguments:
+            columns: ['rpm', 'core_temp_c', 'egt_c', 'vibration_mm_s', 'fuel_flow_kg_h', 'oil_pressure_psi']
+            use_final: true
+    columns:
+      - name: telemetry_id
+        data_type: UInt64
+        description: Source pulse id (engine_telemetry primary key).
+        data_tests:
+          - unique_under_final
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('stg_engine_status_registry')
+                field: engine_id
+              config:
+                # the registry topic can lag behind telemetry for a moment
+                severity: warn
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Run-to-failure lifecycle of the engine.
+      - name: cycle_number
+        data_type: UInt32
+        description: Operating cycle within the lifecycle.
+      - name: event_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Measurement time of the pulse (UTC).
+      - name: rpm
+        data_type: Float64
+        description: Shaft speed (rev/min).
+      - name: core_temp_c
+        data_type: Float64
+        description: Core temperature (degC).
+      - name: egt_c
+        data_type: Float64
+        description: Exhaust gas temperature (degC).
+      - name: vibration_mm_s
+        data_type: Float64
+        description: Vibration velocity (mm/s).
+      - name: fuel_flow_kg_h
+        data_type: Float64
+        description: Fuel flow (kg/h).
+      - name: oil_pressure_psi
+        data_type: Float64
+        description: Oil pressure (psi).
+      - name: wear_factor
+        data_type: Float64
+        description: Simulator ground-truth wear (0..1). Never an ML feature.
+      - name: status
+        data_type: LowCardinality(String)
+        description: Upper-cased, trimmed pulse status. Marks the FAILURE pulse; never an ML feature.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HEALTHY', 'WARNING', 'CRITICAL', 'FAILURE']
+      - name: maintenance_id
+        data_type: Nullable(UInt64)
+        description: Work order linked at failure time (latest version wins).
+      - name: created_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Insert time in PostgreSQL.
+      - name: cdc_op
+        data_type: LowCardinality(String)
+        description: Debezium operation of the version (c, u, d, r).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['c', 'u', 'd', 'r']
+      - name: cdc_lsn
+        data_type: UInt64
+        description: Log sequence number; ReplacingMergeTree version.
+      - name: cdc_source_ts
+        data_type: "DateTime64(3, 'UTC')"
+        description: Commit time of the change in PostgreSQL.
+      - name: ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Time the version landed in ClickHouse; the incremental watermark.
+      - name: is_deleted
+        data_type: UInt8
+        description: >
+          1 when the version is a source delete or carries a non-finite sensor reading; FINAL
+          hides such pulses.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+
+  - name: stg_engine_status_registry
+    description: >
+      Status history of every engine: one row per CDC version of engine_status_registry
+      (replayed deliveries collapse). Incremental (append) on ReplacingMergeTree ordered by
+      (engine_id, cdc_lsn) with the same watermark-and-lookback rule as stg_engine_telemetry.
+      The current state of an engine is its row with the highest cdc_lsn (read with FINAL, then
+      argMax or ORDER BY cdc_lsn DESC LIMIT 1 BY engine_id); is_deleted = 1 there means the engine
+      was removed.
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'cdc_lsn']
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model.
+        data_tests:
+          - not_null
+      - name: operational_status
+        data_type: LowCardinality(String)
+        description: Upper-cased, trimmed status. Never an ML feature.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HEALTHY', 'WARNING', 'CRITICAL', 'FAILURE', 'MAINTENANCE_RESET']
+      - name: current_lifecycle_id
+        data_type: UInt32
+        description: Lifecycle the engine was in at this version.
+      - name: current_cycle
+        data_type: UInt32
+        description: Cycle within that lifecycle.
+      - name: wear_factor
+        data_type: Float64
+        description: Simulator ground-truth wear (0..1). Never an ML feature.
+      - name: cycles_since_new
+        data_type: UInt32
+        description: Cycles accumulated since registration.
+      - name: lifecycles_completed
+        data_type: UInt32
+        description: Run-to-failure lifecycles completed so far.
+      - name: last_maintenance_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Completion time of the most recent repair.
+      - name: status_changed_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Time operational_status last changed.
+      - name: last_telemetry_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: event_ts of the engine's last pulse at this version.
+      - name: updated_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Update time of the registry row in PostgreSQL.
+      - name: registered_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Registration time of the engine.
+      - name: cdc_op
+        data_type: LowCardinality(String)
+        description: Debezium operation of the version (c, u, d, r).
+      - name: cdc_lsn
+        data_type: UInt64
+        description: Log sequence number; orders the history.
+      - name: cdc_source_ts
+        data_type: "DateTime64(3, 'UTC')"
+        description: Commit time of the change in PostgreSQL.
+      - name: ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Time the version landed in ClickHouse; the incremental watermark.
+      - name: is_deleted
+        data_type: UInt8
+        description: 1 when the version is a delete of the registry row.
+
+  - name: stg_maintenance_log
+    description: >
+      Current version of every maintenance work order (highest cdc_lsn per maintenance_id),
+      deleted work orders removed. Table (rebuilt every run; one row per failure) on
+      ReplacingMergeTree ordered by (engine_id, maintenance_id).
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'lifecycle_id']
+    columns:
+      - name: maintenance_id
+        data_type: UInt64
+        description: Work order id.
+        data_tests:
+          - unique_under_final
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine that failed.
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle that ended in this failure.
+      - name: failure_cycle
+        data_type: UInt32
+        description: Cycle at which the engine failed, as recorded by the work order.
+      - name: failure_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Failure time.
+      - name: failure_mode
+        data_type: LowCardinality(String)
+        description: Upper-cased, trimmed failure mode.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HPT_BLADE_EROSION', 'BEARING_DEGRADATION', 'OIL_SYSTEM_LEAK', 'COMPRESSOR_FOULING']
+              config:
+                severity: warn
+      - name: maintenance_status
+        data_type: LowCardinality(String)
+        description: OPEN until the repair completes, then COMPLETED.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['OPEN', 'COMPLETED']
+      - name: action_taken
+        data_type: Nullable(String)
+        description: Repair action (set on completion).
+      - name: opened_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Time the work order was opened.
+      - name: completed_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Time the repair completed.
+      - name: downtime_seconds
+        data_type: Nullable(Int32)
+        description: Repair downtime in seconds.
+        data_tests:
+          - non_negative
+      - name: warning_rows_flagged
+        data_type: Nullable(Int32)
+        description: Telemetry rows linked to the work order at failure.
+      - name: notes
+        data_type: Nullable(String)
+        description: Free-text notes.
+      - name: cdc_op
+        data_type: LowCardinality(String)
+        description: Debezium operation of the current version.
+      - name: cdc_lsn
+        data_type: UInt64
+        description: Log sequence number of the current version.
+      - name: ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Time the current version landed in ClickHouse.
