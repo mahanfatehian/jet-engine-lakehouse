@@ -1,0 +1,318 @@
+version: 2
+
+models:
+  - name: fct_rul_prediction_backtest
+    description: >
+      Live backtest of the RUL model: every prediction of gold_engine_rul_predictions made during
+      a lifecycle that has since FAILED (int_engine_lifecycles.has_failed = 1), scored against the
+      truth the failure revealed. One row per (model_version, engine_id, lifecycle_id,
+      telemetry_id): the predictor re-scores an engine's newest feature row every round until a
+      newer pulse lands, so only the first (live) scoring of a row is kept. Scorings of the
+      FAILURE pulse itself, or of a later pulse, are excluded: they are made after the engine has
+      failed, their truth is RUL 0 by definition and they carry no warning value. Pulses of the
+      failure cycle that precede the FAILURE pulse stay (RUL label 0, as in
+      mart_rul_training_features). Errors are measured against the RUL capped at var
+      rul_cap_cycles (the regressor's target); the horizon label uses the horizon the model was
+      trained for (horizon_cycles). The lifecycle-level warning lead time is derived from these
+      rows by rpt_model_live_performance. Table (rebuilt every run) on ReplacingMergeTree ordered
+      by (model_version, engine_id, lifecycle_id, telemetry_id); rows are unique, so it can be
+      read with or without FINAL.
+    config:
+      tags: ["ml", "backtest"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['model_version', 'engine_id', 'lifecycle_id', 'telemetry_id']
+      - finite_values:
+          arguments:
+            columns: ['predicted_rul_cycles', 'error_cycles', 'abs_error_cycles', 'nasa_score', 'failure_probability']
+      - expression_is_true:
+          name: fct_rul_prediction_backtest_errors_consistent
+          arguments:
+            expression: >
+              error_cycles = predicted_rul_cycles - actual_rul_cycles_capped
+              and abs_error_cycles = abs(error_cycles)
+              and is_late_prediction = (error_cycles > 0)
+              and actual_rul_cycles_capped <= actual_rul_cycles
+              and feature_event_ts < failure_ts
+    columns:
+      - name: predicted_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: First time this model version scored the feature row (UTC); later re-scorings are dropped.
+        data_tests:
+          - not_null
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Scored engine.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model the prediction was made with (categorical model input).
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Failed lifecycle the scored pulse belongs to.
+        data_tests:
+          - not_null
+      - name: cycle_number
+        data_type: UInt32
+        description: Cycle of the scored pulse within the lifecycle.
+      - name: telemetry_id
+        data_type: UInt64
+        description: Scored pulse (feature row of int_sensor_rolling_features).
+        data_tests:
+          - not_null
+      - name: feature_event_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Measurement time of the scored pulse (UTC); always before failure_ts.
+      - name: model_version
+        data_type: LowCardinality(String)
+        description: rul-YYYYMMDDTHHMMSSZ of the model that made the prediction.
+        data_tests:
+          - not_null
+      - name: predicted_rul_cycles
+        data_type: Float64
+        description: Predicted remaining cycles (regressor output, clipped to [0, cap] by the predictor).
+      - name: actual_rul_cycles
+        data_type: Int32
+        description: True remaining useful life = failure_cycle - cycle_number (0 for pulses of the failure cycle).
+        data_tests:
+          - not_null
+          - non_negative
+      - name: actual_rul_cycles_capped
+        data_type: Int32
+        description: least(actual_rul_cycles, var rul_cap_cycles), the target the regressor is trained on and held to.
+        data_tests:
+          - non_negative
+      - name: error_cycles
+        data_type: Float64
+        description: >
+          predicted_rul_cycles - actual_rul_cycles_capped. Positive = late (the failure came sooner
+          than predicted, optimistic), negative = early (conservative).
+      - name: abs_error_cycles
+        data_type: Float64
+        description: abs(error_cycles).
+        data_tests:
+          - non_negative
+      - name: is_late_prediction
+        data_type: UInt8
+        description: 1 when error_cycles > 0 (the model over-estimated the remaining life).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: nasa_score
+        data_type: Float64
+        description: >
+          Asymmetric NASA C-MAPSS score of the prediction with d = error_cycles: exp(-d/13) - 1 when
+          early, exp(d/10) - 1 when late, 0 when exact. Same definition as the training holdout's
+          nasa_score (data_science/rul_metrics.py).
+        data_tests:
+          - non_negative
+      - name: predicted_failure_within_horizon
+        data_type: UInt8
+        description: >
+          Classifier decision of the prediction: 1 when failure_probability reached the model's tuned
+          threshold (failure_within_horizon of gold_engine_rul_predictions).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: actual_failure_within_horizon
+        data_type: UInt8
+        description: 1 when actual_rul_cycles <= horizon_cycles (the engine did fail within the horizon).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: horizon_cycles
+        data_type: UInt16
+        description: >
+          Horizon of the model's classifier (RUL_FAILURE_HORIZON_CYCLES when it was trained);
+          actual_failure_within_horizon uses it, so every model is judged on the horizon it predicted.
+      - name: failure_probability
+        data_type: Float64
+        description: Predicted probability of failure within horizon_cycles.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: risk_band
+        data_type: LowCardinality(String)
+        description: LOW | MEDIUM | HIGH of the prediction.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['LOW', 'MEDIUM', 'HIGH']
+      - name: failure_cycle
+        data_type: UInt32
+        description: Cycle of the lifecycle's FAILURE pulse (source of the truth).
+        data_tests:
+          - not_null
+      - name: failure_mode
+        data_type: String
+        description: Failure mode from the lifecycle's maintenance work order; UNKNOWN until it has landed.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HPT_BLADE_EROSION', 'BEARING_DEGRADATION', 'OIL_SYSTEM_LEAK', 'COMPRESSOR_FOULING', 'UNKNOWN']
+              config:
+                severity: warn
+      - name: failure_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Measurement time of the lifecycle's FAILURE pulse (UTC).
+
+  - name: rpt_model_live_performance
+    description: >
+      Live performance of every RUL model version on the lifecycles that have failed since it
+      predicted them, aggregated from fct_rul_prediction_backtest: one row per model_version and
+      engine_model, plus one engine_model = 'ALL' row per model_version covering the whole fleet
+      (never sum across rows of one model version). A model version appears once at least one of
+      its predictions can be scored. Metric definitions follow the training holdout of
+      ml_model_runs (data_science/rul_metrics.py): RMSE, MAE and bias against the capped RUL,
+      late-life RMSE on predictions whose true RUL is within var rul_cap_cycles, the mean C-MAPSS
+      score, and precision / recall / F1 of the failure_within_horizon decision. A metric without
+      a denominator is NULL, never NaN; an empty backtest yields an empty table. Table (rebuilt
+      every run) on ReplacingMergeTree ordered by (model_version, engine_model); rows are unique,
+      so it can be read with or without FINAL.
+    config:
+      tags: ["ml", "backtest", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['model_version', 'engine_model']
+      - finite_values:
+          arguments:
+            columns: ['rmse_cycles', 'mae_cycles', 'bias_cycles', 'mean_nasa_score', 'late_prediction_rate']
+      - expression_is_true:
+          name: rpt_model_live_performance_nullable_metrics_finite
+          arguments:
+            expression: >
+              isFinite(ifNull(late_life_rmse_cycles, 0)) and isFinite(ifNull(clf_precision, 0))
+              and isFinite(ifNull(clf_recall, 0)) and isFinite(ifNull(clf_f1, 0))
+              and isFinite(ifNull(median_warning_lead_cycles, 0))
+      - expression_is_true:
+          name: rpt_model_live_performance_counts_consistent
+          arguments:
+            expression: >
+              clf_true_positives + clf_false_positives + clf_false_negatives + clf_true_negatives
+              = predictions_scored
+              and lifecycles_warned <= lifecycles_covered
+              and lifecycles_covered <= predictions_scored
+              and first_predicted_at <= last_predicted_at
+    columns:
+      - name: model_version
+        data_type: LowCardinality(String)
+        description: rul-YYYYMMDDTHHMMSSZ of the scored model.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model of the scored predictions, or ALL for the model version's whole fleet.
+        data_tests:
+          - not_null
+      - name: predictions_scored
+        data_type: UInt64
+        description: Backtest rows (first scorings of pre-failure pulses of failed lifecycles).
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: lifecycles_covered
+        data_type: UInt64
+        description: Failed lifecycles with at least one scored prediction.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: lifecycles_warned
+        data_type: UInt64
+        description: Covered lifecycles with at least one HIGH-risk prediction before the failure.
+      - name: rmse_cycles
+        data_type: Float64
+        description: Root mean squared error_cycles (against the capped RUL).
+        data_tests:
+          - non_negative
+      - name: mae_cycles
+        data_type: Float64
+        description: Mean abs_error_cycles.
+        data_tests:
+          - non_negative
+      - name: bias_cycles
+        data_type: Float64
+        description: Mean error_cycles; positive = the model expects failures later than they come (optimistic).
+      - name: late_life_rmse_cycles
+        data_type: Nullable(Float64)
+        description: >
+          RMSE over predictions whose actual_rul_cycles <= var rul_cap_cycles (where the capped
+          target is the exact truth); NULL when there is no such prediction.
+        data_tests:
+          - non_negative
+      - name: mean_nasa_score
+        data_type: Float64
+        description: Mean per-prediction C-MAPSS score (comparable to ml_model_runs.nasa_score).
+        data_tests:
+          - non_negative
+      - name: late_prediction_rate
+        data_type: Float64
+        description: Share of predictions with is_late_prediction = 1.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: clf_true_positives
+        data_type: UInt64
+        description: Predictions with predicted and actual failure_within_horizon = 1.
+      - name: clf_false_positives
+        data_type: UInt64
+        description: Predicted failure within the horizon, but it came later.
+      - name: clf_false_negatives
+        data_type: UInt64
+        description: Failure came within the horizon, but was not predicted.
+      - name: clf_true_negatives
+        data_type: UInt64
+        description: Neither predicted nor actual failure within the horizon.
+      - name: clf_precision
+        data_type: Nullable(Float64)
+        description: TP / (TP + FP) of the horizon classifier; NULL without a predicted positive.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: clf_recall
+        data_type: Nullable(Float64)
+        description: TP / (TP + FN) of the horizon classifier; NULL without an actual positive.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: clf_f1
+        data_type: Nullable(Float64)
+        description: 2TP / (2TP + FP + FN) of the horizon classifier; NULL without any positive.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: median_warning_lead_cycles
+        data_type: Nullable(Float64)
+        description: >
+          Median over the warned lifecycles of the advance warning: failure_cycle minus the cycle
+          of the lifecycle's first HIGH-risk prediction (in prediction order). An early, transient
+          HIGH counts, as it is what an operator saw first. Interpolated median; NULL when no
+          lifecycle was warned.
+        data_tests:
+          - non_negative
+      - name: first_predicted_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Earliest scored prediction (UTC).
+      - name: last_predicted_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Latest scored prediction (UTC).
+      - name: refreshed_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Build time of this table (UTC).
