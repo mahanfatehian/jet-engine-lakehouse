@@ -1,66 +1,332 @@
-version: '3.8'
+# =============================================================================
+# IoT Jet Engine Lakehouse & Predictive Maintenance platform (local stack)
+#
+#   simulator -> postgres (WAL) -> debezium -> kafka -> spark structured streaming
+#     -> Path A: minio  s3a://lakehouse/{bronze,silver}  (parquet, exactly-once)
+#     -> Path B: clickhouse raw_* tables                 (hot OLAP)
+#   orchestrator: dbt silver/gold -> snapshots to minio -> XGBoost RUL train/predict
+#
+# Every variable has an inline default (${VAR:-default}): `docker compose up -d`
+# boots without any .env file, while infrastructure/.env still overrides values.
+# =============================================================================
+name: iot-engine
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-clickhouse-env: &clickhouse-env
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+  CLICKHOUSE_DB: ${CLICKHOUSE_DB:-iot_engine}
+
+x-s3-env: &s3-env
+  S3_ENDPOINT_URL: http://minio:9000
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
 
 services:
+  # --------------------------------------------------------------- edge OLTP
   postgres:
     image: postgres:15-alpine
     container_name: de_postgres
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
     ports:
-      - "${POSTGRES_PORT}:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      # TCP on purpose: during first-boot init the server only listens on the unix
+      # socket, so the service turns healthy only once init.sql has completed.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
 
+  # ------------------------------------------------------ streaming backbone
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: de_kafka
     ports:
-      - "${KAFKA_PORT}:9092"
+      - "${KAFKA_PORT:-9092}:9092"
     environment:
-      KAFKA_NODE_ID: ${KAFKA_NODE_ID}
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_PORT}'
+      KAFKA_NODE_ID: ${KAFKA_NODE_ID:-1}
+      KAFKA_PROCESS_ROLES: ${KAFKA_PROCESS_ROLES:-broker,controller}
+      KAFKA_CONTROLLER_QUORUM_VOTERS: ${KAFKA_CONTROLLER_QUORUM_VOTERS:-1@kafka:29093}
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_PORT:-9092}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_PROCESS_ROLES: ${KAFKA_PROCESS_ROLES}
-      KAFKA_CONTROLLER_QUORUM_VOTERS: ${KAFKA_CONTROLLER_QUORUM_VOTERS}
-      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
-      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
-      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-168}
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx1g}
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+    logging: *default-logging
 
-  minio:
-    image: minio/minio:latest
-    container_name: de_minio
-    ports:
-      - "${MINIO_API_PORT}:9000"
-      - "${MINIO_CONSOLE_PORT}:9001"
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: de_kafka_init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: server /data --console-address ":9001"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-engine_cdc}
+      CDC_TOPIC_PARTITIONS: ${CDC_TOPIC_PARTITIONS:-3}
+      CDC_TOPIC_RETENTION_MS: ${CDC_TOPIC_RETENTION_MS:-604800000}
+    volumes:
+      - ./kafka/create-topics.sh:/scripts/create-topics.sh:ro
+    restart: "no"
+    logging: *default-logging
+
+  # --------------------------------------------------- change data capture
+  debezium:
+    image: quay.io/debezium/connect:2.5
+    container_name: de_debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${DEBEZIUM_PORT:-8083}:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: ${DEBEZIUM_GROUP_ID:-engine-cdc-connect}
+      CONFIG_STORAGE_TOPIC: ${DEBEZIUM_CONFIG_TOPIC:-_connect_configs}
+      OFFSET_STORAGE_TOPIC: ${DEBEZIUM_OFFSET_TOPIC:-_connect_offsets}
+      STATUS_STORAGE_TOPIC: ${DEBEZIUM_STATUS_TOPIC:-_connect_statuses}
+      REST_HOST_NAME: 0.0.0.0
+      ADVERTISED_HOST_NAME: debezium
+      HEAP_OPTS: ${DEBEZIUM_HEAP_OPTS:--Xms256m -Xmx1g}
+      # Connector configs reference secrets as ${env:VAR}; resolved by the worker.
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-engine_cdc}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  cdc-register:
+    image: curlimages/curl:8.11.1
+    container_name: de_cdc_register
+    depends_on:
+      debezium:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/register-connector.sh"]
+    environment:
+      CONNECT_URL: http://debezium:8083
+      CONNECTOR_CONFIG: /config/register-postgres-connector.json
+    volumes:
+      - ./debezium/register-connector.sh:/scripts/register-connector.sh:ro
+      - ./debezium/register-postgres-connector.json:/config/register-postgres-connector.json:ro
+    restart: "no"
+    logging: *default-logging
+
+  # ------------------------------------------------- lakehouse object store
+  # Community MinIO build (MinIO Inc. no longer publishes minio/minio images);
+  # same binary, CLI and S3 API. Override with MINIO_IMAGE / MC_IMAGE.
+  minio:
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    container_name: de_minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+    logging: *default-logging
 
+  minio-init:
+    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-25T00-00-00Z}
+    container_name: de_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/scripts/init-buckets.sh"]
+    environment:
+      S3_ENDPOINT_URL: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+      MC_CONFIG_DIR: /tmp/.mc
+    volumes:
+      - ./minio/init-buckets.sh:/scripts/init-buckets.sh:ro
+    restart: "no"
+    logging: *default-logging
+
+  # ------------------------------------------------------- real-time OLAP
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.8
     container_name: de_clickhouse
     ports:
-      - "${CLICKHOUSE_HTTP_PORT}:8123"
-      - "${CLICKHOUSE_TCP_PORT}:9000"
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_TCP_PORT:-19000}:9000"
     environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-iot_engine}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - chdata:/var/lib/clickhouse
+      - ./clickhouse/init-db.sh:/docker-entrypoint-initdb.d/01-init-db.sh:ro
+      - ./clickhouse/init-db.sql:/opt/clickhouse-init/init-db.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # Probe the container address, not loopback: the first-boot init server binds
+      # 127.0.0.1 only, so this passes once init-db.sql ran and the real server is up.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://$$(hostname):8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+
+  # ------------------------------------------------------- application tier
+  simulator:
+    build:
+      context: ../simulator
+    image: iot-engine/simulator:latest
+    container_name: de_simulator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      SIM_ENGINE_IDS: ${SIM_ENGINE_IDS:-JT9D-001,JT9D-002,CFM56-104,CFM56-105,GE90-201,GE90-202}
+      SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-1.0}
+      SIM_PULSES_PER_CYCLE: ${SIM_PULSES_PER_CYCLE:-10}
+      SIM_MEAN_LIFE_CYCLES: ${SIM_MEAN_LIFE_CYCLES:-180}
+      SIM_BACKFILL_LIFECYCLES: ${SIM_BACKFILL_LIFECYCLES:-4}
+      SIM_MAINTENANCE_SECONDS: ${SIM_MAINTENANCE_SECONDS:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+    logging: *default-logging
+
+  streaming:
+    build:
+      context: ../streaming
+    image: iot-engine/streaming:latest
+    container_name: de_streaming
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "${SPARK_UI_PORT:-4040}:4040"
+    environment:
+      <<: [*clickhouse-env, *s3-env]
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-engine_cdc}
+      CHECKPOINT_DIR: /opt/spark-checkpoints
+      LAKE_TRIGGER_SECONDS: ${LAKE_TRIGGER_SECONDS:-60}
+      CLICKHOUSE_TRIGGER_SECONDS: ${CLICKHOUSE_TRIGGER_SECONDS:-5}
+      KAFKA_STARTING_OFFSETS: ${KAFKA_STARTING_OFFSETS:-earliest}
+      MAX_OFFSETS_PER_TRIGGER: ${MAX_OFFSETS_PER_TRIGGER:-20000}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-2g}
+      SPARK_LOG_LEVEL: ${SPARK_LOG_LEVEL:-WARN}
+    volumes:
+      - spark-checkpoints:/opt/spark-checkpoints
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: data_science/Dockerfile
+    image: iot-engine/data-platform:latest
+    container_name: de_orchestrator
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command: ["python", "orchestration/pipeline_runner.py", "loop"]
+    environment:
+      <<: [*clickhouse-env, *s3-env]
+      DBT_PROJECT_DIR: /app/analytics
+      DBT_PROFILES_DIR: /app/analytics
+      DBT_INTERVAL_SECONDS: ${DBT_INTERVAL_SECONDS:-120}
+      PREDICT_INTERVAL_SECONDS: ${PREDICT_INTERVAL_SECONDS:-60}
+      SNAPSHOT_INTERVAL_SECONDS: ${SNAPSHOT_INTERVAL_SECONDS:-900}
+      TRAIN_INTERVAL_SECONDS: ${TRAIN_INTERVAL_SECONDS:-1800}
+      SNAPSHOT_RETENTION: ${SNAPSHOT_RETENTION:-5}
+      RUL_FAILURE_HORIZON_CYCLES: ${RUL_FAILURE_HORIZON_CYCLES:-25}
+      RUL_CAP_CYCLES: ${RUL_CAP_CYCLES:-125}
+      MIN_TRAINING_LIFECYCLES: ${MIN_TRAINING_LIFECYCLES:-6}
+      FLIGHT_HOURS_PER_CYCLE: ${FLIGHT_HOURS_PER_CYCLE:-2.0}
+      MODEL_PROMOTION_POLICY: ${MODEL_PROMOTION_POLICY:-better}
+      ML_ARTIFACT_PREFIX: ${ML_ARTIFACT_PREFIX:-ml-artifacts/rul_model}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    stop_grace_period: 30s
+    restart: unless-stopped
+    logging: *default-logging
 
 volumes:
   pgdata:
+  kafkadata:
   miniodata:
   chdata:
+  spark-checkpoints:
