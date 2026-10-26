@@ -1,0 +1,10 @@
+# The image needs only the job's Python modules and requirements.txt.
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.venv
+venv
+.env
+*.env
+*.md

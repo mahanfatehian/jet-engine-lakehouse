@@ -1,0 +1,23 @@
+# Python dependencies of the streaming image, fully pinned for CPython 3.11 on linux/x86_64
+# (python:3.11-slim-bookworm). The direct pins (pyspark and clickhouse-connect from the
+# interface contract, section 9, plus pytest) were resolved into the transitive pins with
+#   uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28
+
+# Streaming job
+pyspark==3.5.9
+clickhouse-connect==1.11.0
+
+# Transitive runtime dependencies
+backports-zstd==1.8.0  # clickhouse-connect (Python < 3.14)
+certifi==2026.10.23  # clickhouse-connect
+lz4==4.4.5  # clickhouse-connect
+py4j==0.10.9.9  # pyspark
+urllib3==2.8.0  # clickhouse-connect
+
+# Test tooling: the image is the reference environment for tests/streaming because it is
+# the only one with the production Spark, Java and connector versions.
+pytest==9.1.1
+iniconfig==2.3.1  # pytest
+packaging==26.3  # pytest
+pluggy==1.7.0  # pytest
+pygments==2.21.0  # pytest
