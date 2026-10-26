@@ -4,11 +4,16 @@ Run from the repository root, or from /app inside the data-platform image::
 
     python orchestration/pipeline_runner.py loop
     python orchestration/pipeline_runner.py once
-    python orchestration/pipeline_runner.py task {dbt,dbt-run,dbt-test,snapshot,train,predict}
+    python orchestration/pipeline_runner.py task {dbt,dbt-run,dbt-test,dbt-build,snapshot,train,predict}
+    python orchestration/pipeline_runner.py task train -- --promotion-policy always
 
 Every task is a subprocess. Exit code 3 from a task means "skipped: preconditions not met"
-and is logged as SKIPPED, not as a failure. Settings come from the environment variables
-of contract section 2 (DBT_*, *_INTERVAL_SECONDS, CLICKHOUSE_HOST/PORT, LOG_LEVEL).
+and is logged as SKIPPED, not as a failure. Every mode holds a per-task lock while a task
+runs (see pipeline_locks), so manual runs and the loop never execute the same job at once.
+In ``loop`` and ``once``, a failed ``dbt test`` blocks training and the lake snapshot of
+that cycle (PIPELINE_GATE_ON_DBT_TESTS). Settings come from the environment variables of
+contract section 2 (DBT_*, *_INTERVAL_SECONDS, CLICKHOUSE_HOST/PORT, LOG_LEVEL) plus
+PIPELINE_LOCK_DIR and PIPELINE_GATE_ON_DBT_TESTS.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from pipeline_health import (
     default_heartbeat_path,
     wait_for_clickhouse,
 )
+from pipeline_locks import TaskLocks
 from pipeline_process import SubprocessTaskRunner
 from pipeline_scheduler import PipelineScheduler, TaskExecutor
 from pipeline_signals import ShutdownFlag, install_signal_handlers
@@ -36,6 +42,7 @@ from pipeline_tasks import (
     CLI_TASK_CHOICES,
     EXIT_FAILURE,
     EXIT_SUCCESS,
+    GATED_BY_DBT_TESTS,
     ONCE_SEQUENCE,
     TaskName,
     TaskResult,
@@ -71,9 +78,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=default_heartbeat_path(),
         help="JSON liveness file rewritten every iteration (default %(default)s)",
     )
-    modes.add_parser("once", help="run dbt -> snapshot -> train -> predict once; exit 1 if any task failed")
-    task = modes.add_parser("task", help="run one task and exit with its exit code (3 = skipped)")
+    modes.add_parser(
+        "once",
+        help="run dbt run + test -> snapshot -> train -> predict once (a failed dbt test skips "
+        "snapshot and train); exit 1 if any task failed",
+    )
+    task = modes.add_parser(
+        "task",
+        help="run one task and exit with its exit code (3 = skipped)",
+        description="Run one task; arguments after `--` are appended to its command line.",
+    )
     task.add_argument("task", choices=CLI_TASK_CHOICES, help="'dbt' runs dbt run, then dbt test")
+    task.add_argument(
+        "task_args",
+        nargs="*",
+        metavar="ARG",
+        help="extra arguments for the task, after `--` (e.g. task train -- --promotion-policy always)",
+    )
     return parser
 
 
@@ -87,30 +108,54 @@ def configure_logging(level_name: str) -> None:
     logging.basicConfig(level=level, handlers=[handler])
 
 
-def make_executor(settings: RunnerSettings, runner: SubprocessTaskRunner, *, loop_mode: bool) -> TaskExecutor:
-    """Bind task names to their concrete command lines for the given mode."""
+def make_executor(
+    settings: RunnerSettings,
+    runner: SubprocessTaskRunner,
+    locks: TaskLocks,
+    *,
+    loop_mode: bool,
+    extra_args: Sequence[str] = (),
+) -> TaskExecutor:
+    """Bind task names to their concrete command lines, run under the task's lock."""
 
     def execute(task: TaskName) -> TaskResult:
-        return runner.run(build_task_spec(task, settings, loop_mode=loop_mode))
+        spec = build_task_spec(task, settings, loop_mode=loop_mode, extra_args=extra_args)
+        return locks.run_locked(spec, runner.run)
 
     return execute
 
 
 def run_sequence(
-    tasks: Sequence[TaskName], execute: TaskExecutor, shutdown: ShutdownFlag
+    tasks: Sequence[TaskName],
+    execute: TaskExecutor,
+    shutdown: ShutdownFlag,
+    *,
+    gate_on_dbt_tests: bool = True,
 ) -> list[TaskResult]:
-    """Run ``tasks`` in order; a failed ``dbt run`` or a stop request ends the sequence early."""
+    """Run ``tasks`` in order.
+
+    A failed ``dbt run`` or a stop request ends the sequence early. A failed ``dbt test``
+    skips training and the snapshot (``gate_on_dbt_tests``) but not prediction, which keeps
+    serving the existing production model.
+    """
     results: list[TaskResult] = []
+    blocked: frozenset[TaskName] = frozenset()
     for index, task in enumerate(tasks):
         if shutdown.requested:
             logger.warning("stop requested: not starting %s", _names(tasks[index:]))
             break
+        if task in blocked:
+            continue
         result = execute(task)
         results.append(result)
         remaining = tasks[index + 1 :]
-        if task is TaskName.DBT_RUN and result.status is TaskStatus.FAILED and remaining:
+        if result.status is not TaskStatus.FAILED or not remaining:
+            continue
+        if task is TaskName.DBT_RUN:
             logger.error("dbt run failed: skipping %s", _names(remaining))
             break
+        if task is TaskName.DBT_TEST:
+            blocked = _blocked_by_failed_dbt_test(remaining, gate_on_dbt_tests)
     return results
 
 
@@ -118,25 +163,37 @@ def run_loop(settings: RunnerSettings, shutdown: ShutdownFlag, heartbeat_path: P
     """``loop`` mode: schedule tasks until SIGTERM/SIGINT, then exit 0."""
     heartbeat = HeartbeatWriter(heartbeat_path)
     runner = SubprocessTaskRunner(shutdown, on_poll=heartbeat.tick)
-    execute = make_executor(settings, runner, loop_mode=True)
-    PipelineScheduler(execute, settings.intervals, shutdown, heartbeat=heartbeat).run_forever()
+    locks = TaskLocks(settings.lock_dir, shutdown, on_poll=heartbeat.tick)
+    execute = make_executor(settings, runner, locks, loop_mode=True)
+    PipelineScheduler(
+        execute,
+        settings.intervals,
+        shutdown,
+        heartbeat=heartbeat,
+        gate_on_dbt_tests=settings.gate_on_dbt_tests,
+    ).run_forever()
     return EXIT_SUCCESS
 
 
 def run_once(settings: RunnerSettings, shutdown: ShutdownFlag) -> int:
     """``once`` mode: dbt run + test, snapshot, train, predict; 0 only if nothing failed."""
     runner = SubprocessTaskRunner(shutdown)
-    results = run_sequence(ONCE_SEQUENCE, make_executor(settings, runner, loop_mode=False), shutdown)
+    execute = make_executor(settings, runner, TaskLocks(settings.lock_dir, shutdown), loop_mode=False)
+    results = run_sequence(ONCE_SEQUENCE, execute, shutdown, gate_on_dbt_tests=settings.gate_on_dbt_tests)
     summary = ", ".join(f"{result.name}={result.status}" for result in results) or "no task ran"
     logger.info("once finished: %s", summary)
     return once_exit_code(results, len(ONCE_SEQUENCE))
 
 
-def run_task(settings: RunnerSettings, shutdown: ShutdownFlag, task_name: str) -> int:
+def run_task(
+    settings: RunnerSettings, shutdown: ShutdownFlag, task_name: str, task_args: Sequence[str] = ()
+) -> int:
     """``task`` mode: run one (or, for ``dbt``, two) tasks and return the task's exit code."""
     tasks = expand_task(task_name)
     runner = SubprocessTaskRunner(shutdown)
-    results = run_sequence(tasks, make_executor(settings, runner, loop_mode=False), shutdown)
+    locks = TaskLocks(settings.lock_dir, shutdown)
+    execute = make_executor(settings, runner, locks, loop_mode=False, extra_args=task_args)
+    results = run_sequence(tasks, execute, shutdown)
     return task_exit_code(results, len(tasks))
 
 
@@ -159,7 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_loop(settings, shutdown, args.heartbeat_file)
     if args.mode == "once":
         return run_once(settings, shutdown)
-    return run_task(settings, shutdown, args.task)
+    return run_task(settings, shutdown, args.task, args.task_args)
 
 
 def _clickhouse_ready(settings: RunnerSettings, shutdown: ShutdownFlag, max_wait_seconds: float) -> bool:
@@ -173,6 +230,27 @@ def _clickhouse_ready(settings: RunnerSettings, shutdown: ShutdownFlag, max_wait
         return False
     logger.warning("stop requested while waiting for ClickHouse")
     return False
+
+
+def _blocked_by_failed_dbt_test(
+    remaining: Sequence[TaskName], gate_on_dbt_tests: bool
+) -> frozenset[TaskName]:
+    """Tasks of the rest of the sequence that a failed dbt test blocks (logged either way)."""
+    gated = [task for task in remaining if task in GATED_BY_DBT_TESTS]
+    if not gated:
+        return frozenset()
+    if not gate_on_dbt_tests:
+        logger.warning(
+            "dbt test failed, but PIPELINE_GATE_ON_DBT_TESTS=false: %s still run on the untested data",
+            _names(gated),
+        )
+        return frozenset()
+    logger.error(
+        "dbt test failed: skipping %s so that no model learns from, and no snapshot publishes, "
+        "data that failed its tests (PIPELINE_GATE_ON_DBT_TESTS=true); predict still runs",
+        _names(gated),
+    )
+    return frozenset(gated)
 
 
 def _names(tasks: Sequence[TaskName]) -> str:
