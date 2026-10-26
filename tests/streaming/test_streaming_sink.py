@@ -32,6 +32,8 @@ class FakeClient:
     def __init__(self, failures: int = 0, error: Exception | None = None, tables: list[str] | None = None):
         self.inserts: list[dict[str, Any]] = []
         self.calls = 0
+        self.queries = 0
+        self.closed = False
         self._failures = failures
         self._error = error
         self._tables = tables or []
@@ -48,7 +50,11 @@ class FakeClient:
     def query(self, sql: str, parameters: dict[str, str]) -> Any:
         assert "{database:String}" in sql
         assert parameters == {"database": "iot_engine"}
+        self.queries += 1
         return type("Result", (), {"result_rows": [(name,) for name in self._tables]})()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.mark.parametrize(
@@ -152,3 +158,56 @@ def test_connect_retries_until_the_server_answers(monkeypatch: pytest.MonkeyPatc
     assert attempts[-1]["password"] == "pw"
     assert attempts[-1]["database"] == "iot_engine"
     assert attempts[-1]["autogenerate_session_id"] is False
+
+
+def test_required_tables_are_the_raw_tables_and_the_dead_letters() -> None:
+    assert clickhouse_sink.REQUIRED_TABLES == (
+        "raw_engine_telemetry",
+        "raw_engine_status_registry",
+        "raw_maintenance_log",
+        DEAD_LETTER_TABLE,
+    )
+
+
+def test_target_connects_once_and_checks_the_tables_every_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(tables=list(clickhouse_sink.REQUIRED_TABLES))
+    connects: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        clickhouse_sink.clickhouse_connect, "get_client", lambda **kwargs: connects.append(kwargs) or client
+    )
+    target = clickhouse_sink.ClickHouseTarget(load_settings({}), no_shutdown)
+    target.check_ready()
+    target.check_ready()  # e.g. before the restart that follows a ClickHouse outage
+    assert (len(connects), client.queries) == (1, 2)
+    target.writer.insert_rows(DEAD_LETTER_TABLE, DEAD_LETTER_COLUMNS, [("t", 0, 1, None, "", "x", "bad")])
+    assert [insert["table"] for insert in client.inserts] == [DEAD_LETTER_TABLE]
+    target.close()
+    assert client.closed
+
+
+def test_target_makes_one_attempt_per_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[int] = []
+
+    def refused(**_kwargs: Any) -> object:
+        attempts.append(1)
+        raise OperationalError("connection refused")
+
+    monkeypatch.setattr(clickhouse_sink.clickhouse_connect, "get_client", refused)
+    waits: list[float] = []
+    target = clickhouse_sink.ClickHouseTarget(
+        load_settings({}), lambda seconds: waits.append(seconds) or False
+    )
+    with pytest.raises(OperationalError):
+        target.check_ready()
+    assert (attempts, waits) == ([1], [])  # the supervisor owns the backoff
+    with pytest.raises(RuntimeError, match="not connected"):
+        _ = target.writer
+    target.close()  # nothing to release
+
+
+def test_target_reports_missing_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(tables=["raw_engine_telemetry"])
+    monkeypatch.setattr(clickhouse_sink.clickhouse_connect, "get_client", lambda **_kwargs: client)
+    target = clickhouse_sink.ClickHouseTarget(load_settings({}), no_shutdown)
+    with pytest.raises(clickhouse_sink.MissingTablesError, match="raw_cdc_dead_letter"):
+        target.check_ready()

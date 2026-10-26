@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from streaming_retry import RetryAbortedError, RetryPolicy, call_with_retry
+from streaming_retry import RetryAbortedError, RetryPolicy, call_with_retry, capped_backoff
 
 
 class TransientError(Exception):
@@ -39,6 +39,15 @@ def flaky(failures: int, error: Exception) -> tuple[list[int], Callable[[], str]
 def test_policy_delays_grow_exponentially_and_are_capped() -> None:
     assert RetryPolicy(attempts=6, base_delay_s=1.0, max_delay_s=10.0).delays() == (1.0, 2.0, 4.0, 8.0, 10.0)
     assert RetryPolicy(attempts=1, base_delay_s=1.0, max_delay_s=1.0).delays() == ()
+
+
+def test_capped_backoff_doubles_up_to_the_cap() -> None:
+    assert [capped_backoff(failures, 2.0, 60.0) for failures in range(1, 9)] == [2, 4, 8, 16, 32, 60, 60, 60]
+
+
+def test_capped_backoff_stays_finite_for_endless_failures() -> None:
+    assert capped_backoff(10**6, 2.0, 60.0) == 60.0
+    assert capped_backoff(0, 2.0, 60.0) == 2.0
 
 
 @pytest.mark.parametrize(("attempts", "base", "cap"), [(0, 1.0, 1.0), (3, 0.0, 1.0), (3, 2.0, 1.0)])

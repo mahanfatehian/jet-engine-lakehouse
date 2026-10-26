@@ -8,9 +8,14 @@ from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from streaming_config import load_settings
-from streaming_readiness import DependencyNotReadyError, probe_http, probe_tcp, wait_for_dependencies
-from streaming_retry import RetryPolicy
+from streaming_config import StreamingSettings, load_settings
+from streaming_readiness import (
+    DependencyNotReadyError,
+    check_clickhouse_dependencies,
+    check_lake_dependencies,
+    probe_http,
+    probe_tcp,
+)
 
 FAST_TIMEOUT_S = 1.0
 
@@ -83,28 +88,42 @@ def test_tcp_probe_rejects_unreachable_or_malformed_servers(servers: str) -> Non
         probe_tcp(servers.format(port=_unused_port()), timeout_s=FAST_TIMEOUT_S)
 
 
-def test_wait_for_dependencies_passes_when_everything_answers(
-    http_server: Callable[[int], str], tcp_listener: int
-) -> None:
-    url = http_server(200)
-    port = url.rsplit(":", 1)[1]
-    settings = load_settings(
+def _settings(kafka_port: int, minio_url: str, clickhouse_port: int | str) -> StreamingSettings:
+    return load_settings(
         {
+            "KAFKA_BOOTSTRAP_SERVERS": f"127.0.0.1:{kafka_port}",
+            "S3_ENDPOINT_URL": minio_url,
             "CLICKHOUSE_HOST": "127.0.0.1",
-            "CLICKHOUSE_PORT": port,
-            "S3_ENDPOINT_URL": url,
-            "KAFKA_BOOTSTRAP_SERVERS": f"127.0.0.1:{tcp_listener}",
+            "CLICKHOUSE_PORT": str(clickhouse_port),
         }
     )
-    waits: list[float] = []
-    wait_for_dependencies(settings, lambda seconds: waits.append(seconds) or False)
-    assert waits == []
 
 
-def test_wait_for_dependencies_gives_up_after_the_policy() -> None:
-    settings = load_settings({"CLICKHOUSE_HOST": "127.0.0.1", "CLICKHOUSE_PORT": str(_unused_port())})
-    waits: list[float] = []
-    policy = RetryPolicy(attempts=3, base_delay_s=0.1, max_delay_s=0.2)
-    with pytest.raises(DependencyNotReadyError):
-        wait_for_dependencies(settings, lambda seconds: waits.append(seconds) or False, policy)
-    assert waits == [0.1, 0.2]
+def test_lake_needs_kafka_and_minio_but_not_clickhouse(
+    http_server: Callable[[int], str], tcp_listener: int
+) -> None:
+    check_lake_dependencies(_settings(tcp_listener, http_server(200), _unused_port()))
+
+
+def test_lake_check_names_the_missing_dependency(tcp_listener: int) -> None:
+    settings = _settings(tcp_listener, f"http://127.0.0.1:{_unused_port()}", _unused_port())
+    with pytest.raises(
+        DependencyNotReadyError, match=r"^MinIO: http://127\.0\.0\.1:\d+/minio/health/live is"
+    ):
+        check_lake_dependencies(settings)
+
+
+def test_clickhouse_needs_kafka_and_clickhouse_but_not_minio(
+    http_server: Callable[[int], str], tcp_listener: int
+) -> None:
+    clickhouse_port = http_server(200).rsplit(":", 1)[1]
+    check_clickhouse_dependencies(
+        _settings(tcp_listener, f"http://127.0.0.1:{_unused_port()}", clickhouse_port)
+    )
+
+
+def test_clickhouse_check_names_the_missing_dependency(http_server: Callable[[int], str]) -> None:
+    clickhouse_port = http_server(200).rsplit(":", 1)[1]
+    settings = _settings(_unused_port(), http_server(200), clickhouse_port)
+    with pytest.raises(DependencyNotReadyError, match=r"^Kafka: no Kafka bootstrap server is reachable"):
+        check_clickhouse_dependencies(settings)

@@ -39,6 +39,8 @@ def test_defaults_target_host_published_ports() -> None:
     assert (settings.aws_region, settings.lakehouse_bucket) == ("us-east-1", "lakehouse")
     assert settings.cdc_topic_prefix == "engine_cdc"
     assert settings.checkpoint_dir == "/opt/spark-checkpoints"
+    assert settings.heartbeat_file == "/tmp/streaming.heartbeat"
+    assert settings.kafka_fail_on_data_loss is True
     assert (settings.lake_trigger_seconds, settings.clickhouse_trigger_seconds) == (60.0, 5.0)
     assert (settings.kafka_starting_offsets, settings.max_offsets_per_trigger) == ("earliest", 20000)
     assert (settings.spark_driver_memory, settings.spark_log_level, settings.log_level) == (
@@ -78,6 +80,31 @@ def test_empty_password_is_kept_verbatim() -> None:
     assert load_settings({"CLICKHOUSE_PASSWORD": ""}).clickhouse_password == ""
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        (" False ", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+    ],
+)
+def test_fail_on_data_loss_is_a_boolean_switch(value: str, expected: bool) -> None:
+    assert load_settings({"KAFKA_FAIL_ON_DATA_LOSS": value}).kafka_fail_on_data_loss is expected
+
+
+def test_heartbeat_file_is_configurable() -> None:
+    assert load_settings({"STREAMING_HEARTBEAT_FILE": "/run/streaming.json"}).heartbeat_file == (
+        "/run/streaming.json"
+    )
+
+
 def test_repr_hides_secrets() -> None:
     text = repr(load_settings(COMPOSE_ENV))
     assert "s3-secret" not in text
@@ -101,6 +128,9 @@ def test_repr_hides_secrets() -> None:
         ("SPARK_DRIVER_MEMORY", "2 GB"),
         ("SPARK_DRIVER_MEMORY", "0g"),
         ("KAFKA_BOOTSTRAP_SERVERS", "   "),
+        ("KAFKA_FAIL_ON_DATA_LOSS", "maybe"),
+        ("KAFKA_FAIL_ON_DATA_LOSS", ""),
+        ("STREAMING_HEARTBEAT_FILE", " "),
     ],
 )
 def test_invalid_values_raise_config_error(name: str, value: str) -> None:
