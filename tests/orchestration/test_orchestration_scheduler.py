@@ -13,7 +13,6 @@ from pipeline_config import ScheduleIntervals
 from pipeline_health import HeartbeatWriter
 from pipeline_scheduler import (
     IDLE_POLL_SECONDS,
-    PipelineScheduler,
     backoff_delay,
     dependent_tasks,
     model_available_after,
@@ -25,129 +24,104 @@ RUN, TEST = TaskName.DBT_RUN.value, TaskName.DBT_TEST.value
 TRAIN, PREDICT, SNAPSHOT = TaskName.TRAIN.value, TaskName.PREDICT.value, TaskName.SNAPSHOT.value
 
 
-class ScriptedExecutor:
-    """Fake task execution: scripted exit codes per task (the last one repeats), 1 s per task."""
+def test_bootstrap_trains_after_every_dbt_run_until_a_model_exists(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted({TaskName.TRAIN: [3], TaskName.PREDICT: [3]})
+    scheduler = make_scheduler(executor)
 
-    def __init__(self, clock: Any, script: dict[TaskName, list[int]] | None = None) -> None:
-        self.clock = clock
-        self.script = {task: list(codes) for task, codes in (script or {}).items()}
-        self.calls: list[TaskName] = []
+    history = run_cycles(scheduler, executor, 3)
 
-    def __call__(self, task: TaskName) -> TaskResult:
-        self.calls.append(task)
-        codes = self.script.get(task, [0])
-        code = codes.pop(0) if len(codes) > 1 else codes[0]
-        self.clock.advance(1.0)
-        return TaskResult(task, classify_exit_code(code), code, 1.0)
-
-
-def _scheduler(
-    clock: Any,
-    executor: Any,
-    intervals: ScheduleIntervals | None = None,
-    shutdown: ShutdownFlag | None = None,
-    **kwargs: Any,
-) -> PipelineScheduler:
-    return PipelineScheduler(
-        executor, intervals or ScheduleIntervals(), shutdown or ShutdownFlag(), clock=clock, **kwargs
-    )
-
-
-def _cycles(
-    scheduler: PipelineScheduler, executor: ScriptedExecutor, clock: Any, count: int
-) -> list[list[str]]:
-    """Run ``count`` cycles, each as soon as it is due; return the tasks executed per cycle."""
-    history = []
-    for _ in range(count):
-        clock.advance(scheduler.seconds_until_next_cycle())
-        first_call = len(executor.calls)
-        scheduler.run_cycle()
-        history.append([task.value for task in executor.calls[first_call:]])
-    return history
-
-
-def test_bootstrap_trains_after_every_dbt_run_until_a_model_exists(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.TRAIN: [3], TaskName.PREDICT: [3]})
-    scheduler = _scheduler(clock, executor)
-
-    history = _cycles(scheduler, executor, clock, 3)
-
+    # The snapshot waits for the second successful dbt run (see the snapshot tests).
     assert history == [
-        [RUN, TEST, TRAIN, PREDICT, SNAPSHOT],
         [RUN, TEST, TRAIN, PREDICT],
+        [RUN, TEST, TRAIN, PREDICT, SNAPSHOT],
         [RUN, TEST, TRAIN, PREDICT],
     ]
     assert not scheduler.model_available
 
 
-def test_first_successful_training_ends_bootstrap_and_serves_predictions_at_once(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.TRAIN: [3, 0], TaskName.PREDICT: [3, 0]})
-    scheduler = _scheduler(clock, executor)
+def test_first_successful_training_ends_bootstrap_and_serves_predictions_at_once(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted({TaskName.TRAIN: [3, 0], TaskName.PREDICT: [3, 0]})
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 2)
+    history = run_cycles(scheduler, executor, 2)
 
-    assert history[1] == [RUN, TEST, TRAIN, PREDICT]
+    assert history[1] == [RUN, TEST, TRAIN, PREDICT, SNAPSHOT]
     last_predict = scheduler.tracker(TaskName.PREDICT).last_result
     assert last_predict is not None and last_predict.status is TaskStatus.SUCCESS
     assert scheduler.model_available
-    assert _cycles(scheduler, executor, clock, 1) == [[RUN, TEST, PREDICT]]
+    assert run_cycles(scheduler, executor, 1) == [[RUN, TEST, PREDICT]]
 
 
-def test_steady_state_predicts_before_training_on_their_own_intervals(clock: Any) -> None:
-    executor = ScriptedExecutor(clock)
-    scheduler = _scheduler(clock, executor)
+def test_steady_state_predicts_before_training_on_their_own_intervals(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted()
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 17)
+    history = run_cycles(scheduler, executor, 17)
 
-    # Cycle i starts 120*i s after the first one: training is due again after 1800 s
-    # (cycle 15), snapshots every 900 s (cycles 8 and 16), predictions in every cycle.
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT, SNAPSHOT]
-    assert history[1] == [RUN, TEST, PREDICT]
+    # Cycle i starts 120*i s after the first one. Training is due again 1800 s after cycle 0
+    # (cycle 15). The first snapshot runs in cycle 1 and then every 900 s rounded up to whole
+    # cycles, i.e. 960 s (cycle 9). Predictions run in every cycle.
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
+    assert history[1] == [RUN, TEST, PREDICT, SNAPSHOT]
+    assert history[2] == [RUN, TEST, PREDICT]
     assert history[15] == [RUN, TEST, PREDICT, TRAIN]
-    assert history[16] == [RUN, TEST, PREDICT, SNAPSHOT]
     assert [index for index, tasks in enumerate(history) if TRAIN in tasks] == [0, 15]
-    assert [index for index, tasks in enumerate(history) if SNAPSHOT in tasks] == [0, 8, 16]
+    assert [index for index, tasks in enumerate(history) if SNAPSHOT in tasks] == [1, 9]
     assert all(PREDICT in tasks for tasks in history)
 
 
-def test_predict_skip_without_model_restarts_bootstrap_in_the_same_cycle(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.PREDICT: [0, 3], TaskName.TRAIN: [0, 3]})
-    scheduler = _scheduler(clock, executor)
+def test_predict_skip_without_model_restarts_bootstrap_in_the_same_cycle(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted({TaskName.PREDICT: [0, 3], TaskName.TRAIN: [0, 3]})
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 3)
+    history = run_cycles(scheduler, executor, 3)
 
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT, SNAPSHOT]
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
     # predict finds no production model: training is attempted right away, then goes first.
-    assert history[1] == [RUN, TEST, PREDICT, TRAIN]
+    assert history[1] == [RUN, TEST, PREDICT, TRAIN, SNAPSHOT]
     assert history[2] == [RUN, TEST, TRAIN, PREDICT]
     assert not scheduler.model_available
 
 
-def test_predict_interval_longer_than_the_dbt_interval(clock: Any) -> None:
+def test_predict_interval_longer_than_the_dbt_interval(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
     intervals = ScheduleIntervals(
         dbt_seconds=120, predict_seconds=300, snapshot_seconds=900, train_seconds=1800
     )
-    executor = ScriptedExecutor(clock)
-    scheduler = _scheduler(clock, executor, intervals)
+    executor = scripted()
+    scheduler = make_scheduler(executor, intervals)
 
-    history = _cycles(scheduler, executor, clock, 7)
+    history = run_cycles(scheduler, executor, 7)
 
     assert [index for index, tasks in enumerate(history) if PREDICT in tasks] == [0, 3, 6]
 
 
-def test_failed_dbt_run_skips_dependents_and_the_loop_carries_on(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.DBT_RUN: [1, 0]})
-    scheduler = _scheduler(clock, executor)
+def test_failed_dbt_run_skips_dependents_and_the_loop_carries_on(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted({TaskName.DBT_RUN: [1, 0]})
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 2)
+    history = run_cycles(scheduler, executor, 3)
 
-    assert history == [[RUN], [RUN, TEST, TRAIN, PREDICT, SNAPSHOT]]
+    assert history == [[RUN], [RUN, TEST, TRAIN, PREDICT], [RUN, TEST, PREDICT, SNAPSHOT]]
     assert scheduler.tracker(TaskName.DBT_RUN).consecutive_failures == 0
 
 
-def test_repeated_dbt_failures_back_off_exponentially_up_to_the_cap(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.DBT_RUN: [1]})
-    scheduler = _scheduler(clock, executor)
+def test_repeated_dbt_failures_back_off_exponentially_up_to_the_cap(
+    clock: Any, scripted: Any, make_scheduler: Any
+) -> None:
+    executor = scripted({TaskName.DBT_RUN: [1]})
+    scheduler = make_scheduler(executor)
 
     waits = []
     for _ in range(7):
@@ -160,49 +134,53 @@ def test_repeated_dbt_failures_back_off_exponentially_up_to_the_cap(clock: Any) 
     assert executor.calls == [TaskName.DBT_RUN] * 7
 
 
-def test_a_failing_task_backs_off_without_blocking_the_others(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.PREDICT: [1]})
-    scheduler = _scheduler(clock, executor)
+def test_a_failing_task_backs_off_without_blocking_the_others(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    executor = scripted({TaskName.PREDICT: [1]})
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 9)
+    history = run_cycles(scheduler, executor, 9)
 
     assert [index for index, tasks in enumerate(history) if PREDICT in tasks] == [0, 1, 3, 7]
     assert all(tasks[:2] == [RUN, TEST] for tasks in history)
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT, SNAPSHOT]
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
     assert scheduler.tracker(TaskName.PREDICT).consecutive_failures == 4
 
 
-def test_a_skip_resets_the_failure_streak(clock: Any) -> None:
-    executor = ScriptedExecutor(clock, {TaskName.PREDICT: [1, 1, 3]})
-    scheduler = _scheduler(clock, executor)
+def test_a_skip_resets_the_failure_streak(scripted: Any, make_scheduler: Any, run_cycles: Any) -> None:
+    executor = scripted({TaskName.PREDICT: [1, 1, 3]})
+    scheduler = make_scheduler(executor)
 
-    history = _cycles(scheduler, executor, clock, 5)
+    history = run_cycles(scheduler, executor, 5)
 
     assert [index for index, tasks in enumerate(history) if PREDICT in tasks] == [0, 1, 3, 4]
     assert scheduler.tracker(TaskName.PREDICT).consecutive_failures == 0
 
 
 def test_an_exception_while_launching_a_task_counts_as_failure(
-    clock: Any, caplog: pytest.LogCaptureFixture
+    make_scheduler: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     def execute(task: TaskName) -> TaskResult:
-        if task is TaskName.SNAPSHOT:
+        if task is TaskName.PREDICT:
             raise RuntimeError("cannot fork")
         return TaskResult(task, TaskStatus.SUCCESS, 0, 0.0)
 
-    scheduler = _scheduler(clock, execute)
+    scheduler = make_scheduler(execute)
 
     results = scheduler.run_cycle()
 
-    assert results[-1].name is TaskName.SNAPSHOT
+    assert results[-1].name is TaskName.PREDICT
     assert (results[-1].status, results[-1].exit_code) == (TaskStatus.FAILED, 1)
-    assert "task snapshot could not be executed" in caplog.text
+    assert "task predict could not be executed" in caplog.text
     assert scheduler.cycles_completed == 1
 
 
-def test_stop_request_ends_the_cycle_between_tasks(clock: Any, tmp_path: Path) -> None:
+def test_stop_request_ends_the_cycle_between_tasks(
+    clock: Any, scripted: Any, make_scheduler: Any, tmp_path: Path
+) -> None:
     shutdown = ShutdownFlag()
-    executor = ScriptedExecutor(clock)
+    executor = scripted()
 
     def execute(task: TaskName) -> TaskResult:
         if task is TaskName.DBT_TEST:
@@ -210,9 +188,7 @@ def test_stop_request_ends_the_cycle_between_tasks(clock: Any, tmp_path: Path) -
         return executor(task)
 
     heartbeat = HeartbeatWriter(tmp_path / "heartbeat.json", clock=clock)
-    scheduler = _scheduler(
-        clock, execute, shutdown=shutdown, sleep=lambda seconds: False, heartbeat=heartbeat
-    )
+    scheduler = make_scheduler(execute, shutdown=shutdown, sleep=lambda seconds: False, heartbeat=heartbeat)
 
     scheduler.run_forever()
 
@@ -220,9 +196,9 @@ def test_stop_request_ends_the_cycle_between_tasks(clock: Any, tmp_path: Path) -
     assert json.loads(heartbeat.path.read_text(encoding="utf-8"))["state"] == "stopped"
 
 
-def test_idle_wait_is_chunked_and_interruptible(clock: Any) -> None:
+def test_idle_wait_is_chunked_and_interruptible(clock: Any, scripted: Any, make_scheduler: Any) -> None:
     shutdown = ShutdownFlag()
-    executor = ScriptedExecutor(clock)
+    executor = scripted()
     sleeps: list[float] = []
 
     def sleep(seconds: float) -> bool:
@@ -232,22 +208,24 @@ def test_idle_wait_is_chunked_and_interruptible(clock: Any) -> None:
             shutdown.request("SIGTERM")
         return shutdown.requested
 
-    _scheduler(clock, executor, shutdown=shutdown, sleep=sleep).run_forever()
+    make_scheduler(executor, shutdown=shutdown, sleep=sleep).run_forever()
 
-    # 115 s of idle time between the cycles (the first one took 5 s), then one more chunk
-    # during which the stop arrives.
+    # 116 s of idle time between the cycles (the first one ran 4 tasks of 1 s each), then
+    # one more chunk during which the stop arrives.
     assert executor.calls.count(TaskName.DBT_RUN) == 2
     assert max(sleeps) <= IDLE_POLL_SECONDS
-    assert sum(sleeps) == pytest.approx(115 + IDLE_POLL_SECONDS)
+    assert sum(sleeps) == pytest.approx(116 + IDLE_POLL_SECONDS)
 
 
-def test_heartbeat_reports_task_states(clock: Any, tmp_path: Path) -> None:
+def test_heartbeat_reports_task_states(
+    clock: Any, scripted: Any, make_scheduler: Any, tmp_path: Path
+) -> None:
     def noon() -> datetime:
         return datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
     heartbeat = HeartbeatWriter(tmp_path / "heartbeat.json", clock=clock, wall_clock=noon)
-    executor = ScriptedExecutor(clock, {TaskName.TRAIN: [3], TaskName.PREDICT: [3]})
-    scheduler = _scheduler(clock, executor, heartbeat=heartbeat, wall_clock=noon)
+    executor = scripted({TaskName.TRAIN: [3], TaskName.PREDICT: [3]})
+    scheduler = make_scheduler(executor, heartbeat=heartbeat, wall_clock=noon)
 
     scheduler.run_cycle()
 
@@ -256,9 +234,12 @@ def test_heartbeat_reports_task_states(clock: Any, tmp_path: Path) -> None:
     assert payload["state"] == "idle"
     assert payload["cycles_completed"] == 1
     assert payload["production_model_available"] is False
+    assert payload["dbt_test_gate"] == {"enabled": True, "blocking": False}
     assert payload["current_task"] is None
-    assert payload["next_cycle_in_seconds"] == pytest.approx(115.0)
+    assert payload["next_cycle_in_seconds"] == pytest.approx(116.0)
+    assert set(payload["tasks"]) == {RUN, TEST, SNAPSHOT, TRAIN, PREDICT}
     assert payload["tasks"]["dbt-run"]["status"] == "SUCCESS"
+    assert payload["tasks"]["snapshot"]["runs"] == 0
     assert payload["tasks"]["train"] == {
         "status": "SKIPPED",
         "exit_code": 3,
@@ -269,7 +250,7 @@ def test_heartbeat_reports_task_states(clock: Any, tmp_path: Path) -> None:
     }
 
 
-def test_running_task_is_visible_in_the_heartbeat(clock: Any, tmp_path: Path) -> None:
+def test_running_task_is_visible_in_the_heartbeat(clock: Any, make_scheduler: Any, tmp_path: Path) -> None:
     heartbeat = HeartbeatWriter(tmp_path / "heartbeat.json", clock=clock)
     seen: dict[str, object] = {}
 
@@ -277,7 +258,9 @@ def test_running_task_is_visible_in_the_heartbeat(clock: Any, tmp_path: Path) ->
         seen.setdefault(task.value, json.loads(heartbeat.path.read_text(encoding="utf-8"))["current_task"])
         return TaskResult(task, TaskStatus.SUCCESS, 0, 0.0)
 
-    _scheduler(clock, execute, heartbeat=heartbeat).run_cycle()
+    scheduler = make_scheduler(execute, heartbeat=heartbeat)
+    scheduler.run_cycle()
+    scheduler.run_cycle()
 
     assert seen == {task: task for task in (RUN, TEST, TRAIN, PREDICT, SNAPSHOT)}
 
@@ -322,11 +305,37 @@ def test_dependent_task_order() -> None:
     assert [task.value for task in dependent_tasks(bootstrap=False)] == [TEST, PREDICT, TRAIN, SNAPSHOT]
 
 
-def test_backoff_warning_is_logged(clock: Any, caplog: pytest.LogCaptureFixture) -> None:
+def test_backoff_warning_is_logged(
+    scripted: Any, make_scheduler: Any, run_cycles: Any, caplog: pytest.LogCaptureFixture
+) -> None:
     caplog.set_level(logging.WARNING, logger="pipeline_scheduler")
-    executor = ScriptedExecutor(clock, {TaskName.DBT_RUN: [1]})
-    scheduler = _scheduler(clock, executor)
+    executor = scripted({TaskName.DBT_RUN: [1]})
+    scheduler = make_scheduler(executor)
 
-    _cycles(scheduler, executor, clock, 2)
+    run_cycles(scheduler, executor, 2)
 
     assert "task dbt-run failed 2 times in a row: backing off, next attempt in about 240s" in caplog.messages
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"), [(60, 120), (120, 120), (121, 240), (900, 960), (1800, 1800)]
+)
+def test_effective_cadence_is_rounded_up_to_whole_dbt_cycles(
+    make_scheduler: Any, seconds: float, expected: float
+) -> None:
+    assert make_scheduler(lambda task: None).effective_seconds(seconds) == expected
+
+
+def test_startup_log_states_the_effective_cadences(
+    make_scheduler: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pipeline_scheduler")
+    shutdown = ShutdownFlag()
+    shutdown.request("SIGTERM")
+
+    make_scheduler(lambda task: None, shutdown=shutdown).run_forever()
+
+    started = next(message for message in caplog.messages if message.startswith("pipeline loop started"))
+    assert "predict every 120s, snapshot every 960s, train every 1800s" in started
+    assert "=60/900/1800 rounded up to whole dbt cycles" in started
+    assert "a failed dbt test skips train and snapshot of its cycle" in started
