@@ -95,6 +95,8 @@ FLEET = (
         0.784,
     ),
 )
+# Registered but never flown: the health board must read its sensor KPIs as unknown (NULL).
+SPARE_ENGINE = EnginePlan("CFM56-105", "CFM56-7B", (), (), 0.0)
 
 
 @dataclass

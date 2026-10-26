@@ -3,7 +3,8 @@
 The simulation mirrors the platform's PostgreSQL tables and their Debezium change stream:
 1 Hz pulses grouped in 10-pulse cycles, lifecycles that degrade until a FAILURE pulse, a
 maintenance work order opened at the failure and completed 20 s later, the lifecycle's
-non-HEALTHY pulses linked to the work order by UPDATEs, and a registry row updated every cycle.
+non-HEALTHY pulses linked to the work order by UPDATEs, and a registry row updated every cycle
+(plus one spare engine that is registered but never reports telemetry).
 
 ``build_history`` splits the change stream into two delivery phases around a cut-off:
 
@@ -27,6 +28,7 @@ from synthetic_fleet import (
     MAINTENANCE_SECONDS,
     PULSES_PER_CYCLE,
     SIM_START,
+    SPARE_ENGINE,
     EnginePlan,
     Lifecycle,
     Pulse,
@@ -222,7 +224,7 @@ def simulate(rng: random.Random) -> tuple[list[Lifecycle], list[CdcEvent], datet
     registries = {plan.engine_id: _RegistryState(plan) for plan in FLEET}
     events = [
         CdcEvent("engine_status_registry", "c", SIM_START - timedelta(seconds=1), dict(state.row))
-        for state in registries.values()
+        for state in [*registries.values(), _RegistryState(SPARE_ENGINE)]
     ]
     completed = sorted((lc for lc in lifecycles if lc.failure_mode), key=lambda lc: lc.pulses[-1].event_ts)
     work_orders = {id(lc): number for number, lc in enumerate(completed, start=1)}
@@ -243,8 +245,10 @@ def _assign_lsns(events: list[CdcEvent], rng: random.Random) -> None:
         event.lsn = lsn
 
 
-def _prediction(lifecycle: Lifecycle, at: datetime, rul_cycles: float, risk_band: str) -> dict[str, Any]:
-    pulse = lifecycle.pulses[-1]
+def _prediction(
+    lifecycle: Lifecycle, at: datetime, rul_cycles: float, risk_band: str, pulse: Pulse | None = None
+) -> dict[str, Any]:
+    pulse = lifecycle.pulses[-1] if pulse is None else pulse
     return {
         "predicted_at": at,
         "engine_id": pulse.engine_id,
@@ -265,18 +269,65 @@ def _prediction(lifecycle: Lifecycle, at: datetime, rul_cycles: float, risk_band
     }
 
 
+def _newest_pulse_at(lifecycle: Lifecycle, at: datetime) -> Pulse:
+    """The pulse a live scoring at ``at`` sees: the newest one measured by then."""
+    return [pulse for pulse in lifecycle.pulses if pulse.event_ts <= at][-1]
+
+
 def _predictions(lifecycle_of: dict[tuple[str, int], Lifecycle], cutoff: datetime) -> list[dict[str, Any]]:
-    """Predictions written during the increment: a stale one for an ended lifecycle, two for CFM56-104."""
+    """Predictions written during the increment: a stale one for an ended lifecycle, three current.
+
+    CFM56-104's are scored like the live loop scores, from the newest pulse at scoring time, so
+    the board must age them; JT9D-001's current one scores its newest pulse (nothing to age).
+    """
 
     def at(seconds: int) -> datetime:
         return cutoff + timedelta(seconds=seconds)
 
+    cfm56 = lifecycle_of[("CFM56-104", 4)]
     return [
         _prediction(lifecycle_of[("JT9D-001", 3)], at(50), 5.0, "HIGH"),
         _prediction(lifecycle_of[("JT9D-001", 4)], at(250), 80.0, "LOW"),
-        _prediction(lifecycle_of[("CFM56-104", 4)], at(100), 30.0, "MEDIUM"),
-        _prediction(lifecycle_of[("CFM56-104", 4)], at(200), 25.0, "HIGH"),
+        _prediction(cfm56, at(100), 40.0, "MEDIUM", _newest_pulse_at(cfm56, at(100))),
+        _prediction(cfm56, at(200), 30.0, "MEDIUM", _newest_pulse_at(cfm56, at(200))),
     ]
+
+
+def _aged_risk_band(risk_band: str, rul_cycles: float, horizon_cycles: int) -> str:
+    """predict_rul's RUL rule re-applied to an aged RUL; a band never de-escalates."""
+    if risk_band == "HIGH" or rul_cycles <= horizon_cycles:
+        return "HIGH"
+    if risk_band == "MEDIUM" or rul_cycles <= 2 * horizon_cycles:
+        return "MEDIUM"
+    return "LOW"
+
+
+def expected_board_predictions(
+    predictions: list[dict[str, Any]], registry: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any] | None]:
+    """Per engine, the newest prediction of its current lifecycle aged to its registry cycle."""
+    board: dict[str, dict[str, Any] | None] = {}
+    for engine_id, row in registry.items():
+        current = [
+            p
+            for p in predictions
+            if p["engine_id"] == engine_id and p["lifecycle_id"] == row["current_lifecycle_id"]
+        ]
+        if not current:
+            board[engine_id] = None
+            continue
+        newest = max(current, key=lambda p: p["predicted_at"])
+        elapsed = max(row["current_cycle"] - newest["cycle_number"], 0)
+        rul = max(newest["predicted_rul_cycles"] - elapsed, 0.0)
+        raw_rul = newest["predicted_rul_cycles"]
+        board[engine_id] = {
+            "prediction_cycle_number": newest["cycle_number"],
+            "cycles_since_prediction": elapsed,
+            "predicted_rul_cycles_adjusted": rul,
+            "predicted_rul_hours_adjusted": newest["predicted_rul_hours"] * rul / raw_rul if raw_rul else 0.0,
+            "risk_band_adjusted": _aged_risk_band(newest["risk_band"], rul, newest["horizon_cycles"]),
+        }
+    return board
 
 
 def _pulses_near(lifecycle: Lifecycle, at: datetime, count: int) -> list[Pulse]:
@@ -306,6 +357,8 @@ def build_history(seed: int) -> History:
         ),
     ]
     _assign_lsns(events, rng)
+    # final registry row per engine (events are in commit order; replays are added below)
+    registry = {e.image["engine_id"]: e.image for e in events if e.table == "engine_status_registry"}
 
     baseline_late = lifecycle_of[("CFM56-104", 2)].pulses[30:33]
     window_late = _pulses_near(running["GE90-201"], cutoff - timedelta(seconds=150), 4)
@@ -331,9 +384,11 @@ def build_history(seed: int) -> History:
         CdcEvent(e.table, e.op, e.commit_ts, dict(e.image), e.lsn, e.phase, e.late_visible) for e in replays
     ]
 
+    predictions = _predictions(lifecycle_of, cutoff)
     manifest = {
         "cutoff": cutoff.isoformat(),
-        "engines": [plan.engine_id for plan in FLEET],
+        "engines": [plan.engine_id for plan in (*FLEET, SPARE_ENGINE)],
+        "silent_engine": SPARE_ENGINE.engine_id,
         "completed_lifecycles": [
             [lc.plan.engine_id, lc.lifecycle_id] for lc in lifecycles if lc.failure_mode
         ],
@@ -346,6 +401,7 @@ def build_history(seed: int) -> History:
         "lagging_registry_engine": "GE90-202",
         "replayed_events": len(replays),
         # newest prediction of each engine's current lifecycle, as fct_engine_health_status must show it
-        "expected_predicted_rul": {"JT9D-001": 80.0, "CFM56-104": 25.0, "GE90-201": None, "GE90-202": None},
+        "expected_predicted_rul": {"JT9D-001": 80.0, "CFM56-104": 30.0, "GE90-201": None, "GE90-202": None},
+        "expected_board_predictions": expected_board_predictions(predictions, registry),
     }
-    return History(events, cutoff, _predictions(lifecycle_of, cutoff), manifest)
+    return History(events, cutoff, predictions, manifest)

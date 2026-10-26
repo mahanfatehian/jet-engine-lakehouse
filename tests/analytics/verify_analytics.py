@@ -3,13 +3,18 @@
     python tests/analytics/verify_analytics.py snapshot incremental
     python tests/analytics/verify_analytics.py compare incremental full_refresh
     python tests/analytics/verify_analytics.py check /tmp/seed_manifest.json [--incremental]
+    python tests/analytics/verify_analytics.py baseline 20
+    python tests/analytics/verify_analytics.py mart-cap 2
 
 snapshot  copies the FINAL contents of every model into analytics_verify.<tag>__<model>
           (build-time columns excluded)
 compare   row counts, per-column checksums and row-level EXCEPT diffs of two snapshots
 check     CDC dedup, late / deleted / corrected pulses, registry lag, RUL labels, finite
-          features, fct grain and predictions, and an independent Python recomputation of the
-          rolling features of selected lifecycles (feature_reference.py)
+          features, fct grain, predictions and their aging, and an independent Python
+          recomputation of the rolling features of selected lifecycles (feature_reference.py)
+baseline  every live feature row records baseline_cycles = N and the reference lifecycles
+          match the Python recomputation with an N-cycle baseline
+mart-cap  the training mart holds exactly the newest N completed lifecycles of every engine
 Exit code 0 when every check passes, 1 otherwise; snapshot (the only write) needs
 ANALYTICS_IT_ALLOW_WRITES=1 like seed_engine_raw.py and exits 2 without it.
 """
@@ -29,10 +34,11 @@ from typing import Any
 from clickhouse_connect.driver.client import Client
 from clickhouse_connect.driver.exceptions import ClickHouseError
 from feature_reference import ROLLED_SENSORS, SENSORS, WINDOWS, Reading, expected_features
-from seed_engine_raw import EXIT_REFUSED, connect, with_retries, writes_allowed
+from seed_engine_raw import EXIT_REFUSED, connect, writes_allowed
+from verify_gold import check_board, check_mart_cap
+from verify_queries import DATABASE, rows, scalar
 
 LOGGER = logging.getLogger("verify_analytics")
-DATABASE = os.environ.get("CLICKHOUSE_DB", "iot_engine")
 VERIFY_DATABASE = "analytics_verify"
 MODELS = (
     "stg_engine_telemetry",
@@ -42,8 +48,12 @@ MODELS = (
     "int_sensor_rolling_features",
     "mart_rul_training_features",
     "fct_engine_health_status",
+    "fct_rul_prediction_backtest",
+    "rpt_model_live_performance",
 )
-BUILD_TIME_COLUMNS = frozenset({"feature_computed_at", "refreshed_at", "telemetry_staleness_seconds"})
+BUILD_TIME_COLUMNS = frozenset(
+    {"feature_computed_at", "refreshed_at", "telemetry_staleness_seconds", "prediction_age_seconds"}
+)
 FLOAT_FEATURES = (
     *SENSORS,
     *(
@@ -68,16 +78,6 @@ REFERENCE_LIFECYCLES = (("CFM56-104", 2), ("GE90-202", 4), ("JT9D-001", 2), ("GE
 BASELINE_CYCLES = 10
 RUL_CAP_CYCLES = int(os.environ.get("RUL_CAP_CYCLES", "125"))
 RUL_HORIZON_CYCLES = int(os.environ.get("RUL_FAILURE_HORIZON_CYCLES", "25"))
-
-
-def rows(client: Client, sql: str) -> list[tuple[Any, ...]]:
-    """Run a query (with retries) and return its rows."""
-    return with_retries(lambda: client.query(sql).result_rows, "query ClickHouse")
-
-
-def scalar(client: Client, sql: str) -> Any:
-    """Run a query that returns one value."""
-    return rows(client, sql)[0][0]
 
 
 def model_columns(client: Client, database: str, table: str) -> list[tuple[str, str]]:
@@ -247,7 +247,11 @@ def check_scenarios(client: Client, manifest: dict[str, Any], incremental: bool)
 
 
 def check_labels(client: Client) -> list[str]:
-    """Mart labels recomputed from stg FINAL; only completed lifecycles, every pulse up to the failure."""
+    """Mart labels recomputed from stg FINAL; only completed lifecycles, every pulse up to the failure.
+
+    The fixture's engines complete fewer lifecycles than the default mart_max_lifecycles_per_engine,
+    so the whole history is expected here; check_mart_cap covers a binding window.
+    """
     bad = scalar(
         client,
         f"""
@@ -299,33 +303,7 @@ def check_finite(client: Client) -> list[str]:
     return failures
 
 
-def check_board(client: Client, manifest: dict[str, Any]) -> list[str]:
-    """One fct row per engine; predictions joined for the current lifecycle only."""
-    board = {
-        row[0]: row[1:]
-        for row in rows(
-            client,
-            (
-                f"SELECT engine_id, predicted_rul_cycles, operational_status, engine_model "
-                f"FROM {DATABASE}.fct_engine_health_status FINAL"
-            ),
-        )
-    }
-    count = scalar(client, f"SELECT count() FROM {DATABASE}.fct_engine_health_status FINAL")
-    failures = []
-    if count != len(manifest["engines"]) or set(board) != set(manifest["engines"]):
-        failures.append(f"fct has {count} rows for engines {sorted(board)}")
-    for engine, expected in manifest["expected_predicted_rul"].items():
-        actual = board.get(engine, (None,))[0]
-        if actual != expected:
-            failures.append(f"fct {engine}: predicted_rul_cycles {actual}, expected {expected}")
-    lagging = board.get(manifest["lagging_registry_engine"], (None, "UNKNOWN", "UNKNOWN"))
-    if "UNKNOWN" in lagging[1:]:
-        failures.append(f"fct {manifest['lagging_registry_engine']}: registry state not applied {lagging}")
-    return failures
-
-
-def check_feature_values(client: Client) -> list[str]:
+def check_feature_values(client: Client, baseline_cycles: int = BASELINE_CYCLES) -> list[str]:
     """Recompute the features of REFERENCE_LIFECYCLES in Python and compare every value."""
     failures = []
     for engine_id, lifecycle_id in REFERENCE_LIFECYCLES:
@@ -338,7 +316,7 @@ def check_feature_values(client: Client) -> list[str]:
                 f"FROM {DATABASE}.stg_engine_telemetry FINAL WHERE {where}",
             )
         ]
-        expected = expected_features(readings, BASELINE_CYCLES)
+        expected = expected_features(readings, baseline_cycles)
         actual = {
             row[0]: dict(zip(FLOAT_FEATURES, row[1:], strict=True))
             for row in rows(
@@ -366,6 +344,18 @@ def check_feature_values(client: Client) -> list[str]:
     return failures
 
 
+def check_baseline(client: Client, baseline_cycles: int) -> list[str]:
+    """Every live feature row was computed with ``baseline_cycles`` and its values agree."""
+    stale = scalar(
+        client,
+        f"SELECT count() FROM {DATABASE}.int_sensor_rolling_features FINAL "
+        f"WHERE baseline_cycles != {int(baseline_cycles)}",
+    )
+    LOGGER.info("feature rows not computed with baseline_cycles=%d: %d", baseline_cycles, stale)
+    failures = [f"{stale} feature rows not computed with baseline_cycles={baseline_cycles}"] if stale else []
+    return failures + check_feature_values(client, baseline_cycles)
+
+
 def check(client: Client, manifest_path: Path, incremental: bool) -> list[str]:
     """Run every invariant check against the current model contents."""
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -375,7 +365,7 @@ def check(client: Client, manifest_path: Path, incremental: bool) -> list[str]:
         *check_labels(client),
         *check_finite(client),
         *check_board(client, manifest),
-        *check_feature_values(client),
+        *check_baseline(client, BASELINE_CYCLES),
     ]
 
 
@@ -389,7 +379,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     check_parser = commands.add_parser("check", help="run the invariant checks")
     check_parser.add_argument("manifest", type=Path)
     check_parser.add_argument("--incremental", action="store_true", help="also expect retraction rows")
+    baseline_parser = commands.add_parser("baseline", help="check the features' baseline definition")
+    baseline_parser.add_argument("cycles", type=int)
+    commands.add_parser("mart-cap", help="check the mart's training window").add_argument(
+        "lifecycles", type=int
+    )
     return parser.parse_args(argv)
+
+
+def _run(client: Client, args: argparse.Namespace) -> list[str]:
+    if args.command == "snapshot":
+        return snapshot(client, args.tag)
+    if args.command == "compare":
+        return compare(client, args.left, args.right)
+    if args.command == "baseline":
+        return check_baseline(client, args.cycles)
+    if args.command == "mart-cap":
+        return check_mart_cap(client, args.lifecycles)
+    return check(client, args.manifest, args.incremental)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -401,13 +408,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "snapshot" and not writes_allowed():
         return EXIT_REFUSED
     try:
-        client = connect()
-        if args.command == "snapshot":
-            failures = snapshot(client, args.tag)
-        elif args.command == "compare":
-            failures = compare(client, args.left, args.right)
-        else:
-            failures = check(client, args.manifest, args.incremental)
+        failures = _run(connect(), args)
     except ClickHouseError:
         LOGGER.exception("verification could not run")
         return 1

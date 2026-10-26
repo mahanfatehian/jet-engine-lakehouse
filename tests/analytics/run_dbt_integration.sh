@@ -6,17 +6,22 @@
 #      dbt target and logs kept inside the container)
 #   3. seed base -> dbt debug -> dbt build -> seed increment -> dbt build (incremental path)
 #   4. invariant checks, snapshot, dbt build --full-refresh, snapshot, compare, checks again
+#   5. var-driven definitions: a changed baseline_cycles heals on the next incremental run (and
+#      equals the full refresh again), the anomaly-threshold guard rejects miscalibrated
+#      thresholds, and the training mart keeps only the newest lifecycles of each engine
 #
-# Everything it creates is named tmp-analytics-* and removed on exit (ANALYTICS_IT_KEEP=1 keeps it).
+# Everything it creates is named ${ANALYTICS_IT_PREFIX:-tmp-analytics}-* and removed on exit
+# (ANALYTICS_IT_KEEP=1 keeps it); set the prefix to run two copies side by side.
 # Usage: bash tests/analytics/run_dbt_integration.sh      (Linux, macOS or Git Bash on Windows)
 set -euo pipefail
 
 # Git Bash would rewrite container paths such as /repo into Windows paths.
 export MSYS_NO_PATHCONV=1
 
-readonly NETWORK=tmp-analytics-net
-readonly CLICKHOUSE=tmp-analytics-ch
-readonly DBT=tmp-analytics-dbt
+readonly PREFIX="${ANALYTICS_IT_PREFIX:-tmp-analytics}"
+readonly NETWORK="${PREFIX}-net"
+readonly CLICKHOUSE="${PREFIX}-ch"
+readonly DBT="${PREFIX}-dbt"
 readonly CLICKHOUSE_IMAGE=clickhouse/clickhouse-server:26.8
 readonly PYTHON_IMAGE=python:3.12-slim-bookworm
 readonly DBT_PACKAGES=(dbt-core==1.12.6 dbt-clickhouse==1.10.3)
@@ -61,6 +66,23 @@ in_dbt() { docker exec "${DBT}" bash -c "cd /repo/analytics && $*"; }
 verify() { docker exec "${DBT}" python /repo/tests/analytics/verify_analytics.py "$@"; }
 seed() { docker exec "${DBT}" python /repo/tests/analytics/seed_engine_raw.py "$@"; }
 
+expect_test_failure() {
+    # $1 = singular test, $2 = dbt vars, $3 = regex one of its failing rows must match. dbt show
+    # runs the test query and prints its rows as JSON (untruncated, one key per line: flattened
+    # here), so the reason of the failure is checked, not just that the test fails.
+    local output
+    if ! output="$(in_dbt "dbt show --select $1 --vars '$2' --limit 50 --output json" 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        return 1
+    fi
+    if ! tr -s '[:space:]' ' ' <<<"${output}" | grep -Eq -- "$3"; then
+        printf '%s\n' "${output}" >&2
+        log "$1 with vars $2 did not report /$3/"
+        return 1
+    fi
+    log "$1 with vars $2 reports /$3/ as expected"
+}
+
 wait_for_clickhouse() {
     # Same probe as the compose healthcheck: the first-boot init server only binds loopback,
     # so the container address answers once init-db.sql has been applied.
@@ -100,6 +122,28 @@ start_containers() {
     wait_for_clickhouse
 }
 
+check_definition_changes() {
+    log "phase 4: baseline_cycles changed in a one-off run, healed by the next incremental run"
+    in_dbt "dbt run --select int_sensor_rolling_features --vars '{baseline_cycles: 20}'"
+    verify baseline 20
+    expect_test_failure assert_features_use_current_baseline_cycles '{}' \
+        '"built_with_baseline_cycles": *20.*dbt run --full-refresh -s int_sensor_rolling_features\+'
+    in_dbt "dbt build --select int_sensor_rolling_features+"
+    verify baseline 10
+    verify snapshot healed
+    verify compare full_refresh healed
+
+    log "phase 5: the anomaly-threshold guard rejects thresholds that never fire or always fire"
+    expect_test_failure assert_anomaly_thresholds_calibrated '{anomaly_oil_pressure_drop_psi: 8.0}' \
+        '"flag": *"is_oil_pressure_drop_anomaly", *"issue": *"silent_at_failure"'
+    expect_test_failure assert_anomaly_thresholds_calibrated '{anomaly_vibration_ratio: 1.0}' \
+        '"flag": *"is_vibration_growth_anomaly", *"issue": *"noisy_while_healthy"'
+
+    log "phase 6: the training mart keeps the newest completed lifecycles of each engine"
+    in_dbt "dbt build --select mart_rul_training_features+ --vars '{mart_max_lifecycles_per_engine: 2}'"
+    verify mart-cap 2
+}
+
 main() {
     trap cleanup EXIT
     start_containers
@@ -120,6 +164,8 @@ main() {
     verify snapshot full_refresh
     verify compare incremental full_refresh
     verify check "${MANIFEST}"
+
+    check_definition_changes
     log "all analytics checks passed"
 }
 
