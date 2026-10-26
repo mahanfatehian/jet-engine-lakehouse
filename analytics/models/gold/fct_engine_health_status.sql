@@ -12,6 +12,12 @@
     RUL prediction for its current lifecycle. Rebuilt on every run; refreshed_at is the build time.
     Right-hand columns are made Nullable before the LEFT JOINs so that "no data" reads as NULL
     instead of ClickHouse's 0 / '' join defaults.
+
+    The pipeline scores engines after `dbt run`, so the newest prediction is typically one dbt
+    interval older than current_cycle. The raw model output is kept as is; the *_adjusted
+    columns age it by the cycles flown since the scored pulse, and risk_band_adjusted re-applies
+    the predictor's RUL rule (HIGH within the horizon, MEDIUM within twice the horizon) to the
+    adjusted RUL. A band only ever escalates: the failure probability cannot be aged.
 -#}
 
 {%- set latest_columns = raw_sensor_columns()
@@ -104,10 +110,11 @@ engine_state as (
         registry_updated_ts,
         feature_telemetry_id,
         feature_event_ts,
-        greatest(
-            (toUnixTimestamp64Milli(now64(3, 'UTC')) - toUnixTimestamp64Milli(feature_event_ts)) / 1000.0,
-            0.0
-        ) as staleness_seconds,
+        -- NULL for an engine that never reported telemetry (the stale flag treats it as silent)
+        {{ at_least(
+            "(toUnixTimestamp64Milli(now64(3, 'UTC')) - toUnixTimestamp64Milli(feature_event_ts)) / 1000.0",
+            '0.0'
+        ) }} as staleness_seconds,
         {%- for column in latest_columns %}
         latest_{{ column }},
         {%- endfor %}
@@ -125,9 +132,11 @@ latest_predictions as (
     select
         engine_id,
         lifecycle_id as prediction_lifecycle_id,
+        toNullable(cycle_number) as prediction_cycle_number,
         toNullable(predicted_rul_cycles) as prediction_rul_cycles,
         toNullable(predicted_rul_hours) as prediction_rul_hours,
         toNullable(failure_probability) as prediction_failure_probability,
+        toNullable(horizon_cycles) as prediction_horizon_cycles,
         toNullable(cast(risk_band as String)) as prediction_risk_band,
         toNullable(cast(model_version as String)) as prediction_model_version,
         toNullable(predicted_at) as prediction_predicted_at
@@ -163,9 +172,11 @@ assessed as (
             ),
             4
         ) as degradation,
+        prediction_cycle_number,
         prediction_rul_cycles,
         prediction_rul_hours,
         prediction_failure_probability,
+        prediction_horizon_cycles,
         prediction_risk_band,
         prediction_model_version,
         prediction_predicted_at
@@ -173,6 +184,37 @@ assessed as (
     left join latest_predictions
         on latest_predictions.engine_id = engine_state.engine_id
         and latest_predictions.prediction_lifecycle_id = engine_state.resolved_lifecycle_id
+
+),
+
+aged as (
+
+    -- the join keeps the prediction in the current lifecycle, so cycles are comparable; a
+    -- registry that lags the scored pulse counts as no cycle flown (NULL without a prediction)
+    select
+        *,
+        toUInt32({{ at_least('toInt64(resolved_cycle) - toInt64(prediction_cycle_number)', '0') }})
+            as prediction_cycles_elapsed,
+        {{ at_least(
+            "(toUnixTimestamp64Milli(now64(3, 'UTC')) - toUnixTimestamp64Milli(prediction_predicted_at)) / 1000.0",
+            '0.0'
+        ) }} as prediction_age_seconds,
+        {{ at_least('prediction_rul_cycles - prediction_cycles_elapsed', '0.0') }} as prediction_rul_cycles_aged,
+        -- the predictor's own hours-per-cycle conversion (FLIGHT_HOURS_PER_CYCLE when it scored)
+        if(
+            prediction_rul_cycles > 0,
+            prediction_rul_hours * (prediction_rul_cycles_aged / prediction_rul_cycles),
+            prediction_rul_hours
+        ) as prediction_rul_hours_aged,
+        -- the predictor's RUL rule on the aged RUL; the probability part stays as scored
+        multiIf(
+            prediction_risk_band is null, null,
+            prediction_risk_band = 'HIGH' or prediction_rul_cycles_aged <= prediction_horizon_cycles, 'HIGH',
+            prediction_risk_band = 'MEDIUM' or prediction_rul_cycles_aged <= 2 * prediction_horizon_cycles,
+            'MEDIUM',
+            'LOW'
+        ) as prediction_risk_band_aged
+    from assessed
 
 )
 
@@ -209,5 +251,11 @@ select
     prediction_risk_band as risk_band,
     prediction_model_version as model_version,
     prediction_predicted_at as predicted_at,
+    prediction_cycle_number,
+    prediction_cycles_elapsed as cycles_since_prediction,
+    prediction_age_seconds,
+    prediction_rul_cycles_aged as predicted_rul_cycles_adjusted,
+    prediction_rul_hours_aged as predicted_rul_hours_adjusted,
+    prediction_risk_band_aged as risk_band_adjusted,
     now64(3, 'UTC') as refreshed_at
-from assessed
+from aged

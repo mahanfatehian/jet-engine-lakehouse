@@ -1,5 +1,16 @@
+{#-
+    NULL-preserving clamps. Since ClickHouse 24.12 greatest/least skip NULL arguments
+    (least_greatest_legacy_null_behavior = 0): greatest(NULL, 0) is 0 and least(NULL, 1) is 1, so
+    a plain clamp turns "no data" into a measured value. These keep NULL as NULL.
+-#}
+
+{% macro at_least(expression, floor) -%}
+    if(isNull({{ expression }}), NULL, greatest({{ expression }}, {{ floor }}))
+{%- endmacro %}
+
+
 {% macro clamp_unit(expression) -%}
-    least(greatest({{ expression }}, 0.0), 1.0)
+    if(isNull({{ expression }}), NULL, least(greatest({{ expression }}, 0.0), 1.0))
 {%- endmacro %}
 
 

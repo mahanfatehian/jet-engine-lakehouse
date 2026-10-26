@@ -5,10 +5,14 @@ models:
     description: >
       Fleet health board, one row per engine (registered and not deregistered, or seen in
       telemetry): current registry state, latest sensor readings, 5-minute rolling means, drift
-      KPIs, anomaly flags, a sensor-driven degradation index and the latest RUL prediction for
-      the engine's current lifecycle. Thresholds and scales are the anomaly_* and
-      degradation_full_scale_* vars. Table (rebuilt every run) on ReplacingMergeTree ordered by
-      engine_id; rows are unique, so it can be read with or without FINAL.
+      KPIs, anomaly flags, a sensor-driven degradation index and the newest RUL prediction for
+      the engine's current lifecycle. The pipeline loop scores engines after `dbt run`, so that
+      prediction is typically one dbt interval (DBT_INTERVAL_SECONDS) old when the table is
+      built: predicted_rul_cycles and its siblings are the model output as scored, the
+      *_adjusted columns age it by the cycles flown since (cycles_since_prediction).
+      Thresholds and scales are the anomaly_* and degradation_full_scale_* vars. Table (rebuilt
+      every run) on ReplacingMergeTree ordered by engine_id; rows are unique, so it can be read
+      with or without FINAL.
     config:
       tags: ["kpi"]
     data_tests:
@@ -18,6 +22,26 @@ models:
             expression: >
               anomaly_count = is_egt_drift_anomaly + is_vibration_growth_anomaly
               + is_oil_pressure_drop_anomaly + is_telemetry_stale
+      - expression_is_true:
+          name: fct_engine_health_status_no_telemetry_reads_as_unknown
+          arguments:
+            expression: >
+              isNull(last_telemetry_ts) = isNull(telemetry_staleness_seconds)
+              and isNull(last_telemetry_ts) = isNull(degradation_index)
+              and isNull(last_telemetry_ts) = isNull(health_score)
+              and (isNotNull(last_telemetry_ts) or is_telemetry_stale = 1)
+      - expression_is_true:
+          name: fct_engine_health_status_adjusted_prediction_consistent
+          arguments:
+            expression: >
+              isNull(predicted_rul_cycles) = isNull(predicted_rul_cycles_adjusted)
+              and isNull(predicted_rul_cycles) = isNull(cycles_since_prediction)
+              and isNull(risk_band) = isNull(risk_band_adjusted)
+              and coalesce(predicted_rul_cycles_adjusted
+                = greatest(predicted_rul_cycles - cycles_since_prediction, 0), 1)
+              and coalesce(predicted_rul_hours_adjusted <= predicted_rul_hours, 1)
+              and coalesce(indexOf(['LOW', 'MEDIUM', 'HIGH'], risk_band_adjusted)
+                >= indexOf(['LOW', 'MEDIUM', 'HIGH'], risk_band), 1)
     columns:
       - name: engine_id
         data_type: LowCardinality(String)
@@ -63,7 +87,7 @@ models:
         description: event_ts of the newest pulse.
       - name: telemetry_staleness_seconds
         data_type: Nullable(Float64)
-        description: Seconds between refreshed_at and last_telemetry_ts (never negative).
+        description: Seconds between refreshed_at and last_telemetry_ts (never negative; NULL without telemetry).
         data_tests:
           - non_negative
       - name: rpm
@@ -119,7 +143,9 @@ models:
         description: 1 when vibration_mm_s_ratio > var anomaly_vibration_ratio.
       - name: is_oil_pressure_drop_anomaly
         data_type: UInt8
-        description: 1 when oil_pressure_psi_drop > var anomaly_oil_pressure_drop_psi.
+        description: >
+          1 when oil_pressure_psi_drop > var anomaly_oil_pressure_drop_psi. The 5-minute KPI
+          dilutes the late oil-pressure collapse, so this is a late (CRITICAL) signal.
       - name: is_telemetry_stale
         data_type: UInt8
         description: >
@@ -157,26 +183,68 @@ models:
         description: Mean length in cycles of the engine's completed lifecycles (NULL before the first failure).
       - name: predicted_rul_cycles
         data_type: Nullable(Float64)
-        description: Latest predicted remaining cycles for the current lifecycle (NULL until predicted).
+        description: >
+          Remaining cycles of the newest prediction for the current lifecycle, as of its scored
+          pulse (prediction_cycle_number), not of current_cycle; NULL until predicted. See
+          predicted_rul_cycles_adjusted.
       - name: predicted_rul_hours
         data_type: Nullable(Float64)
-        description: Latest predicted remaining flight hours for the current lifecycle.
+        description: Remaining flight hours of that prediction, as of its scored pulse.
       - name: failure_probability
         data_type: Nullable(Float64)
-        description: Latest predicted probability of failure within the horizon.
+        description: Predicted probability of failure within the horizon, as of the scored pulse.
       - name: risk_band
         data_type: Nullable(String)
-        description: LOW | MEDIUM | HIGH of the latest prediction.
+        description: LOW | MEDIUM | HIGH of that prediction, as scored (see risk_band_adjusted).
         data_tests:
           - accepted_values:
               arguments:
                 values: ['LOW', 'MEDIUM', 'HIGH']
       - name: model_version
         data_type: Nullable(String)
-        description: Model that produced the latest prediction.
+        description: Model that produced the prediction.
       - name: predicted_at
         data_type: "Nullable(DateTime64(3, 'UTC'))"
-        description: Time of the latest prediction for the current lifecycle.
+        description: Scoring time of the newest prediction for the current lifecycle.
+      - name: prediction_cycle_number
+        data_type: Nullable(UInt32)
+        description: Cycle of the pulse the prediction scored (NULL without a prediction).
+      - name: cycles_since_prediction
+        data_type: Nullable(UInt32)
+        description: >
+          current_cycle - prediction_cycle_number: cycles flown since the scored pulse (0 when
+          the registry lags it; NULL without a prediction). About DBT_INTERVAL_SECONDS /
+          (SIM_TICK_SECONDS x SIM_PULSES_PER_CYCLE) in the loop, 12 at the defaults.
+      - name: prediction_age_seconds
+        data_type: Nullable(Float64)
+        description: Seconds between predicted_at and refreshed_at (never negative; NULL without a prediction).
+        data_tests:
+          - non_negative
+      - name: predicted_rul_cycles_adjusted
+        data_type: Nullable(Float64)
+        description: >
+          Remaining cycles as of current_cycle: greatest(predicted_rul_cycles -
+          cycles_since_prediction, 0). Use this, not predicted_rul_cycles, next to current_cycle.
+        data_tests:
+          - non_negative
+      - name: predicted_rul_hours_adjusted
+        data_type: Nullable(Float64)
+        description: >
+          predicted_rul_cycles_adjusted in flight hours, with the hours per cycle of the
+          prediction itself (predicted_rul_hours / predicted_rul_cycles).
+        data_tests:
+          - non_negative
+      - name: risk_band_adjusted
+        data_type: Nullable(String)
+        description: >
+          risk_band escalated for the aged RUL with the predictor's rule: HIGH when
+          predicted_rul_cycles_adjusted <= the model's horizon_cycles, else MEDIUM when it is
+          within twice the horizon. Never lower than risk_band, since a failure probability
+          cannot be aged.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['LOW', 'MEDIUM', 'HIGH']
       - name: refreshed_at
         data_type: "DateTime64(3, 'UTC')"
         description: Build time of this table (UTC).
