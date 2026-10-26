@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import predict_rul
 import pytest
 from artifact_store import LocalArtifactStore
-from ds_runtime import PreconditionsNotMetError, StopToken
+from ds_runtime import EXIT_FAILURE, EXIT_OK, PreconditionsNotMetError, StopToken
 from model_registry import (
+    BUNDLE_FILE,
     ML_MODEL_RUNS_COLUMNS,
     ArtifactLayout,
     ModelArtifacts,
+    ModelIntegrityError,
     ProductionPointer,
     publish_artifacts,
     write_production_pointer,
@@ -66,11 +71,16 @@ class FakeGateway:
         self._on_insert()
 
 
-def _promote(store: LocalArtifactStore, bundle: RulModelBundle) -> None:
+def _promote(store: LocalArtifactStore, bundle: RulModelBundle, *, with_digest: bool = True) -> None:
     artifacts = ModelArtifacts(bundle, {}, {}, feature_importance(bundle))
-    publish_artifacts(store, LAYOUT, artifacts)
+    published = publish_artifacts(store, LAYOUT, artifacts)
     pointer = ProductionPointer(
-        bundle.model_version, LAYOUT.version_prefix(bundle.model_version), NOW.isoformat(), {}, []
+        bundle.model_version,
+        LAYOUT.version_prefix(bundle.model_version),
+        NOW.isoformat(),
+        {},
+        [],
+        published.bundle_sha256 if with_digest else None,
     )
     write_production_pointer(store, LAYOUT, pointer)
 
@@ -233,3 +243,60 @@ def test_live_loop_survives_skips_and_errors_and_stops_gracefully(
 
     assert cache.calls == 3
     assert len(gateway.inserts) == 1
+
+
+def test_prediction_refuses_bundles_that_fail_verification(
+    tmp_path: Path, synthetic_training, inference_frame
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    bundle = synthetic_training.trained.bundle
+    _promote(store, bundle, with_digest=False)
+    gateway = FakeGateway(inference_frame)
+
+    with pytest.raises(ModelIntegrityError, match="no bundle_sha256"):
+        predict_once(gateway, ProductionModelCache(store, LAYOUT), hours_per_cycle=2.0)
+    _promote(store, bundle)
+    key = LAYOUT.artifact_key(bundle.model_version, BUNDLE_FILE)
+    store.put_bytes(key, store.get_bytes(key)[:-1])
+    with pytest.raises(ModelIntegrityError, match="modified or corrupted"):
+        predict_once(gateway, ProductionModelCache(store, LAYOUT), hours_per_cycle=2.0)
+    assert gateway.inserts == []
+
+
+def test_model_cache_reloads_when_the_recorded_digest_changes(tmp_path: Path, synthetic_training) -> None:
+    store = CountingStore(tmp_path)
+    bundle = synthetic_training.trained.bundle
+    _promote(store, bundle)
+    cache = ProductionModelCache(store, LAYOUT)
+    cache.current()
+    key = LAYOUT.artifact_key(bundle.model_version, BUNDLE_FILE)
+    store.put_bytes(key, store.get_bytes(key) + b"tampered")
+    pointer = store.get_json(LAYOUT.production_key)
+    store.put_json(LAYOUT.production_key, {**pointer, "bundle_sha256": "f" * 64})
+
+    with pytest.raises(ModelIntegrityError):
+        cache.current()
+
+
+class _NoSignals(StopToken):
+    def install_signal_handlers(self) -> StopToken:
+        return self
+
+
+@pytest.mark.parametrize(("with_digest", "code"), [(True, EXIT_OK), (False, EXIT_FAILURE)])
+def test_batch_cli_exits_1_when_the_bundle_cannot_be_verified(
+    tmp_path: Path, synthetic_training, inference_frame, monkeypatch, caplog, with_digest: bool, code: int
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    _promote(store, synthetic_training.trained.bundle, with_digest=with_digest)
+    gateway = FakeGateway(inference_frame)
+    monkeypatch.setattr(predict_rul, "S3ArtifactStore", lambda _settings: store)
+    monkeypatch.setattr(predict_rul, "ClickHouseGateway", lambda _settings: contextlib.nullcontext(gateway))
+    monkeypatch.setattr(predict_rul, "configure_logging", lambda _level: None)
+    monkeypatch.setattr(predict_rul, "StopToken", _NoSignals)
+
+    with caplog.at_level(logging.ERROR, logger="predict_rul"):
+        assert predict_rul.main(["--mode", "batch"]) == code
+
+    assert len(gateway.inserts) == (1 if with_digest else 0)
+    assert ("refusing to serve the production model" in caplog.text) is not with_digest

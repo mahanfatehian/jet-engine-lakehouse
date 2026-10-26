@@ -8,6 +8,7 @@ mean of the first 10 cycles), so the frames match the feature contract exactly.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,14 +18,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from artifact_store import LocalArtifactStore
+from ds_runtime import StopToken
 from feature_pipeline import (
     FEATURE_COLUMNS,
     INFERENCE_FRAME_COLUMNS,
     RAW_SENSOR_COLUMNS,
     TRAINING_FRAME_COLUMNS,
 )
+from model_registry import ArtifactLayout, ModelRunRecord, RunSummary
 from rul_metrics import HoldoutMetrics
 from rul_modeling import GroupSplit, LabelSpec, TrainedModel, evaluate_bundle, split_groups, train_models
+from train_rul_model import TrainingContext
+from training_sources import TrainingFrame, prepare_training_frame
+from training_window import LifecycleInventory, TrainingWindow, apply_window, inventory_from_frame
 
 ENGINE_MODELS = ("CFM56-7B", "GE90-115B", "JT9D-7R4")
 FAILURE_MODES = ("HPT_BLADE_EROSION", "BEARING_DEGRADATION", "OIL_SYSTEM_LEAK", "COMPRESSOR_FOULING")
@@ -236,6 +243,75 @@ def synthetic_training(synthetic_mart: pd.DataFrame, label_spec: LabelSpec) -> S
     return SyntheticTraining(
         frames, split, trained, evaluate_bundle(trained.bundle, frames["test"], label_spec)
     )
+
+
+class FrameSource:
+    """TrainingDataSource over an in-memory mart frame; records the windows it was asked for."""
+
+    name = "clickhouse"
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        self._frame = prepare_training_frame(frame)
+        self.windows: list[TrainingWindow] = []
+
+    def inventory(self) -> LifecycleInventory:
+        return inventory_from_frame(self._frame)
+
+    def load(self, window: TrainingWindow) -> TrainingFrame:
+        self.windows.append(window)
+        return TrainingFrame(apply_window(self._frame, window), self.name, "memory:synthetic")
+
+
+class MemoryRunRegistry:
+    """RunRegistry kept in a list; ``history`` stands in for rows written by earlier runs."""
+
+    def __init__(self, history: RunSummary | None = None) -> None:
+        self.history = history
+        self.records: list[ModelRunRecord] = []
+
+    def latest_run(self) -> RunSummary | None:
+        if not self.records:
+            return self.history
+        last = max(self.records, key=lambda record: (record.trained_at, record.model_version))
+        # Same facts ClickHouseRunRegistry extracts from the row and its params_json.
+        return RunSummary(
+            last.model_version,
+            last.train_lifecycles + last.test_lifecycles,
+            last.promoted,
+            json.loads(last.params_json).get("data_watermark_us"),
+        )
+
+    def record_run(self, record: ModelRunRecord) -> None:
+        self.records.append(record)
+
+
+ARTIFACT_LAYOUT = ArtifactLayout("ml-artifacts/rul_model")
+
+
+@pytest.fixture
+def make_context(label_spec: LabelSpec) -> Callable[..., TrainingContext]:
+    """Factory of TrainingContexts over a local store, an in-memory mart and run registry."""
+
+    def build(
+        root: Path, frame: pd.DataFrame, runs: MemoryRunRegistry | None = None, store=None
+    ) -> TrainingContext:
+        return TrainingContext(
+            source=FrameSource(frame),
+            store=store if store is not None else LocalArtifactStore(root),
+            runs=runs if runs is not None else MemoryRunRegistry(),
+            layout=ARTIFACT_LAYOUT,
+            labels=label_spec,
+            hours_per_cycle=2.0,
+            stop=StopToken(),
+        )
+
+    return build
+
+
+@pytest.fixture
+def run_registry() -> Callable[..., MemoryRunRegistry]:
+    """Factory of in-memory run registries (optionally seeded with an earlier run)."""
+    return MemoryRunRegistry
 
 
 @pytest.fixture(scope="session")

@@ -17,7 +17,7 @@ from ds_runtime import (
     retry_call,
     run_cli,
 )
-from ds_settings import ConfigError, load_settings
+from ds_settings import ConfigError, PromotionSettings, load_settings
 from lakehouse_io import _is_transient, final_modifier
 
 
@@ -118,7 +118,14 @@ def test_settings_defaults_follow_the_contract() -> None:
     assert (model.failure_horizon_cycles, model.rul_cap_cycles, model.min_training_lifecycles) == (25, 125, 6)
     assert (model.flight_hours_per_cycle, model.promotion_policy) == (2.0, "better")
     assert model.artifact_prefix == "ml-artifacts/rul_model"
+    assert model.training_max_rows == 600_000
+    assert (model.promotion.min_r2, model.promotion.min_roc_auc, model.promotion.f1_tolerance) == (
+        0.5,
+        0.75,
+        0.05,
+    )
     assert settings.snapshot_retention == 5
+    assert settings.snapshot_window_days == 7
     assert "password" not in repr(settings.clickhouse)
     assert "secret_access_key" not in repr(settings.s3)
 
@@ -132,8 +139,30 @@ def test_settings_defaults_follow_the_contract() -> None:
         ({"MODEL_PROMOTION_POLICY": "sometimes"}, "better, always"),
         ({"RUL_CAP_CYCLES": "20", "RUL_FAILURE_HORIZON_CYCLES": "25"}, "must exceed"),
         ({"ML_ARTIFACT_PREFIX": "///"}, "must not be empty"),
+        ({"TRAINING_MAX_ROWS": "999"}, ">= 1000"),
+        ({"SNAPSHOT_WINDOW_DAYS": "0"}, ">= 1"),
+        ({"PROMOTION_MIN_R2": "1.5"}, r"PROMOTION_MIN_R2 must be a finite number in \[-inf, 1\]"),
+        ({"PROMOTION_MIN_R2": "-inf"}, "finite"),
+        ({"PROMOTION_MIN_ROC_AUC": "nan"}, "PROMOTION_MIN_ROC_AUC"),
+        ({"PROMOTION_MIN_ROC_AUC": "high"}, "must be a number"),
+        ({"PROMOTION_F1_TOLERANCE": "-0.1"}, r"\[0, 1\]"),
     ],
 )
 def test_invalid_settings_are_rejected(env: dict[str, str], message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         load_settings(env)
+
+
+def test_promotion_and_window_settings_are_read_from_the_environment() -> None:
+    settings = load_settings(
+        {
+            "TRAINING_MAX_ROWS": "50000",
+            "SNAPSHOT_WINDOW_DAYS": "2",
+            "PROMOTION_MIN_R2": "-0.5",
+            "PROMOTION_MIN_ROC_AUC": "0.9",
+            "PROMOTION_F1_TOLERANCE": "0",
+        }
+    )
+
+    assert settings.model.training_max_rows == 50_000 and settings.snapshot_window_days == 2
+    assert settings.model.promotion == PromotionSettings(min_r2=-0.5, min_roc_auc=0.9, f1_tolerance=0.0)
