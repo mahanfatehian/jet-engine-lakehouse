@@ -1,12 +1,11 @@
-"""PostgreSQL persistence of the fleet simulator; every statement here becomes a Debezium CDC event.
+"""PostgreSQL persistence of the fleet simulator: connection, single-writer lease, transactions, resume reads.
 
-    table                    INSERT (op "c")                   UPDATE (op "u")
-    engine_status_registry   engine registration               cycle progress, status change, failure, repair
-    engine_telemetry         every pulse                       maintenance_id stamped on WARNING..FAILURE rows
-    maintenance_log          work order opened at failure      flagged-row count, repair completion
-
-Writes arrive as ordered (operation, payload) lists and each list runs in exactly ONE transaction, so a
-failure (telemetry row, work order, flags, registry) or a repair is never half visible downstream.
+Every connection first takes the single-writer lease (fleet_lease), so a second simulator never writes
+next to this one. Writes arrive as ordered (operation, payload) lists that fleet_writer executes in
+exactly ONE transaction. The simulator also owns ``simulator_lifecycle_params`` (created here at start-up,
+so existing volumes migrate on their own): the SIM_* values each lifecycle was generated with, which
+let a restart re-derive an in-progress lifecycle exactly. Debezium does not capture it: the publication
+and the connector's table.include.list name the three CDC tables explicitly.
 """
 
 from __future__ import annotations
@@ -20,11 +19,12 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import psycopg2
+from fleet_config import GenerationSettings
+from fleet_lease import WriterLease
+from fleet_writer import FleetStateError, FleetWriter
 from psycopg2.extras import execute_values
 
 if TYPE_CHECKING:
-    from engine_generator import Pulse
-    from fleet_runtime import FailureEvent, MaintenanceCompletion, RegistryUpdate
     from psycopg2.extensions import connection, cursor
 
 logger = logging.getLogger("fleet_db")
@@ -35,21 +35,23 @@ CONNECT_ATTEMPTS = 10
 RETRY_ATTEMPTS = 5
 BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS = 1.0, 30.0
 CONNECT_TIMEOUT_SECONDS = 10
-INSERT_PAGE_SIZE = 1000
-TELEMETRY_COLUMNS = (
-    "engine_id",
-    "lifecycle_id",
-    "cycle_number",
-    "event_ts",
-    "rpm",
-    "core_temp_c",
-    "egt_c",
-    "vibration_mm_s",
-    "fuel_flow_kg_h",
-    "oil_pressure_psi",
-    "wear_factor",
-    "status",
-)
+# Server-side TCP keepalive: PostgreSQL ends the session of a simulator that vanished without closing
+# its socket (and so frees the writer lock) within ~50 s, inside the lease's wait, not after 2 hours.
+SERVER_KEEPALIVE_OPTIONS = "-c tcp_keepalives_idle=20 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3"
+
+LIFECYCLE_PARAMS_DDL = """
+CREATE TABLE IF NOT EXISTS simulator_lifecycle_params (
+    engine_id         VARCHAR(32)      NOT NULL REFERENCES engine_status_registry (engine_id),
+    lifecycle_id      INTEGER          NOT NULL CHECK (lifecycle_id >= 1),
+    seed              BIGINT           NOT NULL,
+    mean_life_cycles  DOUBLE PRECISION NOT NULL CHECK (mean_life_cycles >= 2),
+    pulses_per_cycle  INTEGER          NOT NULL CHECK (pulses_per_cycle >= 1),
+    created_ts        TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    PRIMARY KEY (engine_id, lifecycle_id)
+);
+COMMENT ON TABLE simulator_lifecycle_params IS
+    'Simulator-owned (not captured by CDC): SIM_SEED, SIM_MEAN_LIFE_CYCLES and SIM_PULSES_PER_CYCLE each '
+    'engine lifecycle was generated with, so a restart re-derives it exactly after those settings change.'"""
 
 REGISTER_ENGINES_SQL = """
 INSERT INTO engine_status_registry
@@ -57,70 +59,25 @@ INSERT INTO engine_status_registry
 VALUES %s
 ON CONFLICT (engine_id) DO NOTHING"""
 
-INSERT_TELEMETRY_SQL = f"INSERT INTO engine_telemetry ({', '.join(TELEMETRY_COLUMNS)}) VALUES %s"
-
-OPEN_WORK_ORDER_SQL = """
-INSERT INTO maintenance_log
-    (engine_id, lifecycle_id, failure_cycle, failure_ts, failure_mode, maintenance_status, opened_ts, notes)
-VALUES (%(engine_id)s, %(lifecycle_id)s, %(cycle)s, %(ts)s, %(mode)s, 'OPEN', %(ts)s, %(notes)s)
-RETURNING maintenance_id"""
-
-FLAG_WARNING_ROWS_SQL = """
-UPDATE engine_telemetry SET maintenance_id = %(maintenance_id)s
- WHERE engine_id = %(engine_id)s AND lifecycle_id = %(lifecycle_id)s
-   AND status IN ('WARNING', 'CRITICAL', 'FAILURE') AND maintenance_id IS NULL"""
-
-COUNT_FLAGGED_ROWS_SQL = "UPDATE maintenance_log SET warning_rows_flagged = %s WHERE maintenance_id = %s"
-
-REGISTRY_FAILURE_SQL = """
-UPDATE engine_status_registry
-   SET operational_status = 'FAILURE', status_changed_ts = %(ts)s, current_lifecycle_id = %(lifecycle_id)s,
-       current_cycle = %(cycle)s, wear_factor = %(wear)s, cycles_since_new = %(cycles_since_new)s,
-       last_telemetry_ts = %(ts)s, updated_ts = now()
- WHERE engine_id = %(engine_id)s"""
-
-# status NULL = progress only: keep operational_status and status_changed_ts as they are.
-REGISTRY_PROGRESS_SQL = """
-UPDATE engine_status_registry
-   SET operational_status = COALESCE(%(status)s, operational_status),
-       status_changed_ts = CASE WHEN %(status)s IS NULL THEN status_changed_ts ELSE %(ts)s END,
-       current_lifecycle_id = %(lifecycle_id)s, current_cycle = %(cycle)s, wear_factor = %(wear)s,
-       cycles_since_new = %(cycles_since_new)s, last_telemetry_ts = %(ts)s, updated_ts = now()
- WHERE engine_id = %(engine_id)s"""
-
-CLOSE_WORK_ORDER_SQL = """
-UPDATE maintenance_log
-   SET maintenance_status = 'COMPLETED', completed_ts = %(ts)s, downtime_seconds = %(downtime)s,
-       action_taken = %(action)s
- WHERE engine_id = %(engine_id)s AND lifecycle_id = %(lifecycle_id)s AND maintenance_status = 'OPEN'"""
-
-REGISTRY_RESET_SQL = """
-UPDATE engine_status_registry
-   SET operational_status = 'MAINTENANCE_RESET', current_lifecycle_id = %(next_lifecycle_id)s,
-       current_cycle = 0, wear_factor = 0, lifecycles_completed = lifecycles_completed + 1,
-       last_maintenance_ts = %(ts)s, status_changed_ts = %(ts)s, updated_ts = now()
- WHERE engine_id = %(engine_id)s"""
-
 SNAPSHOT_SQL = """
 SELECT r.operational_status, r.current_lifecycle_id, r.current_cycle, r.cycles_since_new,
        p.pulses, p.last_cycle, p.last_wear,
        (SELECT max(t.event_ts) FROM engine_telemetry t WHERE t.engine_id = r.engine_id),
+       s.seed, s.mean_life_cycles, s.pulses_per_cycle,
        m.maintenance_status, m.failure_ts, m.failure_mode
   FROM engine_status_registry r
  CROSS JOIN LATERAL (
        SELECT count(*) AS pulses, max(t.cycle_number) AS last_cycle, max(t.wear_factor) AS last_wear
          FROM engine_telemetry t
         WHERE t.engine_id = r.engine_id AND t.lifecycle_id = r.current_lifecycle_id) p
+  LEFT JOIN simulator_lifecycle_params s
+         ON s.engine_id = r.engine_id AND s.lifecycle_id = r.current_lifecycle_id
   LEFT JOIN maintenance_log m ON m.engine_id = r.engine_id AND m.lifecycle_id = r.current_lifecycle_id
  WHERE r.engine_id = %s"""
 
 
 class DatabaseConnectionError(RuntimeError):
     """PostgreSQL stayed unreachable through all bounded retries, or a shutdown interrupted the wait."""
-
-
-class FleetStateError(RuntimeError):
-    """A write did not touch exactly the row it targets: database and simulator state disagree."""
 
 
 @dataclass(frozen=True)
@@ -148,6 +105,11 @@ class DatabaseSettings:
             password=env.get("POSTGRES_PASSWORD") or cls.password,
         )
 
+    @property
+    def target(self) -> str:
+        """host:port/dbname for log and error messages."""
+        return f"{self.host}:{self.port}/{self.dbname}"
+
 
 @dataclass(frozen=True)
 class WorkOrder:
@@ -160,7 +122,11 @@ class WorkOrder:
 
 @dataclass(frozen=True)
 class EngineSnapshot:
-    """Persisted state needed to resume one engine after a restart."""
+    """Persisted state needed to resume one engine after a restart.
+
+    ``settings`` are the stored generation settings of the current lifecycle: None for a lifecycle
+    without telemetry, and for one written before the simulator recorded them.
+    """
 
     engine_id: str
     operational_status: str
@@ -171,6 +137,7 @@ class EngineSnapshot:
     last_cycle_number: int | None
     last_wear_factor: float | None
     last_event_ts: datetime | None
+    settings: GenerationSettings | None
     work_order: WorkOrder | None
 
 
@@ -183,106 +150,44 @@ def _first_line(exc: BaseException) -> str:
     return str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
 
 
-def _require_one_row(cur: cursor, what: str) -> None:
-    if cur.rowcount != 1:
-        raise FleetStateError(f"{what} touched {cur.rowcount} rows instead of 1")
-
-
-class _Writer:
-    """Executes the simulator's write operations on the cursor of one transaction."""
-
-    def __init__(self, cur: cursor) -> None:
-        self._cur = cur
-
-    def apply(self, ops: Sequence[tuple[str, Any]]) -> list[Any]:
-        """Run ``ops`` in order and return each result (the work-order id for a failure)."""
-        handlers: dict[str, Callable[[Any], Any]] = {
-            "insert_pulses": self.insert_pulses,
-            "record_failure": self.record_failure,
-            "update_registry": self.update_registry,
-            "complete_maintenance": self.complete_maintenance,
-        }
-        return [handlers[name](payload) for name, payload in ops]
-
-    def insert_pulses(self, pulses: Sequence[Pulse]) -> int:
-        """Batch INSERT of telemetry rows."""
-        rows = [tuple(getattr(pulse, column) for column in TELEMETRY_COLUMNS) for pulse in pulses]
-        execute_values(self._cur, INSERT_TELEMETRY_SQL, rows, page_size=INSERT_PAGE_SIZE)
-        return len(rows)
-
-    def record_failure(self, event: FailureEvent) -> int:
-        """FAILURE row, work order, maintenance_id on the lifecycle's warning rows, registry FAILURE."""
-        pulse = event.pulse
-        params = {
-            "engine_id": pulse.engine_id,
-            "lifecycle_id": pulse.lifecycle_id,
-            "cycle": pulse.cycle_number,
-            "ts": pulse.event_ts,
-            "mode": event.failure_mode,
-            "notes": event.notes,
-            "wear": pulse.wear_factor,
-            "cycles_since_new": event.cycles_since_new,
-        }
-        self.insert_pulses([pulse])
-        self._cur.execute(OPEN_WORK_ORDER_SQL, params)
-        maintenance_id = self._cur.fetchone()[0]
-        self._cur.execute(FLAG_WARNING_ROWS_SQL, {**params, "maintenance_id": maintenance_id})
-        flagged = self._cur.rowcount
-        self._cur.execute(COUNT_FLAGGED_ROWS_SQL, (flagged, maintenance_id))
-        self._cur.execute(REGISTRY_FAILURE_SQL, params)
-        _require_one_row(self._cur, f"registry FAILURE update of {pulse.engine_id}")
-        return int(maintenance_id)
-
-    def update_registry(self, update: RegistryUpdate) -> None:
-        """Registry progress (cycle, wear, counters) and, if ``update.status`` is set, the new status."""
-        self._cur.execute(
-            REGISTRY_PROGRESS_SQL,
-            {
-                "status": update.status,
-                "ts": update.event_ts,
-                "lifecycle_id": update.lifecycle_id,
-                "cycle": update.current_cycle,
-                "wear": update.wear_factor,
-                "cycles_since_new": update.cycles_since_new,
-                "engine_id": update.engine_id,
-            },
-        )
-        _require_one_row(self._cur, f"registry update of {update.engine_id}")
-
-    def complete_maintenance(self, completion: MaintenanceCompletion) -> None:
-        """Close the OPEN work order and reset the registry into the next lifecycle."""
-        params = {
-            "engine_id": completion.engine_id,
-            "lifecycle_id": completion.lifecycle_id,
-            "next_lifecycle_id": completion.next_lifecycle_id,
-            "ts": completion.completed_ts,
-            "downtime": completion.downtime_seconds,
-            "action": completion.action_taken,
-        }
-        self._cur.execute(CLOSE_WORK_ORDER_SQL, params)
-        _require_one_row(
-            self._cur, f"work order of {completion.engine_id} lifecycle {completion.lifecycle_id}"
-        )
-        self._cur.execute(REGISTRY_RESET_SQL, params)
-        _require_one_row(self._cur, f"registry reset of {completion.engine_id}")
-
-
 class FleetDatabase:
-    """Owns the connection: bounded reconnects with exponential backoff, one transaction per write batch."""
+    """Owns the connection: bounded reconnects with exponential backoff, one transaction per write batch.
+
+    Every new session takes the single-writer lease before its first statement; WriterLockError
+    (from fleet_lease) means another simulator writes to this database and this one must stop.
+    """
 
     def __init__(self, settings: DatabaseSettings, stop_event: threading.Event) -> None:
         self._settings = settings
         self._stop = stop_event
         self._conn: connection | None = None
+        self._lease = WriterLease(stop_event)
 
     def connect(self) -> connection:
-        """Open the connection, retrying with backoff; DatabaseConnectionError once attempts run out."""
-        target = f"{self._settings.host}:{self._settings.port}/{self._settings.dbname}"
+        """Open the connection and take the writer lease on it (both with bounded retries).
+
+        Raises DatabaseConnectionError once the connection attempts run out or a shutdown request
+        interrupts the wait, and WriterLockError when another simulator holds (or held) the lease.
+        """
+        conn = self._open()
+        try:
+            acquired = self._lease.acquire(conn, self._settings.target)
+        except BaseException:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            raise DatabaseConnectionError("shutdown requested while waiting for the writer lock")
+        self._conn = conn
+        return conn
+
+    def _open(self) -> connection:
+        target = self._settings.target
         for attempt in range(1, CONNECT_ATTEMPTS + 1):
             if self._stop.is_set():
                 raise DatabaseConnectionError("shutdown requested while connecting to PostgreSQL")
             try:
-                self._conn = psycopg2.connect(
+                conn = psycopg2.connect(
                     host=self._settings.host,
                     port=self._settings.port,
                     dbname=self._settings.dbname,
@@ -290,6 +195,7 @@ class FleetDatabase:
                     password=self._settings.password,
                     connect_timeout=CONNECT_TIMEOUT_SECONDS,
                     application_name="engine-simulator",
+                    options=SERVER_KEEPALIVE_OPTIONS,
                 )
             except psycopg2.OperationalError as exc:
                 logger.warning(
@@ -303,11 +209,11 @@ class FleetDatabase:
                     self._stop.wait(backoff_delay(attempt))
             else:
                 logger.info("Connected to PostgreSQL %s", target)
-                return self._conn
+                return conn
         raise DatabaseConnectionError(f"PostgreSQL {target} unreachable after {CONNECT_ATTEMPTS} attempts")
 
     def close(self) -> None:
-        """Close the connection if open (safe to call repeatedly)."""
+        """Close the connection if open, which also releases the writer lock (safe to call repeatedly)."""
         if self._conn is not None and not self._conn.closed:
             self._conn.close()
         self._conn = None
@@ -337,14 +243,22 @@ class FleetDatabase:
     def execute(self, ops: Sequence[tuple[str, Any]]) -> list[Any] | None:
         """Run ``ops`` in ONE transaction; None when a transient error rolled it back (not retried)."""
         try:
-            return self._transaction(lambda cur: _Writer(cur).apply(ops))
+            return self._transaction(lambda cur: FleetWriter(cur).apply(ops))
         except TRANSIENT_ERRORS as exc:
             self._discard_connection(exc)
             return None
 
     def execute_with_retry(self, ops: Sequence[tuple[str, Any]]) -> list[Any]:
         """Run idempotent ``ops`` in ONE transaction, reconnecting and retrying on transient errors."""
-        return self._with_retry(lambda cur: _Writer(cur).apply(ops), "write batch")
+        return self._with_retry(lambda cur: FleetWriter(cur).apply(ops), "write batch")
+
+    def ensure_schema(self) -> None:
+        """Create the simulator-owned tables that a database initialised by an older release lacks."""
+
+        def work(cur: cursor) -> None:
+            cur.execute(LIFECYCLE_PARAMS_DDL)
+
+        self._with_retry(work, "schema check")
 
     def register_engines(self, engine_models: Mapping[str, str]) -> int:
         """INSERT a HEALTHY lifecycle-1 registry row per engine unless present; returns the rows created."""
@@ -361,17 +275,8 @@ class FleetDatabase:
 
         return self._with_retry(work, "engine registration")
 
-    def telemetry_is_empty(self) -> bool:
-        """True when engine_telemetry holds no row at all (first start of the platform)."""
-
-        def work(cur: cursor) -> bool:
-            cur.execute("SELECT NOT EXISTS (SELECT 1 FROM engine_telemetry)")
-            return bool(cur.fetchone()[0])
-
-        return self._with_retry(work, "telemetry check")
-
     def load_snapshot(self, engine_id: str) -> EngineSnapshot:
-        """Registry row, current-lifecycle progress and work order of ``engine_id``."""
+        """Registry row, current-lifecycle progress, stored generation settings and work order."""
 
         def work(cur: cursor) -> tuple[Any, ...] | None:
             cur.execute(SNAPSHOT_SQL, (engine_id,))
@@ -380,7 +285,9 @@ class FleetDatabase:
         row = self._with_retry(work, f"snapshot of {engine_id}")
         if row is None:
             raise FleetStateError(f"engine {engine_id} is not registered")
-        status, lifecycle_id, cycle, cycles_since_new, pulses, last_cycle, last_wear, last_ts, *order = row
+        status, lifecycle_id, cycle, cycles_since_new, pulses, last_cycle, last_wear, last_ts, *rest = row
+        seed, mean_life, pulses_per_cycle, *order = rest
+        settings = None if seed is None else GenerationSettings(int(seed), float(mean_life), pulses_per_cycle)
         return EngineSnapshot(
             engine_id=engine_id,
             operational_status=status,
@@ -391,5 +298,6 @@ class FleetDatabase:
             last_cycle_number=last_cycle,
             last_wear_factor=last_wear,
             last_event_ts=last_ts,
+            settings=settings,
             work_order=WorkOrder(*order) if order[0] is not None else None,
         )
