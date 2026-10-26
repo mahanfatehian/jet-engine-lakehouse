@@ -1,7 +1,9 @@
-"""Snapshot naming, discovery, retention, the snapshot job and the local artifact store."""
+"""Snapshot naming, discovery, retention, the snapshot job, the lakehouse training source and the store."""
 
 from __future__ import annotations
 
+import io
+import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -10,20 +12,25 @@ import pandas as pd
 import pytest
 from artifact_store import ArtifactNotFoundError, LocalArtifactStore
 from ds_runtime import PreconditionsNotMetError, StopToken
-from feature_pipeline import INFERENCE_FRAME_COLUMNS, SnapshotTrainingSource
+from feature_pipeline import INFERENCE_FRAME_COLUMNS
 from lakehouse_snapshots import (
     GOLD_HEALTH_STATUS,
     GOLD_TRAINING_FEATURES,
     SILVER_ROLLING_FEATURES,
     SNAPSHOT_DATASETS,
     format_snapshot_ts,
+    latest_nonempty_snapshot,
     latest_snapshot_key,
     list_snapshot_ids,
+    parquet_row_count,
     prune_snapshots,
     run_snapshot,
     snapshot_ids_to_prune,
     snapshot_key,
+    snapshot_select_sql,
 )
+from training_sources import SnapshotTrainingSource
+from training_window import plan_training_window
 
 
 class FakeExporter:
@@ -44,6 +51,13 @@ class FakeExporter:
         return destination.stat().st_size
 
 
+class TailOnlyStore(LocalArtifactStore):
+    """Local store that refuses whole-object reads, proving a reader only touches the footer."""
+
+    def get_bytes(self, key: str) -> bytes:
+        raise AssertionError(f"whole object read of {key}")
+
+
 def _tables(mart: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {
         "int_sensor_rolling_features": mart.loc[:, list(INFERENCE_FRAME_COLUMNS)],
@@ -52,11 +66,18 @@ def _tables(mart: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+def _parquet(frame: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    frame.to_parquet(buffer, index=False)
+    return buffer.getvalue()
+
+
 ENGINES = {
     "int_sensor_rolling_features": "ReplacingMergeTree",
     "mart_rul_training_features": "ReplacingMergeTree",
     "fct_engine_health_status": "MergeTree",
 }
+NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
 
 def test_snapshot_keys_follow_the_lakehouse_layout() -> None:
@@ -119,6 +140,19 @@ def test_latest_snapshot_ignores_incomplete_and_foreign_prefixes(tmp_path: Path)
     )
 
 
+def test_snapshot_query_windows_only_the_silver_features() -> None:
+    silver = snapshot_select_sql(SILVER_ROLLING_FEATURES, "ReplacingMergeTree", 7)
+    gold = snapshot_select_sql(GOLD_HEALTH_STATUS, "MergeTree", 7)
+
+    assert silver == (
+        "SELECT * FROM `int_sensor_rolling_features` FINAL WHERE `event_ts` >= "
+        "(SELECT max(`event_ts`) FROM `int_sensor_rolling_features` FINAL) - INTERVAL 7 DAY"
+    )
+    assert gold == "SELECT * FROM `fct_engine_health_status`"
+    with pytest.raises(ValueError, match="window_days"):
+        snapshot_select_sql(SILVER_ROLLING_FEATURES, "ReplacingMergeTree", 0)
+
+
 def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path, synthetic_mart) -> None:
     store = LocalArtifactStore(tmp_path)
     exporter = FakeExporter(_tables(synthetic_mart), ENGINES)
@@ -136,14 +170,49 @@ def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path
             "20261026T030000Z",
         ]
     assert all("FINAL" in query for query in exporter.queries if "int_sensor_rolling_features" in query)
+    assert all("INTERVAL 7 DAY" in query for query in exporter.queries if "int_sensor" in query)
     assert all("FINAL" not in query for query in exporter.queries if "fct_engine_health_status" in query)
 
-    source = SnapshotTrainingSource(store)
-    assert source.count_completed_lifecycles() == synthetic_mart["split_group"].nunique()
-    loaded = source.load()
+    with SnapshotTrainingSource(store) as source:
+        inventory = source.inventory()
+        assert inventory.completed_lifecycles == synthetic_mart["split_group"].nunique()
+        window = plan_training_window(inventory, max_rows=10**6, min_lifecycles=3)
+        loaded = source.load(window)
     assert loaded.data_source == "minio"
     assert loaded.source_uri.endswith("snapshot_ts=20261026T030000Z/data.parquet")
     assert len(loaded.frame) == len(synthetic_mart)
+
+
+def test_empty_datasets_are_not_published(tmp_path: Path, synthetic_mart, caplog) -> None:
+    store = LocalArtifactStore(tmp_path)
+    tables = _tables(synthetic_mart)
+    run_snapshot(FakeExporter(dict(tables), ENGINES), store, retention=5, now=NOW, stop=StopToken())
+    tables["mart_rul_training_features"] = tables["mart_rul_training_features"].iloc[0:0]
+
+    with caplog.at_level(logging.INFO, logger="lakehouse_snapshots"):
+        written = run_snapshot(
+            FakeExporter(tables, ENGINES), store, retention=5, now=NOW + timedelta(hours=1), stop=StopToken()
+        )
+
+    assert set(written) == {"int_sensor_rolling_features", "fct_engine_health_status"}
+    assert list_snapshot_ids(store, GOLD_TRAINING_FEATURES, complete_only=False) == ["20261026T120000Z"]
+    assert list_snapshot_ids(store, GOLD_HEALTH_STATUS, complete_only=True)[-1] == "20261026T130000Z"
+    assert "skipped mart_rul_training_features" in caplog.text
+
+
+def test_snapshot_job_skips_when_every_source_is_empty(tmp_path: Path, synthetic_mart) -> None:
+    store = LocalArtifactStore(tmp_path)
+    old = [f"2026102{day}T000000Z" for day in range(1, 4)]
+    for snapshot_id in old:
+        store.put_bytes(snapshot_key(GOLD_HEALTH_STATUS, snapshot_id), b"parquet")
+    empty = {table: frame.iloc[0:0] for table, frame in _tables(synthetic_mart).items()}
+
+    with pytest.raises(PreconditionsNotMetError, match="every snapshot source is empty"):
+        run_snapshot(FakeExporter(empty, ENGINES), store, retention=1, now=NOW, stop=StopToken())
+
+    # Nothing published and nothing pruned.
+    assert list_snapshot_ids(store, GOLD_HEALTH_STATUS, complete_only=False) == old
+    assert store.list_keys("silver/") == [] and store.list_keys("gold/mart") == []
 
 
 def test_snapshot_job_skips_until_every_source_table_exists(tmp_path: Path, synthetic_mart) -> None:
@@ -158,9 +227,63 @@ def test_snapshot_job_skips_until_every_source_table_exists(tmp_path: Path, synt
     assert store.list_keys("") == []
 
 
+def test_row_count_comes_from_the_parquet_footer(tmp_path: Path, synthetic_mart) -> None:
+    store = TailOnlyStore(tmp_path)
+    key = snapshot_key(GOLD_TRAINING_FEATURES, "20261026T120000Z")
+    store.put_bytes(key, _parquet(synthetic_mart.drop(columns=["status"])))
+
+    assert parquet_row_count(store, key) == len(synthetic_mart)
+    store.put_bytes(key, b"not a parquet file")
+    with pytest.raises(ValueError, match="not a Parquet file"):
+        parquet_row_count(store, key)
+
+
+def test_newest_snapshot_with_rows_wins_over_empty_and_unreadable_ones(
+    tmp_path: Path, synthetic_mart, caplog
+) -> None:
+    store = TailOnlyStore(tmp_path)
+    mart = synthetic_mart.drop(columns=["status"])
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T100000Z"), _parquet(mart.head(7)))
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T110000Z"), b"garbage")
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T120000Z"), _parquet(mart.iloc[0:0]))
+
+    with caplog.at_level(logging.INFO, logger="lakehouse_snapshots"):
+        found = latest_nonempty_snapshot(store, GOLD_TRAINING_FEATURES)
+
+    assert found is not None and (found.snapshot_ts, found.rows) == ("20261026T100000Z", 7)
+    assert "20261026T120000Z, 20261026T110000Z" in caplog.text
+    assert latest_nonempty_snapshot(store, GOLD_HEALTH_STATUS) is None
+
+
+def test_training_from_lakehouse_uses_the_newest_snapshot_with_rows(
+    tmp_path: Path, synthetic_mart, caplog
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    mart = synthetic_mart.drop(columns=["wear_factor", "status"])
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T100000Z"), _parquet(mart))
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T120000Z"), _parquet(mart.iloc[0:0]))
+    source = SnapshotTrainingSource(store)
+
+    with caplog.at_level(logging.INFO):
+        inventory = source.inventory()
+        window = plan_training_window(inventory, max_rows=len(mart) // 2, min_lifecycles=3)
+        loaded = source.load(window)
+    workdir = Path(source._workdir.name)
+    source.close()
+
+    assert inventory.completed_lifecycles == mart["split_group"].nunique()
+    assert loaded.source_uri.endswith("snapshot_ts=20261026T100000Z/data.parquet")
+    assert set(loaded.frame["split_group"]) == set(window.groups) and len(loaded.frame) <= len(mart) // 2
+    assert "training from gold snapshot" in caplog.text and "20261026T100000Z" in caplog.text
+    assert not workdir.exists()
+
+
 def test_training_from_lakehouse_skips_without_snapshots(tmp_path: Path) -> None:
-    with pytest.raises(PreconditionsNotMetError, match="no gold snapshot"):
-        SnapshotTrainingSource(LocalArtifactStore(tmp_path)).count_completed_lifecycles()
+    with (
+        SnapshotTrainingSource(LocalArtifactStore(tmp_path)) as source,
+        pytest.raises(PreconditionsNotMetError, match="no gold snapshot"),
+    ):
+        source.inventory()
 
 
 def test_local_store_writes_atomically_and_rejects_unsafe_keys(tmp_path: Path) -> None:
@@ -180,3 +303,17 @@ def test_local_store_writes_atomically_and_rejects_unsafe_keys(tmp_path: Path) -
             store.put_bytes(unsafe, b"x")
     store.delete_keys(["a/b/data.bin", "a/never-existed.bin"])
     assert store.list_keys("a/") == ["a/doc.json"]
+
+
+def test_local_store_tail_reads_and_downloads(tmp_path: Path) -> None:
+    store = LocalArtifactStore(tmp_path / "store")
+    store.put_bytes("a/data.bin", b"0123456789")
+
+    assert store.get_tail("a/data.bin", 3) == b"789"
+    assert store.get_tail("a/data.bin", 100) == b"0123456789"
+    store.download_file("a/data.bin", tmp_path / "copy.bin")
+    assert (tmp_path / "copy.bin").read_bytes() == b"0123456789"
+    with pytest.raises(ArtifactNotFoundError):
+        store.get_tail("a/missing.bin", 3)
+    with pytest.raises(ValueError, match="length"):
+        store.get_tail("a/data.bin", 0)
