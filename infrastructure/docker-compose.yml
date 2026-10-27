@@ -113,6 +113,7 @@ services:
       HF_BENCHMARK_TOPIC: ${HF_BENCHMARK_TOPIC:-engine_hf.benchmark}
       HF_TOPIC_PARTITIONS: ${HF_TOPIC_PARTITIONS:-6}
       HF_TOPIC_RETENTION_MS: ${HF_TOPIC_RETENTION_MS:-7200000}
+      HF_TOPIC_RETENTION_BYTES: ${HF_TOPIC_RETENTION_BYTES:-2147483648}
     volumes:
       - ./kafka/create-topics.sh:/scripts/create-topics.sh:ro
     restart: "no"
@@ -256,6 +257,9 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-iot_engine}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # Re-apply the idempotent init-db.sql on every start, not only on an empty volume, so
+      # tables added by a later version (the HF tables, for example) appear on an existing stack.
+      CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS: 1
       # Password of the SELECT-only `grafana` account defined in users.d/grafana-reader.xml.
       GRAFANA_CLICKHOUSE_PASSWORD: ${GRAFANA_CLICKHOUSE_PASSWORD:-grafana-readonly}
     volumes:
@@ -355,6 +359,11 @@ services:
       HF_LAKE_TRIGGER_SECONDS: ${HF_LAKE_TRIGGER_SECONDS:-60}
       HF_CLICKHOUSE_TRIGGER_SECONDS: ${HF_CLICKHOUSE_TRIGGER_SECONDS:-10}
       HF_MAX_OFFSETS_PER_TRIGGER: ${HF_MAX_OFFSETS_PER_TRIGGER:-2000}
+      # Best effort: frames the topic retention deleted before an HF query read them are
+      # skipped (true = fail like the CDC queries).
+      HF_FAIL_ON_DATA_LOSS: ${HF_FAIL_ON_DATA_LOSS:-false}
+      # Same value as minio-init: the bronze sink forgets raw frames an hour before they expire.
+      HF_BRONZE_RETENTION_DAYS: ${HF_BRONZE_RETENTION_DAYS:-1}
     volumes:
       - spark-checkpoints:/opt/spark-checkpoints
       - ./schemas:/schemas:ro
@@ -407,6 +416,7 @@ services:
       PROMOTION_MIN_R2: ${PROMOTION_MIN_R2:-0.5}
       PROMOTION_MIN_ROC_AUC: ${PROMOTION_MIN_ROC_AUC:-0.75}
       PROMOTION_F1_TOLERANCE: ${PROMOTION_F1_TOLERANCE:-0.05}
+      SPECTRAL_MAX_LAG_SECONDS: ${SPECTRAL_MAX_LAG_SECONDS:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PIPELINE_GATE_ON_DBT_TESTS: ${PIPELINE_GATE_ON_DBT_TESTS:-true}
       # Shared with every `docker compose run --rm orchestrator` container, so manual

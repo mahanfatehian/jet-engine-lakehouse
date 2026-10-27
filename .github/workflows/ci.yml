@@ -7,8 +7,9 @@
 #
 #   lint              push to main, PR   make lint (ruff check + format check), pinned ruff
 #   unit-tests        push to main, PR   images built from docker-compose.yml (GHA layer cache),
-#                                        pytest inside them like make test-platform (tests/) and
-#                                        make test-streaming (tests/streaming, Spark + Java)
+#                                        pytest inside them like make test-platform (tests/),
+#                                        make test-streaming (tests/streaming, Spark + Java) and
+#                                        make test-simulator (tests/simulator, Kafka + Avro)
 #   dbt-integration   push to main, PR   tests/analytics/run_dbt_integration.sh
 #   compose-config    push to main, PR   docker-compose.yml renders without any .env file
 #                                        (inline defaults) and with .env.example
@@ -77,15 +78,14 @@ jobs:
       matrix:
         include:
           # `make test-platform`: tests/ inside the data-platform image (compose service
-          # `orchestrator`). tests/simulator runs here as well (numpy is all it needs), so the
-          # simulator image has no suite of its own; it is built in this leg so that a broken
-          # Dockerfile still fails CI. Only the PySpark modules may skip here (they run in the
-          # streaming leg): any other import skip means the image lost a dependency.
+          # `orchestrator`). Only the PySpark modules (streaming leg) and the Avro round trip
+          # with fastavro (simulator leg) may skip here: any other import skip means the image
+          # lost a dependency.
           - suite: data-platform
-            targets: orchestrator,simulator
+            targets: orchestrator
             image: iot-engine/data-platform:latest
             tests: tests
-            fail-on-skip: "could not import '(?!pyspark')"
+            fail-on-skip: "could not import '(?!pyspark'|fastavro')"
           # `make test-streaming`: tests/streaming inside the streaming image, the only one with
           # Spark, Java and the connector jars. As in the Makefile, any skip fails the leg.
           - suite: streaming
@@ -93,6 +93,17 @@ jobs:
             image: iot-engine/streaming:latest
             tests: tests/streaming
             fail-on-skip: "."
+          # `make test-simulator`: tests/simulator inside the simulator image, which has the
+          # Kafka client and fastavro, so the frames are checked against the real Avro schema.
+          # The runtime image ships no pytest; this leg installs it into the container first.
+          # Only the check against the streaming feature code may skip (it needs pandas and
+          # runs in the data-platform leg).
+          - suite: simulator
+            targets: simulator
+            image: iot-engine/simulator:latest
+            tests: tests/simulator
+            fail-on-skip: "^(?!could not import 'pandas')"
+            pytest-install: pytest==9.1.1
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -127,19 +138,27 @@ jobs:
           SUITE: ${{ matrix.suite }}
           IMAGE: ${{ matrix.image }}
           TEST_PATHS: ${{ matrix.tests }}
+          PYTEST_INSTALL: ${{ matrix.pytest-install }}
         run: |
           results="$RUNNER_TEMP/test-results"
           # The images run as an unprivileged user (uid 10001), which writes the report.
           install -d -m 0777 "$results"
-          # As in `make test`, the repository is mounted read-only and nothing is written into it.
+          # As in `make test`, the repository is mounted read-only and nothing is written into it;
+          # an image without pytest gets it in /tmp/test-deps inside the throwaway container.
           # Hang protection inside the container: faulthandler prints every thread's stack once a
           # single test runs for 5 minutes, and after 15 minutes timeout interrupts pytest, which
           # still writes the JUnit report (the step then fails with exit code 124).
           docker run --rm --init \
             -v "$GITHUB_WORKSPACE:/src:ro" -v "$results:/test-results" -w /src \
-            -e PYTHONDONTWRITEBYTECODE=1 --entrypoint timeout "$IMAGE" --signal=INT --kill-after=1m 15m \
-            python -m pytest -p no:cacheprovider -rfEs -o faulthandler_timeout=300 \
-            --junitxml="/test-results/$SUITE.xml" -o junit_suite_name="$SUITE" "$TEST_PATHS"
+            -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/tmp/test-deps -e PYTEST_INSTALL \
+            -e SUITE -e TEST_PATHS --entrypoint sh "$IMAGE" -c '
+              if [ -n "$PYTEST_INSTALL" ]; then
+                pip install --quiet --disable-pip-version-check --no-cache-dir --retries 5 \
+                  --target /tmp/test-deps "$PYTEST_INSTALL" || exit 1
+              fi
+              exec timeout --signal=INT --kill-after=1m 15m \
+                python -m pytest -p no:cacheprovider -rfEs -o faulthandler_timeout=300 \
+                --junitxml="/test-results/$SUITE.xml" -o junit_suite_name="$SUITE" "$TEST_PATHS"'
 
       - name: Summarise the JUnit report, fail on forbidden skips
         if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
@@ -234,7 +253,8 @@ jobs:
       - name: Remove the integration containers and network
         if: always()
         run: |
-          docker ps -aq --filter name=tmp-analytics- | xargs -r docker rm -f
+          # -v: the ClickHouse image declares a VOLUME, whose anonymous volume would outlive it
+          docker ps -aq --filter name=tmp-analytics- | xargs -r docker rm -f -v
           docker network ls -q --filter name=tmp-analytics- | xargs -r docker network rm
 
   compose-config:

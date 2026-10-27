@@ -31,12 +31,17 @@ done
 
 # High-frequency sensor frames: high volume, best effort, short retention; frames of
 # kHz waveforms can be a few MB, so the message size limit is raised for this topic only.
+# retention.bytes (per partition, enforced per 256 MiB segment) caps the disk the frames can
+# take on the broker the CDC topics share: at the default fidelity two hours of frames stay far
+# below it, at full fidelity it binds within minutes instead of the disk filling up.
 ensure_topic "${HF_TOPIC:-engine_hf.sensor_frames}" "${HF_TOPIC_PARTITIONS:-6}" \
-    "retention.ms=${HF_TOPIC_RETENTION_MS:-7200000}" max.message.bytes=8388608 \
-    segment.ms=600000 cleanup.policy=delete
+    "retention.ms=${HF_TOPIC_RETENTION_MS:-7200000}" \
+    "retention.bytes=${HF_TOPIC_RETENTION_BYTES:-2147483648}" segment.bytes=268435456 \
+    max.message.bytes=8388608 segment.ms=600000 cleanup.policy=delete
 
-# Load-test topic: no consumer, ten minutes of retention.
+# Load-test topic: no consumer, ten minutes and at most 1 GiB per partition of retention.
 ensure_topic "${HF_BENCHMARK_TOPIC:-engine_hf.benchmark}" "${HF_TOPIC_PARTITIONS:-6}" \
-    retention.ms=600000 max.message.bytes=8388608 segment.ms=300000 cleanup.policy=delete
+    retention.ms=600000 retention.bytes=1073741824 segment.bytes=268435456 \
+    max.message.bytes=8388608 segment.ms=300000 cleanup.policy=delete
 
 kafka-topics --bootstrap-server "${bootstrap}" --list

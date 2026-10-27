@@ -134,11 +134,35 @@ GROUP BY kafka_topic, error_prefix
 ORDER BY records DESC
 LIMIT 10;
 
+SELECT '\n== 7b. High-frequency (HF) frame features: landed frames and freshness (best effort) ==' FORMAT TSVRaw;
+SELECT
+    count() AS frame_copies,
+    uniqExact(engine_id, telemetry_id) AS frames,
+    uniqExact(engine_id) AS engines,
+    maxOrNull(frame_start_ts) AS latest_frame_ts,
+    maxOrNull(ingested_at) AS last_ingested_at,
+    dateDiff('second', maxOrNull(ingested_at), now64(3)) AS seconds_since_last_ingest
+FROM raw_engine_hf_features;
+SELECT
+    count() AS batches_last_15m,
+    sum(frames) AS frames_last_15m,
+    round(quantileOrNull(0.5)(duration_ms) / 1000, 3) AS batch_duration_p50_s,
+    round(quantileOrNull(0.95)(toUnixTimestamp64Milli(ingested_at) - toUnixTimestamp64Milli(max_frame_ts)) / 1000, 3)
+        AS newest_frame_lag_p95_s
+FROM hf_ingest_batches
+WHERE batch_started_at >= now64(3) - INTERVAL 15 MINUTE;
+
 SELECT '\n== 8. dbt models: row counts (UNKNOWN_TABLE = not built by dbt yet) ==' FORMAT TSVRaw;
 SELECT 'stg_engine_telemetry' AS model, count() AS row_count
 FROM stg_engine_telemetry SETTINGS final = 1;
 SELECT 'int_sensor_rolling_features' AS model, count() AS row_count
 FROM int_sensor_rolling_features SETTINGS final = 1;
+SELECT 'stg_engine_hf_features' AS model, count() AS row_count
+FROM stg_engine_hf_features SETTINGS final = 1;
+SELECT 'int_vibration_features' AS model, count() AS row_count
+FROM int_vibration_features SETTINGS final = 1;
+SELECT 'int_ml_features' AS model, count() AS row_count
+FROM int_ml_features SETTINGS final = 1;
 SELECT 'mart_rul_training_features' AS model, count() AS row_count
 FROM mart_rul_training_features SETTINGS final = 1;
 SELECT 'fct_engine_health_status' AS model, count() AS row_count
@@ -268,16 +292,24 @@ FROM
         7,
         'dbt silver/gold models built',
         if(empty(missing), 'OK', 'FAIL'),
-        if(empty(missing), 'all 4 checked models exist', concat('missing: ', arrayStringConcat(missing, ', ')))
+        if(empty(missing), 'all 7 checked models exist', concat('missing: ', arrayStringConcat(missing, ', ')))
     FROM
     (
         SELECT arrayFilter(
             model -> NOT has(built, model),
-            ['stg_engine_telemetry', 'int_sensor_rolling_features',
-             'mart_rul_training_features', 'fct_engine_health_status']
+            ['stg_engine_telemetry', 'int_sensor_rolling_features', 'stg_engine_hf_features',
+             'int_vibration_features', 'int_ml_features', 'mart_rul_training_features',
+             'fct_engine_health_status']
         ) AS missing
         FROM (SELECT groupArray(name) AS built FROM system.tables WHERE database = currentDatabase())
     )
+    UNION ALL
+    SELECT
+        8,
+        'HF frame features ingested within the last 5 minutes (best effort)',
+        if(maxOrNull(ingested_at) >= now64(3) - INTERVAL 5 MINUTE, 'OK', 'WARN'),
+        concat('last frame ', ifNull(toString(maxOrNull(ingested_at)), 'never'))
+    FROM raw_engine_hf_features
 )
 ORDER BY ord
 FORMAT TSVRaw;

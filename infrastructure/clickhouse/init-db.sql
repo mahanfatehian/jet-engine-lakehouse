@@ -226,7 +226,7 @@ CREATE TABLE IF NOT EXISTS raw_engine_hf_features
     kafka_offset              Int64,
     ingested_at               DateTime64(3, 'UTC') DEFAULT now64(3)
 )
-ENGINE = ReplacingMergeTree
+ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMM(frame_start_ts)
 ORDER BY (engine_id, telemetry_id)
 TTL toDateTime(frame_start_ts) + INTERVAL 90 DAY

@@ -1,8 +1,12 @@
 #!/bin/bash
-# Applies init-db.sql to $CLICKHOUSE_DB on first boot.
+# Applies init-db.sql to $CLICKHOUSE_DB on every start of the container.
 #
 # The clickhouse-server entrypoint runs (or sources) every *.sh file in
-# /docker-entrypoint-initdb.d while a temporary server listens on 127.0.0.1.
+# /docker-entrypoint-initdb.d while a temporary server listens on 127.0.0.1:
+# on an empty volume, and on every start because docker-compose.yml sets
+# CLICKHOUSE_ALWAYS_RUN_INITDB_SCRIPTS. init-db.sql only creates what is
+# missing (IF NOT EXISTS), so an existing stack gains the tables of a newer
+# version and keeps its data.
 # The SQL file is mounted outside that directory on purpose: the entrypoint
 # would otherwise execute it without a database context. The work happens in
 # a subshell so `set -euo pipefail` never leaks into the sourcing entrypoint.

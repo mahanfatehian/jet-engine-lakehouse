@@ -72,9 +72,11 @@ warns if the labels it recomputes disagree with the mart's.
 
 ## 3. Features
 
-46 numeric features per pulse, computed in dbt
-([`int_sensor_rolling_features`](../analytics/models/silver/int_sensor_rolling_features.sql)) and
-shared verbatim by training and inference, so there is no train/serve skew:
+56 numeric features per pulse: the 46 pulse features computed in dbt
+([`int_sensor_rolling_features`](../analytics/models/silver/int_sensor_rolling_features.sql)) plus 10
+spectral features from the high-frequency path, joined per pulse by the view
+[`int_ml_features`](../analytics/models/silver/int_ml_features.sql) and shared verbatim by training
+and inference, so there is no train/serve skew:
 
 | Family | Columns |
 |---|---|
@@ -83,6 +85,11 @@ shared verbatim by training and inference, so there is no train/serve skew:
 | Rolling windows (24) | mean, std, min and max over **5 and 15 minutes** for vibration, EGT and oil pressure |
 | Dynamics (9) | `*_delta_1` (pulse-to-pulse change), `*_roc_5m` / `*_roc_15m` (change per minute across the window) |
 | Drift (6) | EGT and core-temperature drift, vibration ratio, oil-pressure drop, fuel-flow and rpm drift in %, all against an *expanding* baseline of the lifecycle's first 10 cycles |
+| Spectral (10, HF path) | 5-minute means of the fan bearing-defect (BPFO) amplitude, fan kurtosis and crest factor, fan 1×N1 and core 1×N2 amplitudes, fan high-frequency energy share, oil temperature, oil quantity, oil filter ΔP and the EGT A/B sensor split |
+
+The spectral features are the only ones allowed to be missing (HF disabled, lagging or a dropped
+frame); XGBoost and the classifier treat them as missing values, while a missing pulse feature fails
+the job.
 
 Plus `engine_model` one-hot (categories persisted with the model). Windows are time ranges
 (`RANGE BETWEEN 300 PRECEDING AND CURRENT ROW` over epoch seconds) partitioned by engine
@@ -128,6 +135,24 @@ ROC-AUC 0.99, Brier 0.028, ECE 0.017**. The live backtest of the models trained 
 the lifecycles that failed after each went live, agrees: RMSE 13–17 cycles, recall 0.88–0.96 and a
 median warning 17–30 cycles before the failure.
 
+6. **Spectral ablation (evidence only):** every run also refits both models without the 10
+   spectral features on the identical split and scores them on the same holdout. The comparison
+   (RMSE, MAE, R², late-life RMSE, F1, ROC-AUC, the spectral share of the regressor's gain, HF
+   coverage, extra seconds) is logged and stored as `ablation` in `metrics.json`, `metadata.json`
+   and `ml_model_runs.params_json`. It never influences promotion and adds roughly 40 % to a run.
+
+   **What it showed.** One run's holdout is small (3 to 9 lifecycles), so on a fresh stack's 24
+   backfilled lifecycles (100 % spectral coverage) the comparison was repeated over 8 different
+   lifecycle splits (`split_groups` seeds 1 to 8). With the spectral features the RUL regressor did
+   not improve (mean holdout RMSE 12.0 vs 11.4 cycles, worse in 6 of 8 splits), the classifier's
+   F1 did not either (0.824 vs 0.836), and only the failure probability was slightly better
+   calibrated (Brier 0.033 vs 0.036, better in 7 of 8). In this simulation the fan channel's RMS
+   equals the 1 Hz vibration reading by construction and the same wear drives every 1 Hz drift, so
+   the frames add failure-mode signatures rather than new information about how far the wear has
+   progressed. Those signatures pay off in the bearing-defect flag of the fleet board, which
+   fired in every bearing-degradation and oil-leak lifecycle and in none of the 14 hot-section or
+   compressor failures.
+
 ## 5. Promotion, artifacts and the registry
 
 - **Quality floors.** Every promotion, under any policy, requires holdout R² ≥ `PROMOTION_MIN_R2`
@@ -137,7 +162,9 @@ median warning 17–30 cycles before the failure.
   have a lower RMSE and may lose at most `PROMOTION_F1_TOLERANCE` (0.05) classifier F1. The gate
   fails **closed**: if the champion cannot be loaded or scored, nothing is promoted and the run is
   recorded with `promoted = 0`. Only a planned change (a different feature schema or bundle format,
-  or a legacy pointer without a digest) lets the floors decide alone. `always` skips the
+  or a legacy pointer without a digest) lets the floors decide alone; a champion trained on the
+  46 pulse features is re-scored on its own columns of the same holdout and compared normally.
+  `always` skips the
   comparison, never the floors; `make train-ml ARGS="--promotion-policy always"` is the escape
   hatch when a champion is permanently unloadable. `production.json` is replaced atomically.
 - **Artifacts** go to `s3://lakehouse/ml-artifacts/rul_model/rul-<UTC timestamp>/`:
@@ -155,8 +182,10 @@ median warning 17–30 cycles before the failure.
 ## 6. Inference
 
 [`predict_rul.py`](../data_science/predict_rul.py) loads the model named by `production.json`,
-takes the newest feature row of every engine (`int_sensor_rolling_features FINAL`, `LIMIT 1 BY
-engine_id`) and writes to `gold_engine_rul_predictions`:
+takes the newest pulse of every engine from the view `int_ml_features` (`LIMIT 1 BY engine_id`;
+when that pulse's HF frame has not landed yet, its spectral features come from the engine's newest
+landed frame of the same lifecycle at most `SPECTRAL_MAX_LAG_SECONDS` older) and writes to
+`gold_engine_rul_predictions`:
 
 | Column | Meaning |
 |---|---|

@@ -20,6 +20,10 @@ done
 
 # Tiering: raw high-frequency frames are the bulk of the volume and only needed for
 # replay/reprocessing, so they expire; features derived from them live on in silver.
+# The prefix covers only the ingest_date= partitions and spares the file sink's
+# bronze/engine_sensor_frames/_spark_metadata/ log: if those objects expired while the
+# streaming job was stopped, its bronze query would fail on every restart with
+# BATCH_METADATA_NOT_FOUND (the sink drops expired files from its log by itself).
 # `mc ilm import` replaces the whole bucket lifecycle, which keeps reruns idempotent.
 cat > /tmp/lakehouse-lifecycle.json <<EOF
 {
@@ -27,13 +31,13 @@ cat > /tmp/lakehouse-lifecycle.json <<EOF
     {
       "ID": "expire-raw-hf-sensor-frames",
       "Status": "Enabled",
-      "Filter": {"Prefix": "bronze/engine_sensor_frames/"},
+      "Filter": {"Prefix": "bronze/engine_sensor_frames/ingest_date="},
       "Expiration": {"Days": ${hf_retention_days}}
     }
   ]
 }
 EOF
 mc ilm import "lake/${bucket}" < /tmp/lakehouse-lifecycle.json > /dev/null
-echo "init-buckets: lifecycle -> bronze/engine_sensor_frames/ expires after ${hf_retention_days} day(s)"
+echo "init-buckets: lifecycle -> bronze/engine_sensor_frames/ingest_date=*/ expires after ${hf_retention_days} day(s)"
 
 mc ls "lake/${bucket}"

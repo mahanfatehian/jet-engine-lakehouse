@@ -54,6 +54,10 @@ GRAFANA_PORT ?= $(call knob,GRAFANA_PORT,3000)
 SCHEMA_REGISTRY_PORT ?= $(call knob,SCHEMA_REGISTRY_PORT,8081)
 DATA_PLATFORM_IMAGE ?= iot-engine/data-platform:latest
 STREAMING_IMAGE ?= iot-engine/streaming:latest
+SIMULATOR_IMAGE ?= iot-engine/simulator:latest
+LOAD_TEST_SECONDS ?= 60
+LOAD_TEST_ENGINES ?= 24
+LOAD_TEST_ARGS ?=
 RUFF_IMAGE ?= ghcr.io/astral-sh/ruff:0.17.1
 PYTEST_VERSION ?= 9.1.1
 TEST_PATHS ?= tests
@@ -130,7 +134,8 @@ STREAMING_PYTEST = python -m pytest -p no:cacheprovider -rs --junitxml=/tmp/stre
 
 .PHONY: help up down clean ps logs build urls register-cdc cdc-status stream dbt-run dbt-test \
 	snapshot train-ml predict-ml pipeline-once verify verify-postgres verify-minio \
-	verify-clickhouse ch-init psql ch-client test test-platform test-streaming lint
+	verify-clickhouse ch-init psql ch-client test test-platform test-streaming test-simulator \
+	load-test lint
 
 help: ## Show this help (default target)
 	@echo "IoT Jet Engine Lakehouse - make targets (run from the repository root)"
@@ -147,6 +152,9 @@ help: ## Show this help (default target)
 		'ML_ARTIFACT_PREFIX=$(ML_ARTIFACT_PREFIX)' 'model registry prefix read by verify-minio' \
 		'TEST_PATHS=$(TEST_PATHS)' 'pytest targets (test-platform)' \
 		'STREAMING_TEST_PATHS=$(STREAMING_TEST_PATHS)' 'pytest targets (test-streaming)' \
+		'LOAD_TEST_SECONDS=$(LOAD_TEST_SECONDS)' 'load-test duration in seconds' \
+		'LOAD_TEST_ENGINES=$(LOAD_TEST_ENGINES)' 'synthetic engines in the load test' \
+		'LOAD_TEST_ARGS="..."' 'extra --benchmark-* flags (load-test), e.g. full fidelity' \
 		'LINT_PATHS=$(LINT_PATHS)' 'ruff targets (lint)' \
 		'CLEAN_GRACE_SECONDS=$(CLEAN_GRACE_SECONDS)' 'abort window before clean deletes the volumes'
 	@echo "LAKEHOUSE_BUCKET, ML_ARTIFACT_PREFIX, BIND_HOST and the *_PORT knobs default to the"
@@ -243,7 +251,7 @@ psql: ## Interactive psql session on the operational Postgres database
 ch-client: ## Interactive clickhouse-client session on the lakehouse database
 	$(COMPOSE) exec clickhouse sh -c '$(CH_CLIENT)'
 
-test: test-platform test-streaming ## Run every unit test: data-platform image, then the streaming image
+test: test-platform test-streaming test-simulator ## Run every unit test: data-platform, streaming and simulator images
 
 test-platform: ## Unit tests in the data-platform image (the PySpark modules run in test-streaming)
 	$(COMPOSE) build orchestrator
@@ -255,6 +263,16 @@ test-streaming: ## tests/streaming incl. the PySpark tests in the streaming imag
 	$(COMPOSE) build streaming
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
 		$(STREAMING_IMAGE) -c '$(STREAMING_PYTEST)'
+
+test-simulator: ## tests/simulator in the simulator image (has fastavro: runs the real-schema Avro round trip)
+	$(COMPOSE) build simulator
+	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
+		$(SIMULATOR_IMAGE) -c '($(PYTEST_BOOTSTRAP)) \
+		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs tests/simulator'
+
+load-test: ## HF producer load test (needs make up): frames/s, MB/s, latency, 30 TB / 30 min projection
+	$(COMPOSE) run --rm --no-deps simulator python engine_generator.py --benchmark \
+		--benchmark-seconds $(LOAD_TEST_SECONDS) --benchmark-engines $(LOAD_TEST_ENGINES) $(LOAD_TEST_ARGS)
 
 lint: ## Lint (ruff check) and format-check (ruff format --check) the Python code
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src $(RUFF_IMAGE) check --no-cache $(LINT_PATHS)
