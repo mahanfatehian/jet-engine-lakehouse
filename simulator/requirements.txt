@@ -1,2 +1,27 @@
+# Simulator image (python:3.12-slim-bookworm). Direct dependencies are pinned by the interface contract; the
+# rest is the exact transitive set of confluent-kafka[avro,schemaregistry]==2.16.0, resolved with
+#   uv pip compile --python-version 3.12 --python-platform x86_64-manylinux_2_28
 psycopg2-binary==2.9.13
 numpy==2.5.4
+confluent-kafka[avro,schemaregistry]==2.16.0
+# transitive dependencies of confluent-kafka[avro,schemaregistry]
+anyio==4.15.1
+attrs==26.1.0
+authlib==1.9.1
+avro==1.12.2
+cachetools==7.2.5
+certifi==2026.10.23
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+fastavro==1.13.1
+h11==0.16.0
+httpcore2==2.16.0
+httpx2==2.16.0
+idna==3.20
+joserfc==1.7.7
+pycparser==3.12
+requests==2.34.2
+truststore==0.10.5
+typing-extensions==4.16.0
+urllib3==2.8.0

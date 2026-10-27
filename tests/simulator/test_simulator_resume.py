@@ -1,5 +1,6 @@
 """Restart semantics of the simulator against an in-memory database: stored per-lifecycle settings,
-adoption or refusal of lifecycles written before they were stored, and per-engine backfill."""
+adoption or refusal of lifecycles written before they were stored, per-engine backfill, and the HF frame
+identity (frame_seq, telemetry_id, frame_start_ts) across restarts."""
 
 from __future__ import annotations
 
@@ -15,7 +16,8 @@ import engine_generator as eg
 import pytest
 from fleet_bootstrap import ResumeMismatchError, bootstrap_fleet
 from fleet_config import GenerationSettings, SimulatorConfig
-from fleet_runtime import FleetRunner
+from fleet_runtime import FleetRunner, RecordedFailure
+from hf_frames import FrameRequest, FrameTap
 
 OLD = SimulatorConfig(
     engine_ids=("JT9D-001", "CFM56-104", "GE90-201"),
@@ -30,11 +32,16 @@ T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 class MemoryFleetDB:
-    """Applies the simulator's write ops to in-memory tables; serves snapshots like fleet_db.SNAPSHOT_SQL."""
+    """Applies the simulator's write ops to in-memory tables; serves snapshots like fleet_db.SNAPSHOT_SQL.
+
+    Telemetry rows get BIGSERIAL-like ids (``ids`` maps (engine_id, event_ts) to them), returned like
+    fleet_writer returns them: a list per insert_pulses, a RecordedFailure per record_failure.
+    """
 
     def __init__(self) -> None:
         self.registry: dict[str, dict[str, Any]] = {}
         self.telemetry: list[eg.Pulse] = []
+        self.ids: dict[tuple[str, datetime], int] = {}
         self.work_orders: dict[tuple[str, int], dict[str, Any]] = {}
         self.settings: dict[tuple[str, int], GenerationSettings] = {}
         self.transactions = 0
@@ -61,12 +68,15 @@ class MemoryFleetDB:
     def _record_settings(self, record: Any) -> None:
         self.settings[(record.engine_id, record.lifecycle_id)] = record.settings
 
-    def _insert_pulses(self, pulses: list[eg.Pulse]) -> None:
+    def _insert_pulses(self, pulses: list[eg.Pulse]) -> list[int]:
         self.telemetry.extend(pulses)
+        for pulse in pulses:
+            self.ids[(pulse.engine_id, pulse.event_ts)] = len(self.ids) + 1
+        return [self.ids[(pulse.engine_id, pulse.event_ts)] for pulse in pulses]
 
-    def _record_failure(self, event: Any) -> int:
+    def _record_failure(self, event: Any) -> RecordedFailure:
         pulse = event.pulse
-        self.telemetry.append(pulse)
+        (telemetry_id,) = self._insert_pulses([pulse])
         key = (pulse.engine_id, pulse.lifecycle_id)
         self.work_orders[key] = {
             "status": "OPEN",
@@ -75,7 +85,7 @@ class MemoryFleetDB:
         }
         self.registry[pulse.engine_id] |= {"status": "FAILURE", "cycle": pulse.cycle_number}
         self.registry[pulse.engine_id]["csn"] = event.cycles_since_new
-        return len(self.work_orders)
+        return RecordedFailure(len(self.work_orders), telemetry_id)
 
     def _update_registry(self, update: Any) -> None:
         row = self.registry[update.engine_id]
@@ -91,6 +101,9 @@ class MemoryFleetDB:
         row = self.registry[completion.engine_id]
         row |= {"status": "MAINTENANCE_RESET", "lifecycle": completion.next_lifecycle_id, "cycle": 0}
         row["done"] += 1
+
+    def telemetry_counts(self, engine_ids: list[str]) -> dict[str, int]:
+        return {engine_id: len(self.rows(engine_id)) for engine_id in engine_ids}
 
     def rows(self, engine_id: str, lifecycle_id: int | None = None) -> list[eg.Pulse]:
         return sorted(
@@ -264,3 +277,49 @@ def test_engine_added_to_the_fleet_later_gets_history_too() -> None:
     assert first_live.event_ts == base + timedelta(seconds=second), "history ends before its live pulses"
     for engine_id, count in rows_before.items():
         assert len(db.rows(engine_id)) == count + 1, f"{engine_id} only got its live pulse"
+
+
+class RecordingPublisher:
+    """hf_producer.FramePublisher stand-in that keeps every frame request it is handed."""
+
+    def __init__(self) -> None:
+        self.frames: list[FrameRequest] = []
+
+    def submit(self, requests: list[FrameRequest]) -> None:
+        self.frames.extend(requests)
+
+    submit_backfill = submit
+
+
+def start_with_frames(
+    db: MemoryFleetDB, config: SimulatorConfig, publisher: RecordingPublisher
+) -> FleetRunner:
+    """One simulator start with the HF tap wired in like engine_generator.main does (counts read first)."""
+    stop = threading.Event()
+    factory = functools.partial(eg.EngineSimulator, config=config)
+    models = {engine_id: eg.build_profile(engine_id).engine_model for engine_id in config.engine_ids}
+    tap = FrameTap(publisher, models, db.telemetry_counts(list(config.engine_ids)))
+    engines = bootstrap_fleet(
+        db, config, factory, models, allow_backfill=True, stop_event=stop, on_commit=tap.backfill
+    )
+    return FleetRunner(engines, db, config, stop, tap.live)
+
+
+def test_frames_carry_the_pulse_ordinal_row_id_and_event_time_across_restarts() -> None:
+    config = replace(OLD, backfill_lifecycles=1)
+    db, publisher, base = MemoryFleetDB(), RecordingPublisher(), datetime.now(UTC)
+    second = run(start_with_frames(db, config, publisher), 0, 25, base)
+    # Restart with one more engine: the others resume their sequence, the newcomer is backfilled from 1.
+    grown = replace(config, engine_ids=(*config.engine_ids, "GE90-202"))
+    run(start_with_frames(db, grown, publisher), second + 10, 25, base)
+    for engine_id in grown.engine_ids:
+        rows = db.rows(engine_id)
+        frames = [frame for frame in publisher.frames if frame.engine_id == engine_id]
+        assert len(rows) > 25 and len(frames) == len(rows), "one frame per committed pulse"
+        assert [frame.frame_seq for frame in frames] == list(range(1, len(rows) + 1))
+        assert [frame.frame_start for frame in frames] == [pulse.event_ts for pulse in rows]
+        assert [frame.telemetry_id for frame in frames] == [db.ids[(engine_id, p.event_ts)] for p in rows]
+        assert [(f.lifecycle_id, f.cycle_number) for f in frames] == [
+            (p.lifecycle_id, p.cycle_number) for p in rows
+        ]
+        assert {frame.engine_model for frame in frames} == {eg.build_profile(engine_id).engine_model}

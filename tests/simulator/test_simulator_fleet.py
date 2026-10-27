@@ -13,7 +13,14 @@ import engine_generator as eg
 import pytest
 from fleet_bootstrap import backfill_fleet, bootstrap_fleet, restore_engine
 from fleet_config import GenerationSettings, SimulatorConfig
-from fleet_runtime import FleetRunner, LifecycleSettings, build_tick_ops, completion_at, registry_update
+from fleet_runtime import (
+    FleetRunner,
+    LifecycleSettings,
+    RecordedFailure,
+    build_tick_ops,
+    completion_at,
+    registry_update,
+)
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 SMALL = SimulatorConfig(
@@ -30,7 +37,8 @@ STATUS_ORDER = {"HEALTHY": 0, "WARNING": 1, "CRITICAL": 2, "FAILURE": 3}
 class FakeStore:
     """In-memory stand-in for fleet_db.FleetDatabase that records every transaction.
 
-    ``with_telemetry`` names the engines whose snapshot shows earlier telemetry (all others are fresh).
+    Like fleet_writer, insert_pulses returns the generated telemetry_ids and record_failure a
+    RecordedFailure. ``with_telemetry`` names the engines whose snapshot shows earlier telemetry.
     """
 
     def __init__(self, *, with_telemetry: tuple[str, ...] = ()) -> None:
@@ -40,20 +48,22 @@ class FakeStore:
         self.registered: dict[str, str] = {}
         self.schema_checks = 0
         self._work_orders = 0
+        self._telemetry_ids = itertools.count(1)
 
     def execute(self, ops: list[tuple[str, Any]]) -> list[Any] | None:
         if self.drop_next:
             self.drop_next = False
             return None
         self.transactions.append(list(ops))
-        results: list[Any] = []
-        for name, _ in ops:
-            if name == "record_failure":
-                self._work_orders += 1
-                results.append(self._work_orders)
-            else:
-                results.append(None)
-        return results
+        return [self._result(name, payload) for name, payload in ops]
+
+    def _result(self, name: str, payload: Any) -> Any:
+        if name == "insert_pulses":
+            return [next(self._telemetry_ids) for _ in payload]
+        if name == "record_failure":
+            self._work_orders += 1
+            return RecordedFailure(self._work_orders, next(self._telemetry_ids))
+        return None
 
     def execute_with_retry(self, ops: list[tuple[str, Any]]) -> list[Any]:
         results = self.execute(ops)

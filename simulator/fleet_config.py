@@ -18,7 +18,8 @@ MAX_ENGINE_ID_LENGTH = 32  # engine_status_registry.engine_id is VARCHAR(32)
 SEED_RANGE = (-(2**63), 2**63 - 1)  # simulator_lifecycle_params.seed is a BIGINT
 
 
-def _env_value(env: Mapping[str, str], name: str, cast: Callable[[str], Any], default: Any) -> Any:
+def env_value(env: Mapping[str, str], name: str, cast: Callable[[str], Any], default: Any) -> Any:
+    """``cast`` of the variable ``name``: ``default`` when unset or blank, ValueError naming it if invalid."""
     raw = env.get(name, "").strip()
     if not raw:
         return default
@@ -105,12 +106,12 @@ class SimulatorConfig:
         engine_ids = tuple(part.strip() for part in raw_ids.split(",") if part.strip())
         return cls(
             engine_ids=engine_ids if raw_ids else DEFAULT_ENGINE_IDS,
-            tick_seconds=_env_value(env, "SIM_TICK_SECONDS", float, cls.tick_seconds),
-            pulses_per_cycle=_env_value(env, "SIM_PULSES_PER_CYCLE", int, cls.pulses_per_cycle),
-            mean_life_cycles=_env_value(env, "SIM_MEAN_LIFE_CYCLES", float, cls.mean_life_cycles),
-            backfill_lifecycles=_env_value(env, "SIM_BACKFILL_LIFECYCLES", int, cls.backfill_lifecycles),
-            maintenance_seconds=_env_value(env, "SIM_MAINTENANCE_SECONDS", float, cls.maintenance_seconds),
-            seed=_env_value(env, "SIM_SEED", int, cls.seed),
+            tick_seconds=env_value(env, "SIM_TICK_SECONDS", float, cls.tick_seconds),
+            pulses_per_cycle=env_value(env, "SIM_PULSES_PER_CYCLE", int, cls.pulses_per_cycle),
+            mean_life_cycles=env_value(env, "SIM_MEAN_LIFE_CYCLES", float, cls.mean_life_cycles),
+            backfill_lifecycles=env_value(env, "SIM_BACKFILL_LIFECYCLES", int, cls.backfill_lifecycles),
+            maintenance_seconds=env_value(env, "SIM_MAINTENANCE_SECONDS", float, cls.maintenance_seconds),
+            seed=env_value(env, "SIM_SEED", int, cls.seed),
             log_level=env.get("LOG_LEVEL", "").strip() or cls.log_level,
         )
 
@@ -136,9 +137,42 @@ def _positive_int(raw: str) -> int:
     return value
 
 
+def _positive_float(raw: str) -> float:
+    value = float(raw)
+    if not 0 < value < math.inf:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return value
+
+
+BENCHMARK_DEFAULTS = {"benchmark_seconds": 60.0, "benchmark_engines": 24}
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """Command line: ``[--max-ticks N] [--no-backfill]``."""
+    """Command line: ``[--max-ticks N] [--no-backfill]`` for the fleet, or ``--benchmark [--benchmark-*]`` for
+    the HF load test (frames only, no PostgreSQL); the --benchmark-* options require --benchmark."""
     parser = argparse.ArgumentParser(description="Jet-engine fleet telemetry simulator (PostgreSQL edge DB).")
     parser.add_argument("--max-ticks", type=_positive_int, help="stop after N live ticks (smoke tests)")
     parser.add_argument("--no-backfill", action="store_true", help="never backfill engines without telemetry")
-    return parser.parse_args(argv)
+    bench = parser.add_argument_group("HF load test (no PostgreSQL, no pacing)")
+    bench.add_argument("--benchmark", action="store_true", help="measure the HF frame producer and exit")
+    bench.add_argument("--benchmark-seconds", type=_positive_float, help="measured duration (default 60)")
+    bench.add_argument(
+        "--benchmark-engines", type=_positive_int, help="synthetic engines BENCH-0001.. (default 24)"
+    )
+    bench.add_argument("--benchmark-topic", help="target topic (default HF_BENCHMARK_TOPIC)")
+    bench.add_argument(
+        "--benchmark-sample-rate", type=_positive_int, help="vibration Hz (default SIM_HF_SAMPLE_RATE_HZ)"
+    )
+    bench.add_argument(
+        "--benchmark-vib-channels", type=_positive_int, help="accelerometers (default SIM_HF_VIB_CHANNELS)"
+    )
+    args = parser.parse_args(argv)
+    given = [name for name in vars(args) if name.startswith("benchmark_") and getattr(args, name) is not None]
+    if given and not args.benchmark:
+        parser.error(f"--{given[0].replace('_', '-')} requires --benchmark")
+    if args.benchmark and (args.max_ticks is not None or args.no_backfill):
+        parser.error("--benchmark cannot be combined with --max-ticks or --no-backfill")
+    for name, default in BENCHMARK_DEFAULTS.items():
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+    return args

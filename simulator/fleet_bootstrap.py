@@ -9,7 +9,9 @@ were recorded is adopted when the current settings reproduce it, and refused oth
 
 Backfill works per engine: every configured engine without any telemetry gets its history in ONE
 transaction, so an interrupted first boot completes on the next start and an engine added to
-SIM_ENGINE_IDS later gets history too; an engine with telemetry is never backfilled again.
+SIM_ENGINE_IDS later gets history too; an engine with telemetry is never backfilled again. Once an
+engine's history has committed, the optional commit hook receives it (high-frequency frames for every
+backfilled pulse, with backdated timestamps).
 
 Like fleet_runtime, this module never imports engine_generator at runtime: engines are built by the
 factory that ``engine_generator.main`` hands in and are persisted through the fleet_db store.
@@ -26,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from fleet_runtime import (
+    CommitHook,
     WriteOp,
     completion_at,
     failure_event,
@@ -254,13 +257,14 @@ def backfill_fleet(
     store: FleetDatabase,
     config: SimulatorConfig,
     stop_event: threading.Event,
+    on_commit: CommitHook | None = None,
 ) -> None:
     """Write the history of every engine in ``engines`` (engines without any telemetry).
 
     History looks exactly like an earlier live run: pulses one tick apart, repairs SIM_MAINTENANCE_SECONDS
     long, the same writes as the live loop. Each engine's history is ONE transaction, so an engine has
     either all of it or no telemetry at all; a shutdown request stops between engines and the next start
-    backfills the engines still without telemetry.
+    backfills the engines still without telemetry. ``on_commit`` receives each committed history.
     """
     names = [engine.engine_id for engine in engines]
     logger.info(
@@ -275,9 +279,12 @@ def backfill_fleet(
             )
             return
         history = engine_history(engine, config)
-        store.execute_with_retry([op for _, ops in history for op in ops])
+        writes = [op for _, ops in history for op in ops]
+        results = store.execute_with_retry(writes)
         for lifecycle_id, ops in history:
             _log_backfilled(engine.engine_id, lifecycle_id, ops)
+        if on_commit is not None:
+            on_commit(writes, results)
     logger.info("Backfill complete: %s", " | ".join(engine.describe() for engine in engines))
 
 
@@ -289,8 +296,10 @@ def bootstrap_fleet(
     *,
     allow_backfill: bool,
     stop_event: threading.Event,
+    on_commit: CommitHook | None = None,
 ) -> list[EngineSimulator]:
-    """Register the fleet, rebuild every twin from the database and backfill engines without telemetry."""
+    """Register the fleet, rebuild every twin from the database and backfill engines without telemetry
+    (``on_commit`` receives each committed engine history)."""
     store.ensure_schema()
     created = store.register_engines(engine_models)
     logger.info("Engine registry ready: %d engines, %d newly registered", len(engine_models), created)
@@ -301,5 +310,5 @@ def bootstrap_fleet(
     if resumed:
         logger.info("Resuming fleet: %s", " | ".join(engine.describe() for engine in resumed))
     if backfilled:
-        backfill_fleet(backfilled, store, config, stop_event)
+        backfill_fleet(backfilled, store, config, stop_event, on_commit)
     return [engine for engine, _ in restored]

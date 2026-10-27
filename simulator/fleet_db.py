@@ -75,6 +75,9 @@ SELECT r.operational_status, r.current_lifecycle_id, r.current_cycle, r.cycles_s
   LEFT JOIN maintenance_log m ON m.engine_id = r.engine_id AND m.lifecycle_id = r.current_lifecycle_id
  WHERE r.engine_id = %s"""
 
+TELEMETRY_COUNTS_SQL = """
+SELECT engine_id, count(*) FROM engine_telemetry WHERE engine_id = ANY(%s) GROUP BY engine_id"""
+
 
 class DatabaseConnectionError(RuntimeError):
     """PostgreSQL stayed unreachable through all bounded retries, or a shutdown interrupted the wait."""
@@ -274,6 +277,16 @@ class FleetDatabase:
             return cur.rowcount
 
         return self._with_retry(work, "engine registration")
+
+    def telemetry_counts(self, engine_ids: Sequence[str]) -> dict[str, int]:
+        """Telemetry rows per engine (0 for an engine without any): where the frame sequence resumes."""
+
+        def work(cur: cursor) -> dict[str, int]:
+            cur.execute(TELEMETRY_COUNTS_SQL, (list(engine_ids),))
+            return {engine_id: int(count) for engine_id, count in cur.fetchall()}
+
+        counts = self._with_retry(work, "telemetry counts")
+        return {engine_id: counts.get(engine_id, 0) for engine_id in engine_ids}
 
     def load_snapshot(self, engine_id: str) -> EngineSnapshot:
         """Registry row, current-lifecycle progress, stored generation settings and work order."""

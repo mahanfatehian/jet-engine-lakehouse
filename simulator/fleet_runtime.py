@@ -5,6 +5,9 @@ that became due, the generation settings of lifecycles whose first pulse this is
 engine, FAILURE events, then registry updates. Engines are duck-typed ``engine_generator.EngineSimulator``
 objects, so this module never imports engine_generator at runtime (that would load the entry-point script
 a second time).
+
+After a transaction commits, an optional commit hook receives its writes and results (the high-frequency
+frame path turns every written pulse into a sensor frame); a dropped tick reaches no hook.
 """
 
 from __future__ import annotations
@@ -14,10 +17,10 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from engine_generator import EngineSimulator, Pulse
@@ -28,6 +31,9 @@ logger = logging.getLogger("fleet_runtime")
 
 WriteOp = tuple[str, Any]
 """One database write as (fleet_db writer method, payload); a list of them runs in ONE transaction."""
+
+CommitHook = Callable[[Sequence[WriteOp], Sequence[Any]], None]
+"""Called with the writes of a committed transaction and their results (fleet_writer return values)."""
 
 HEARTBEAT_SECONDS = 60.0
 
@@ -62,6 +68,27 @@ class FailureEvent:
     failure_mode: str
     cycles_since_new: int
     notes: str
+
+
+class RecordedFailure(NamedTuple):
+    """Result of a committed record_failure write: the work order and the FAILURE pulse's telemetry row."""
+
+    maintenance_id: int
+    telemetry_id: int
+
+
+def committed_pulses(ops: Sequence[WriteOp], results: Sequence[Any]) -> list[tuple[Pulse, int]]:
+    """Every pulse written by a committed transaction with its telemetry_id, in write (= event) order.
+
+    insert_pulses returns the ids of its batch in pulse order; record_failure a RecordedFailure.
+    """
+    written: list[tuple[Pulse, int]] = []
+    for (name, payload), result in zip(ops, results, strict=True):
+        if name == "insert_pulses":
+            written.extend(zip(payload, result, strict=True))
+        elif name == "record_failure":
+            written.append((payload.pulse, result.telemetry_id))
+    return written
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +208,8 @@ def build_tick_ops(
 
 
 class FleetRunner:
-    """Live loop: every tick, ONE transaction carries each operating engine's pulse and any due repairs."""
+    """Live loop: every tick, ONE transaction carries each operating engine's pulse and any due repairs;
+    ``on_commit`` (optional) receives every committed tick."""
 
     def __init__(
         self,
@@ -189,12 +217,14 @@ class FleetRunner:
         store: FleetDatabase,
         config: SimulatorConfig,
         stop_event: threading.Event,
+        on_commit: CommitHook | None = None,
     ) -> None:
         self._engines = list(engines)
         self._store = store
         self._tick_seconds = config.tick_seconds
         self._repair_seconds = config.maintenance_seconds
         self._stop = stop_event
+        self._on_commit = on_commit
         self.ticks = self.pulses = self.failures = self.dropped_ticks = 0
 
     def run(self, max_ticks: int | None = None) -> None:
@@ -241,7 +271,9 @@ class FleetRunner:
             )
         for engine, pulse in pulses:
             slot = failure_slots.get(engine.engine_id)
-            self._apply_pulse(engine, pulse, None if slot is None else results[slot])
+            self._apply_pulse(engine, pulse, None if slot is None else results[slot].maintenance_id)
+        if self._on_commit is not None:
+            self._on_commit(ops, results)
         return True
 
     def _apply_pulse(self, engine: EngineSimulator, pulse: Pulse, maintenance_id: Any) -> None:

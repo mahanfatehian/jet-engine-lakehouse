@@ -40,9 +40,11 @@ Sensor model: B = model baseline x per-engine manufacturing offset (+-1.5 %), z 
 Noise widens with wear (looser clearances, unstable combustion), and vibration spikes and oil-pressure
 dips become frequent just before failure: the precursors that engine health monitoring looks for.
 
-Usage: ``python engine_generator.py [--max-ticks N] [--no-backfill]`` with SIM_*, POSTGRES_*, LOG_LEVEL set.
-Helpers: fleet_config (SIM_*, command line), fleet_bootstrap (resume, backfill), fleet_runtime (live loop,
-work orders), fleet_db (connection, reads), fleet_writer (writes), fleet_lease (single-writer lock).
+Usage: ``python engine_generator.py [--max-ticks N] [--no-backfill]``, or ``--benchmark [--benchmark-*]`` for
+the HF load test, configured by SIM_*, SIM_HF_*, POSTGRES_*, Kafka and Schema Registry variables. Helpers:
+fleet_config (SIM_*, command line), fleet_bootstrap (resume, backfill), fleet_runtime (live loop, work
+orders), fleet_db (connection, reads), fleet_writer (writes), fleet_lease (single-writer lock) and hf_* (every
+committed pulse also becomes an Avro sensor frame on Kafka; hf_runtime wires it in).
 """
 
 from __future__ import annotations
@@ -63,6 +65,8 @@ from fleet_bootstrap import ResumeMismatchError, bootstrap_fleet
 from fleet_config import SimulatorConfig, parse_args
 from fleet_lease import WriterLockError
 from fleet_runtime import FleetRunner, configure_logging, install_signal_handlers
+from hf_benchmark import run_benchmark
+from hf_runtime import HfPath, load_hf_config, open_hf_path
 
 if TYPE_CHECKING:
     from fleet_config import GenerationSettings
@@ -240,7 +244,8 @@ def sensor_readings(
 
 @dataclass(frozen=True, slots=True)
 class Pulse:
-    """One telemetry row; field names match the engine_telemetry columns."""
+    """One telemetry row (fields named like the engine_telemetry columns) plus the hidden state its
+    high-frequency frame is synthesized from: operating condition theta and the lifecycle's failure mode."""
 
     engine_id: str
     lifecycle_id: int
@@ -255,6 +260,8 @@ class Pulse:
     oil_pressure_psi: float
     wear_factor: float
     status: str
+    theta: float
+    failure_mode: str
 
     @property
     def is_failure(self) -> bool:
@@ -351,6 +358,8 @@ class EngineSimulator:
             event_ts=event_ts,
             wear_factor=wear,
             status=status_for_wear(wear),
+            theta=self._theta,
+            failure_mode=self.lifecycle.failure_mode,
             **readings,
         )
 
@@ -396,35 +405,41 @@ class EngineSimulator:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the simulator. Exit codes: 0 clean shutdown, 1 fatal error, 2 invalid configuration or refusal
-    to write (another simulator holds the writer lock, or stored lifecycles contradict the SIM_* values)."""
+    """Run the simulator, or the HF load test with --benchmark. Exit codes: 0 clean shutdown, 1 fatal error
+    (or a load test that lost frames), 2 invalid configuration or refusal to write (another simulator holds
+    the writer lock, or stored lifecycles contradict the SIM_* values)."""
     args = parse_args(argv)
     import fleet_db  # deferred so that the physics above stays importable without psycopg2
 
     try:
-        config = SimulatorConfig.from_env()
+        config, hf_config = SimulatorConfig.from_env(), load_hf_config(args)
         db_settings = fleet_db.DatabaseSettings.from_env()
     except ValueError as exc:
         configure_logging("INFO")
         logger.error("Invalid configuration: %s", exc)
         return 2
     configure_logging(config.log_level)
+    stop = threading.Event()
+    install_signal_handlers(stop)
+    if args.benchmark:
+        nominal = {model: dict(zip(CHANNELS, values, strict=True)) for model, values in ENGINE_TYPES.values()}
+        return run_benchmark(hf_config, args, config.seed, nominal, stop)
     logger.info("Starting fleet simulator: %s", config.summary())
-    stop_event = threading.Event()
-    install_signal_handlers(stop_event)
-    store = fleet_db.FleetDatabase(db_settings, stop_event)
+    store, backfill = fleet_db.FleetDatabase(db_settings, stop), not args.no_backfill
     factory = functools.partial(EngineSimulator, config=config)
     models = {engine_id: build_profile(engine_id).engine_model for engine_id in config.engine_ids}
+    hf = HfPath()
     try:
+        hf = open_hf_path(hf_config, config.seed, store, models)
         engines = bootstrap_fleet(
-            store, config, factory, models, allow_backfill=not args.no_backfill, stop_event=stop_event
+            store, config, factory, models, allow_backfill=backfill, stop_event=stop, on_commit=hf.backfill
         )
-        FleetRunner(engines, store, config, stop_event).run(args.max_ticks)
+        FleetRunner(engines, store, config, stop, hf.live).run(args.max_ticks)
     except (WriterLockError, ResumeMismatchError) as exc:
         logger.error("Refusing to write: %s", exc)
         return 2
     except fleet_db.DatabaseConnectionError as exc:
-        if stop_event.is_set():
+        if stop.is_set():
             logger.info("Shutdown requested while PostgreSQL was unavailable")
             return 0
         logger.error("Giving up: %s", exc)
@@ -433,6 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.exception("Simulator crashed")
         return 1
     finally:
+        hf.close()
         store.close()
     logger.info("Simulator stopped cleanly")
     return 0
