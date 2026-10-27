@@ -4,14 +4,20 @@
 #   1. private docker network + clickhouse-server with the platform's init files (no host ports)
 #   2. python:3.12-slim-bookworm with the pinned dbt-core / dbt-clickhouse (repo mounted read-only,
 #      dbt target and logs kept inside the container)
-#   3. seed base -> dbt debug -> dbt build -> seed increment -> dbt build (incremental path)
-#   4. invariant checks, snapshot, dbt build --full-refresh, snapshot, compare, checks again
+#   3. seed base -> dbt debug -> dbt build -> seed increment -> dbt build (incremental path);
+#      the seed holds synthetic CDC (duplicates, updates, deletes, late rows) and the matching
+#      high-frequency frame features (dropped frames, NaN features, absent process keys,
+#      redelivered, late and corrected copies, bearing degradation)
+#   4. invariant checks, snapshot, dbt build --full-refresh, snapshot, compare (every model,
+#      incremental ones included), checks again
 #   5. var-driven definitions: a changed baseline_cycles heals on the next incremental run (and
 #      equals the full refresh again), the anomaly-threshold guard rejects miscalibrated
-#      thresholds, and the training mart keeps only the newest lifecycles of each engine
+#      thresholds (sensor and bearing-defect flags), and the training mart keeps only the
+#      newest lifecycles of each engine
 #
-# Everything it creates is named ${ANALYTICS_IT_PREFIX:-tmp-analytics}-* and removed on exit
-# (ANALYTICS_IT_KEEP=1 keeps it); set the prefix to run two copies side by side.
+# Everything it creates is removed on exit: the ${ANALYTICS_IT_PREFIX:-tmp-analytics}-* containers
+# and network and ClickHouse's anonymous data volume (ANALYTICS_IT_KEEP=1 keeps them); set the
+# prefix to run two copies side by side.
 # Usage: bash tests/analytics/run_dbt_integration.sh      (Linux, macOS or Git Bash on Windows)
 set -euo pipefail
 
@@ -32,7 +38,9 @@ readonly REPO_ROOT
 log() { printf '%s [analytics-it] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 remove_resources() {
-    docker rm -f "${DBT}" "${CLICKHOUSE}" >/dev/null 2>&1 || true
+    # -v: clickhouse-server declares VOLUME /var/lib/clickhouse, whose anonymous volume would
+    # otherwise outlive every run
+    docker rm -f -v "${DBT}" "${CLICKHOUSE}" >/dev/null 2>&1 || true
     docker network rm "${NETWORK}" >/dev/null 2>&1 || true
 }
 
@@ -138,6 +146,11 @@ check_definition_changes() {
         '"flag": *"is_oil_pressure_drop_anomaly", *"issue": *"silent_at_failure"'
     expect_test_failure assert_anomaly_thresholds_calibrated '{anomaly_vibration_ratio: 1.0}' \
         '"flag": *"is_vibration_growth_anomaly", *"issue": *"noisy_while_healthy"'
+    expect_test_failure assert_anomaly_thresholds_calibrated \
+        '{anomaly_fan_amp_bpfo_mm_s: 9.0, anomaly_fan_kurtosis: 9.0}' \
+        '"flag": *"is_bearing_defect_anomaly", *"issue": *"silent_at_failure"'
+    expect_test_failure assert_anomaly_thresholds_calibrated '{anomaly_fan_amp_bpfo_mm_s: 0.01}' \
+        '"flag": *"is_bearing_defect_anomaly", *"issue": *"noisy_while_healthy"'
 
     log "phase 6: the training mart keeps the newest completed lifecycles of each engine"
     in_dbt "dbt build --select mart_rul_training_features+ --vars '{mart_max_lifecycles_per_engine: 2}'"

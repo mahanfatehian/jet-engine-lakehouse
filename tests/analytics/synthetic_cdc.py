@@ -14,6 +14,9 @@ non-HEALTHY pulses linked to the work order by UPDATEs, and a registry row updat
   (one group in a lifecycle's baseline period), GE90-202's whole registry history (telemetry
   landed first), a late delete and a late sensor correction of already published pulses.
   ``late_visible`` pulses must be loaded with an ingested_at older than the dbt watermark.
+
+``History.frames`` holds the high-frequency frame features of the same pulses, delivered in the
+same two phases (synthetic_hf.py; manifest key ``hf``).
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from synthetic_fleet import (
     Pulse,
     simulate_engine,
 )
+from synthetic_hf import FrameCopy, build_hf_frames
 
 FIRST_LSN = 26_000_000
 REPAIR_ACTIONS = {
@@ -59,12 +63,13 @@ class CdcEvent:
 
 @dataclass
 class History:
-    """The change stream, increment-phase RUL predictions and the facts the checks verify."""
+    """The change stream, increment-phase RUL predictions, HF frame copies and the facts the checks verify."""
 
     events: list[CdcEvent]
     cutoff: datetime
     predictions: list[dict[str, Any]]
     manifest: dict[str, Any]
+    frames: list[FrameCopy]
 
 
 def _telemetry_image(pulse: Pulse, maintenance_id: int | None = None) -> dict[str, Any]:
@@ -385,6 +390,7 @@ def build_history(seed: int) -> History:
     ]
 
     predictions = _predictions(lifecycle_of, cutoff)
+    frames, hf_manifest = build_hf_frames(lifecycles, cutoff, seed)
     manifest = {
         "cutoff": cutoff.isoformat(),
         "engines": [plan.engine_id for plan in (*FLEET, SPARE_ENGINE)],
@@ -403,5 +409,6 @@ def build_history(seed: int) -> History:
         # newest prediction of each engine's current lifecycle, as fct_engine_health_status must show it
         "expected_predicted_rul": {"JT9D-001": 80.0, "CFM56-104": 30.0, "GE90-201": None, "GE90-202": None},
         "expected_board_predictions": expected_board_predictions(predictions, registry),
+        "hf": hf_manifest,
     }
-    return History(events, cutoff, predictions, manifest)
+    return History(events, cutoff, predictions, manifest, frames)

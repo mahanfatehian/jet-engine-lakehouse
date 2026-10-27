@@ -1,4 +1,5 @@
-"""Static checks of the dbt project against the feature contract (CONTRACT.md section 7).
+"""Static checks of the dbt project against the feature contract (CONTRACT.md section 7,
+CONTRACT_V2.md section 8).
 
 They need neither dbt nor ClickHouse: they parse the model YAML, whose columns are enforced as
 dbt model contracts, so a drift between the docs, the physical tables and the ML interface
@@ -7,6 +8,8 @@ fails here first. The end-to-end behaviour is covered by run_dbt_integration.sh.
 
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +17,8 @@ import pytest
 
 yaml = pytest.importorskip("yaml")
 
-ANALYTICS = Path(__file__).resolve().parents[2] / "analytics"
+REPO = Path(__file__).resolve().parents[2]
+ANALYTICS = REPO / "analytics"
 IDENTIFIERS = ("telemetry_id", "engine_id", "engine_model", "lifecycle_id", "cycle_number", "event_ts")
 RAW_SENSORS = ("rpm", "core_temp_c", "egt_c", "vibration_mm_s", "fuel_flow_kg_h", "oil_pressure_psi")
 ROLLED = ("vibration_mm_s", "egt_c", "oil_pressure_psi")
@@ -30,6 +34,20 @@ FLOAT_FEATURES = (
     "fuel_flow_kg_h_drift_pct",
     "rpm_drift_pct",
 )
+# SPECTRAL_FEATURE_COLUMNS of the ML contract: 5-minute means of the HF frame features
+SPECTRAL = (
+    "fan_amp_bpfo_mean_5m",
+    "fan_kurtosis_mean_5m",
+    "fan_crest_factor_mean_5m",
+    "fan_amp_1x_n1_mean_5m",
+    "core_amp_1x_n2_mean_5m",
+    "fan_band_energy_hf_mean_5m",
+    "oil_temp_c_mean_5m",
+    "oil_quantity_mean_5m",
+    "oil_filter_dp_mean_5m",
+    "egt_ab_split_mean_5m",
+)
+PULSE_PREFIX = len(IDENTIFIERS) + len(FLOAT_FEATURES)
 LABELS = {
     "failure_cycle": "UInt32",
     "rul_cycles": "Int32",
@@ -58,11 +76,13 @@ def test_numeric_feature_count_matches_contract() -> None:
     assert len({"cycle_number", *FLOAT_FEATURES}) == 46
 
 
-@pytest.mark.parametrize("model", ["int_sensor_rolling_features", "mart_rul_training_features"])
+@pytest.mark.parametrize(
+    "model", ["int_sensor_rolling_features", "int_ml_features", "mart_rul_training_features"]
+)
 def test_feature_columns_are_exact_and_float(model: str) -> None:
     columns = _columns(model)
     names = [column["name"] for column in columns]
-    assert names[: len(IDENTIFIERS) + len(FLOAT_FEATURES)] == [*IDENTIFIERS, *FLOAT_FEATURES]
+    assert names[:PULSE_PREFIX] == [*IDENTIFIERS, *FLOAT_FEATURES]
     types = {column["name"]: column["data_type"] for column in columns}
     assert {types[name] for name in FLOAT_FEATURES} == {"Float64"}
     assert types["cycle_number"] == "UInt32"
@@ -71,9 +91,70 @@ def test_feature_columns_are_exact_and_float(model: str) -> None:
 def test_mart_labels_follow_contract_and_exclude_ground_truth() -> None:
     columns = _columns("mart_rul_training_features")
     names = [column["name"] for column in columns]
-    assert names[len(IDENTIFIERS) + len(FLOAT_FEATURES) :] == list(LABELS)
+    # the spectral features follow the 45 Float64 features, the labels close the row
+    assert names[PULSE_PREFIX:] == [*SPECTRAL, *LABELS]
     assert {column["name"]: column["data_type"] for column in columns if column["name"] in LABELS} == LABELS
     assert not FORBIDDEN_IN_MART & set(names)
+
+
+@pytest.mark.parametrize(
+    ("model", "position"),
+    [
+        ("int_vibration_features", 5),
+        ("int_ml_features", PULSE_PREFIX),
+        ("mart_rul_training_features", PULSE_PREFIX),
+    ],
+)
+def test_spectral_features_are_nullable_floats_in_contract_order(model: str, position: int) -> None:
+    columns = _columns(model)
+    assert [column["name"] for column in columns][position : position + len(SPECTRAL)] == list(SPECTRAL)
+    assert {column["data_type"] for column in columns if column["name"] in SPECTRAL} == {"Nullable(Float64)"}
+
+
+def test_spectral_features_are_the_same_in_dbt_and_data_science() -> None:
+    macros = (ANALYTICS / "macros" / "feature_columns.sql").read_text(encoding="utf-8")
+    dbt_names = re.findall(r"\{'name': '(\w+)', 'source': '\w+'\}", macros)
+    tree = ast.parse((REPO / "data_science" / "feature_pipeline.py").read_text(encoding="utf-8"))
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "SPECTRAL_FEATURE_COLUMNS"
+    )
+    assert tuple(dbt_names) == ast.literal_eval(assignment.value) == SPECTRAL
+
+
+def test_ml_features_view_joins_spectral_features_onto_every_pulse() -> None:
+    sql = " ".join(
+        (ANALYTICS / "models" / "silver" / "int_ml_features.sql").read_text(encoding="utf-8").split()
+    )
+    assert "config(materialized='view')" in sql
+    assert re.search(
+        r"from \{\{ ref\('int_sensor_rolling_features'\) \}\} final left join \(.*"
+        r"from \{\{ ref\('int_vibration_features'\) \}\} final \) as \w+ "
+        r"using \(engine_id, lifecycle_id, telemetry_id\)",
+        sql,
+    )
+
+
+def test_board_counts_the_bearing_defect_flag() -> None:
+    model = _models()["fct_engine_health_status"]
+    types = {column["name"]: column["data_type"] for column in model["columns"]}
+    assert types["is_bearing_defect_anomaly"] == "UInt8"
+    assert types["last_hf_frame_ts"] == "Nullable(DateTime64(6, 'UTC'))"
+    assert {types[kpi] for kpi in ("fan_amp_bpfo_mean_5m", "fan_kurtosis_mean_5m")} == {"Nullable(Float64)"}
+    expressions = [
+        test["expression_is_true"]["arguments"]["expression"]
+        for test in model["data_tests"]
+        if "expression_is_true" in test
+    ]
+    assert any(
+        "anomaly_count =" in expression and "is_bearing_defect_anomaly" in expression
+        for expression in expressions
+    )
+    anomaly_count = next(column for column in model["columns"] if column["name"] == "anomaly_count")
+    assert anomaly_count["data_tests"][0]["accepted_range"]["arguments"]["max_value"] == 5
 
 
 def test_every_model_is_documented_with_typed_columns() -> None:
@@ -138,14 +219,31 @@ def test_anomaly_threshold_lies_between_healthy_value_and_full_scale(kpi: str) -
     assert healthy < values[threshold] < values[full_scale]
 
 
+# is_bearing_defect_anomaly: thresholds of two spectral KPIs, one rule in macros/health.sql
+BEARING_THRESHOLDS = ("anomaly_fan_amp_bpfo_mm_s", "anomaly_fan_kurtosis")
+
+
 def test_every_kpi_anomaly_threshold_has_a_calibration_guard() -> None:
     fct = (ANALYTICS / "models" / "gold" / "fct_engine_health_status.sql").read_text(encoding="utf-8")
     guard = (ANALYTICS / "tests" / "assert_anomaly_thresholds_calibrated.sql").read_text(encoding="utf-8")
+    health = (ANALYTICS / "macros" / "health.sql").read_text(encoding="utf-8")
     kpi_thresholds = {name for name in _vars() if name.startswith("anomaly_") and "stale" not in name}
-    assert {threshold for threshold, _, _ in KPI_SCALES.values()} == kpi_thresholds
-    for threshold in kpi_thresholds:
+    sensor_thresholds = {threshold for threshold, _, _ in KPI_SCALES.values()}
+    assert sensor_thresholds | set(BEARING_THRESHOLDS) == kpi_thresholds
+    for threshold in sensor_thresholds:
         assert f"number_var('{threshold}')" in fct
         assert f"number_var('{threshold}')" in guard
+    # the board raises the bearing flag with the very rule the guard judges
+    for threshold in BEARING_THRESHOLDS:
+        assert f"number_var('{threshold}')" in health
+    assert "bearing_defect_detected(" in fct and "bearing_defect_detected(" in guard
+
+
+def test_bearing_thresholds_sit_above_a_healthy_spectrum() -> None:
+    values = _vars()
+    # a healthy bearing has no BPFO tone; Gaussian noise has a kurtosis of 3, tones less
+    assert values["anomaly_fan_amp_bpfo_mm_s"] > 0
+    assert values["anomaly_fan_kurtosis"] > 3.0
 
 
 def test_board_keeps_raw_predictions_and_adds_aged_ones() -> None:

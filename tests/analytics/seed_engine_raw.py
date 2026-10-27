@@ -8,7 +8,9 @@ Rows are written the way the Spark job writes them: CDC metadata filled from the
 ingested_at left to the server default, several inserts per table like micro-batches.
 Increment pulses flagged late_visible go first, with an explicit ingested_at 90 s older than
 the newest raw row: a slow concurrent insert that becomes visible behind the dbt watermark.
-The increment phase also appends a few RUL predictions (normally written by predict_rul.py).
+The HF frame copies of synthetic_hf.py land in raw_engine_hf_features the same way (their
+late-visible copies 90 s behind the newest frame). The increment phase also appends a few RUL
+predictions (normally written by predict_rul.py).
 
 The fixture reuses real fleet engine ids, so writing it into the platform's ClickHouse would
 corrupt real data: every write path refuses to run unless ANALYTICS_IT_ALLOW_WRITES=1, which
@@ -34,6 +36,7 @@ import clickhouse_connect
 from clickhouse_connect.driver.client import Client
 from clickhouse_connect.driver.exceptions import ClickHouseError, OperationalError
 from synthetic_cdc import CdcEvent, History, build_history
+from synthetic_hf import HF_COLUMNS
 
 LOGGER = logging.getLogger("seed_engine_raw")
 T = TypeVar("T")
@@ -116,6 +119,7 @@ PRIMARY_KEYS = {
     "engine_status_registry": "engine_id",
     "maintenance_log": "maintenance_id",
 }
+HF_TABLE = "raw_engine_hf_features"
 PREDICTION_COLUMNS = (
     "predicted_at",
     "engine_id",
@@ -225,12 +229,30 @@ def writes_allowed() -> bool:
     return False
 
 
-def _newest_ingestion(client: Client) -> datetime:
+def _newest_ingestion(client: Client, table: str = "raw_engine_telemetry") -> datetime:
     result = with_retries(
-        lambda: client.query("SELECT max(ingested_at) FROM raw_engine_telemetry"),
-        "read the newest ingested_at",
+        lambda: client.query(f"SELECT max(ingested_at) FROM {table}"),
+        f"read the newest ingested_at of {table}",
     )
     return result.result_rows[0][0]
+
+
+def load_hf_phase(client: Client, history: History, phase: str) -> dict[str, int]:
+    """Insert every HF frame copy of ``phase``, late-visible copies first (see the module doc)."""
+    copies = [copy for copy in history.frames if copy.phase == phase]
+    written: dict[str, int] = {}
+    late = [copy for copy in copies if copy.late_visible]
+    if late:
+        visible_at = _newest_ingestion(client, HF_TABLE) - LATE_VISIBLE_LAG
+        rows = [[*(copy.row[column] for column in HF_COLUMNS), visible_at] for copy in late]
+        _insert(client, HF_TABLE, (*HF_COLUMNS, "ingested_at"), rows)
+        LOGGER.info("inserted %d late-visible frames with ingested_at=%s", len(rows), visible_at.isoformat())
+        written["late_visible_frames"] = len(rows)
+    rows = [[copy.row[column] for column in HF_COLUMNS] for copy in copies if not copy.late_visible]
+    _insert(client, HF_TABLE, HF_COLUMNS, rows)
+    LOGGER.info("inserted %d %s frame copies into %s", len(rows), phase, HF_TABLE)
+    written[HF_TABLE] = len(rows)
+    return written
 
 
 def load_phase(client: Client, history: History, phase: str) -> dict[str, int]:
@@ -259,7 +281,7 @@ def load_phase(client: Client, history: History, phase: str) -> dict[str, int]:
         rows = [[prediction[column] for column in PREDICTION_COLUMNS] for prediction in history.predictions]
         _insert(client, "gold_engine_rul_predictions", PREDICTION_COLUMNS, rows)
         written["gold_engine_rul_predictions"] = len(rows)
-    return written
+    return {**written, **load_hf_phase(client, history, phase)}
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:

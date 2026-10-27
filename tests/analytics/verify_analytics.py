@@ -6,12 +6,13 @@
     python tests/analytics/verify_analytics.py baseline 20
     python tests/analytics/verify_analytics.py mart-cap 2
 
-snapshot  copies the FINAL contents of every model into analytics_verify.<tag>__<model>
-          (build-time columns excluded)
+snapshot  copies the FINAL contents of every model (a view as it reads) into
+          analytics_verify.<tag>__<model> (build-time columns excluded)
 compare   row counts, per-column checksums and row-level EXCEPT diffs of two snapshots
 check     CDC dedup, late / deleted / corrected pulses, registry lag, RUL labels, finite
-          features, fct grain, predictions and their aging, and an independent Python
+          features, fct grain, predictions and their aging, an independent Python
           recomputation of the rolling features of selected lifecycles (feature_reference.py)
+          and of every spectral feature of the HF frames (verify_spectral.py)
 baseline  every live feature row records baseline_cycles = N and the reference lifecycles
           match the Python recomputation with an N-cycle baseline
 mart-cap  the training mart holds exactly the newest N completed lifecycles of every engine
@@ -37,6 +38,7 @@ from feature_reference import ROLLED_SENSORS, SENSORS, WINDOWS, Reading, expecte
 from seed_engine_raw import EXIT_REFUSED, connect, writes_allowed
 from verify_gold import check_board, check_mart_cap
 from verify_queries import DATABASE, rows, scalar
+from verify_spectral import check_spectral
 
 LOGGER = logging.getLogger("verify_analytics")
 VERIFY_DATABASE = "analytics_verify"
@@ -44,8 +46,11 @@ MODELS = (
     "stg_engine_telemetry",
     "stg_engine_status_registry",
     "stg_maintenance_log",
+    "stg_engine_hf_features",
     "int_engine_lifecycles",
     "int_sensor_rolling_features",
+    "int_vibration_features",
+    "int_ml_features",
     "mart_rul_training_features",
     "fct_engine_health_status",
     "fct_rul_prediction_backtest",
@@ -95,17 +100,20 @@ def model_columns(client: Client, database: str, table: str) -> list[tuple[str, 
 
 
 def snapshot(client: Client, tag: str) -> list[str]:
-    """Copy the FINAL view of every model into the verify database under ``tag``."""
+    """Copy the FINAL view of every model (a view as it reads) into the verify database under ``tag``."""
     client.command(f"CREATE DATABASE IF NOT EXISTS {VERIFY_DATABASE}")
     for model in MODELS:
         columns = [
             name for name, _ in model_columns(client, DATABASE, model) if name not in BUILD_TIME_COLUMNS
         ]
+        engine = scalar(
+            client, f"SELECT engine FROM system.tables WHERE database = '{DATABASE}' AND name = '{model}'"
+        )
         target = f"{VERIFY_DATABASE}.{tag}__{model}"
         client.command(f"DROP TABLE IF EXISTS {target}")
         client.command(
             f"CREATE TABLE {target} ENGINE = MergeTree ORDER BY tuple() AS "
-            f"SELECT {', '.join(columns)} FROM {DATABASE}.{model} FINAL"
+            f"SELECT {', '.join(columns)} FROM {DATABASE}.{model}{'' if engine == 'View' else ' FINAL'}"
         )
         LOGGER.info("snapshot %s: %d rows", target, scalar(client, f"SELECT count() FROM {target}"))
     return []
@@ -366,6 +374,7 @@ def check(client: Client, manifest_path: Path, incremental: bool) -> list[str]:
         *check_finite(client),
         *check_board(client, manifest),
         *check_baseline(client, BASELINE_CYCLES),
+        *check_spectral(client, manifest, incremental),
     ]
 
 
