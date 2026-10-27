@@ -126,6 +126,7 @@ def test_settings_defaults_follow_the_contract() -> None:
     )
     assert settings.snapshot_retention == 5
     assert settings.snapshot_window_days == 7
+    assert model.spectral_max_lag_seconds == 60.0
     assert "password" not in repr(settings.clickhouse)
     assert "secret_access_key" not in repr(settings.s3)
 
@@ -146,6 +147,12 @@ def test_settings_defaults_follow_the_contract() -> None:
         ({"PROMOTION_MIN_ROC_AUC": "nan"}, "PROMOTION_MIN_ROC_AUC"),
         ({"PROMOTION_MIN_ROC_AUC": "high"}, "must be a number"),
         ({"PROMOTION_F1_TOLERANCE": "-0.1"}, r"\[0, 1\]"),
+        (
+            {"SPECTRAL_MAX_LAG_SECONDS": "-1"},
+            r"SPECTRAL_MAX_LAG_SECONDS must be a finite number in \[0, 3600\]",
+        ),
+        ({"SPECTRAL_MAX_LAG_SECONDS": "7200"}, r"\[0, 3600\]"),
+        ({"SPECTRAL_MAX_LAG_SECONDS": "nan"}, "SPECTRAL_MAX_LAG_SECONDS"),
     ],
 )
 def test_invalid_settings_are_rejected(env: dict[str, str], message: str) -> None:
@@ -161,8 +168,11 @@ def test_promotion_and_window_settings_are_read_from_the_environment() -> None:
             "PROMOTION_MIN_R2": "-0.5",
             "PROMOTION_MIN_ROC_AUC": "0.9",
             "PROMOTION_F1_TOLERANCE": "0",
+            "SPECTRAL_MAX_LAG_SECONDS": "0",
         }
     )
 
     assert settings.model.training_max_rows == 50_000 and settings.snapshot_window_days == 2
     assert settings.model.promotion == PromotionSettings(min_r2=-0.5, min_roc_auc=0.9, f1_tolerance=0.0)
+    assert settings.model.spectral_max_lag_seconds == 0.0
+    assert load_settings({"SPECTRAL_MAX_LAG_SECONDS": "120"}).model.spectral_max_lag_seconds == 120.0

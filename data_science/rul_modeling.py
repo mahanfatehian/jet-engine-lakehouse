@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import platform
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -259,16 +259,20 @@ def train_models(
     model_version: str,
     trained_at: str,
     hours_per_cycle: float,
+    feature_columns: Sequence[str] = FEATURE_COLUMNS,
 ) -> TrainedModel:
     """Fit the regressor and the calibrated classifier on the development lifecycles.
 
     The regressor trains on the train lifecycles and early-stops on the validation ones;
     the classifier's iteration count comes from the same validation lifecycles, its
     calibration and threshold from out-of-fold scores over both (failure_classifier.py).
+    ``feature_columns`` defaults to the full contract; the spectral ablation
+    (feature_ablation.py) passes the same columns without the spectral features.
     """
+    columns = tuple(feature_columns)
     categories = fit_categories(train_frame)
-    x_train = build_feature_matrix(train_frame, categories)
-    x_val = build_feature_matrix(validation_frame, categories)
+    x_train = build_feature_matrix(train_frame, categories, columns)
+    x_val = build_feature_matrix(validation_frame, categories, columns)
     failure_train = labels.failure_target(train_frame)
     failure_val = labels.failure_target(validation_frame)
     if np.unique(failure_train).size < 2 or np.unique(failure_val).size < 2:
@@ -288,7 +292,7 @@ def train_models(
         classifier=classifier.model,
         calibration=classifier.calibration,
         decision_threshold=classifier.threshold,
-        feature_columns=FEATURE_COLUMNS,
+        feature_columns=columns,
         categories=categories,
         failure_horizon_cycles=labels.failure_horizon_cycles,
         rul_cap_cycles=labels.rul_cap_cycles,

@@ -7,8 +7,10 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
+from feature_pipeline import SPECTRAL_FEATURE_COLUMNS
 from train_rul_model import TrainingRequest, run_training
 from training_sources import ClickHouseTrainingSource, training_select_sql
 from training_window import (
@@ -108,6 +110,38 @@ def test_applying_a_window_selects_groups_and_every_nth_pulse(synthetic_mart: pd
     first = synthetic_mart[synthetic_mart["split_group"] == window.groups[0]].sort_values("event_ts")
     expected = first["telemetry_id"].iloc[:: window.stride].tolist()
     assert selected[selected["split_group"] == window.groups[0]]["telemetry_id"].tolist() == expected
+
+
+@pytest.mark.parametrize("budget_share", [1.0, 0.1])
+def test_windows_keep_pulses_whose_spectral_features_are_missing(
+    synthetic_mart: pd.DataFrame, budget_share: float
+) -> None:
+    # The newest lifecycle is always in the window: give it no HF data at all.
+    newest = synthetic_mart.groupby("split_group")["event_ts"].max().idxmax()
+    frame = synthetic_mart.copy()
+    frame.loc[frame["split_group"] == newest, list(SPECTRAL_FEATURE_COLUMNS)] = np.nan
+    window = plan_training_window(
+        inventory_from_frame(frame), max_rows=int(len(frame) * budget_share), min_lifecycles=4
+    )
+
+    selected = apply_window(frame, window)
+
+    assert newest in window.groups and len(selected) == window.rows
+    expected = frame.set_index("telemetry_id").loc[selected["telemetry_id"], list(SPECTRAL_FEATURE_COLUMNS)]
+    pd.testing.assert_frame_equal(
+        selected[list(SPECTRAL_FEATURE_COLUMNS)].reset_index(drop=True), expected.reset_index(drop=True)
+    )
+    assert (
+        selected.loc[selected["split_group"] == newest, list(SPECTRAL_FEATURE_COLUMNS)].isna().all(axis=None)
+    )
+
+
+def test_training_query_selects_the_spectral_features() -> None:
+    window = plan_training_window(_inventory(100, 100, 100), max_rows=300, min_lifecycles=3)
+
+    sql, _ = training_select_sql("`mart_rul_training_features` FINAL", window)
+
+    assert all(f"`{column}` AS `{column}`" in sql for column in SPECTRAL_FEATURE_COLUMNS)
 
 
 def test_training_query_filters_lifecycles_and_thins_inside_clickhouse() -> None:

@@ -13,6 +13,9 @@
 4. A champion that cannot be compared because it was built for another feature schema or
    bundle format (a planned change), or whose production.json predates bundle digests (so it
    cannot be verified and is never unpickled), is "incomparable": the floors decide alone.
+   A champion whose inputs are all still available is compared, also when the challenger
+   has more features: a v1 champion with the 46 pulse features is re-scored on its own
+   columns of the same holdout as a challenger that adds the spectral features.
    Any other failure to re-score it (storage errors, digest mismatch, corrupt bundle, ...)
    keeps the champion: nothing is promoted until it can be scored again or an operator
    promotes explicitly with ``--promotion-policy always``.
@@ -45,6 +48,7 @@ class ChampionOutcome:
 
     ``challenger_holdout`` is set when the comparison had to leave out holdout lifecycles
     the champion was fitted on: the challenger's metrics on the same remaining lifecycles.
+    ``feature_count`` is the number of numeric features of a champion that could be loaded.
     """
 
     status: ChampionStatus
@@ -52,6 +56,7 @@ class ChampionOutcome:
     holdout: HoldoutMetrics | None = None
     detail: str = ""
     challenger_holdout: HoldoutMetrics | None = None
+    feature_count: int | None = None
 
     @classmethod
     def none(cls) -> ChampionOutcome:
@@ -68,6 +73,7 @@ class ChampionOutcome:
             "challenger_holdout": None
             if self.challenger_holdout is None
             else self.challenger_holdout.as_dict(),
+            "feature_count": self.feature_count,
         }
 
 

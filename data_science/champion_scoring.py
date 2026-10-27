@@ -2,16 +2,19 @@
 
 Every way this can go wrong is classified for model_promotion.decide_promotion:
 
-* INCOMPARABLE - a planned change: the champion's bundle format or feature schema differs
-  from the challenger's, or its production.json predates bundle digests (it is then never
-  unpickled). The quality floors decide alone.
+* INCOMPARABLE - a planned change: the champion's bundle format differs from the
+  challenger's, it needs feature columns the holdout no longer has, or its production.json
+  predates bundle digests (it is then never unpickled). The quality floors decide alone.
 * NO_UNSEEN_HOLDOUT - the champion was fitted on every holdout lifecycle (a small training
   window whose split fell back to an old lifecycle): it is kept until a fair comparison exists.
 * FAILED - anything else (storage errors, digest mismatch, corrupt bundle, ...): the gate
   keeps the champion (fails closed), the error is logged and the run is still recorded.
 
 Only holdout lifecycles the champion was not fitted on take part in the comparison, so it
-can never be flattered by lifecycles it was trained or early-stopped on.
+can never be flattered by lifecycles it was trained or early-stopped on. A champion whose
+features are a subset of the holdout's columns - a v1 model with the 46 pulse features next
+to a challenger that adds the spectral features - is COMPARABLE: it is re-scored on its own
+columns of the same rows, which is a fair comparison of what each model would serve.
 """
 
 from __future__ import annotations
@@ -28,13 +31,13 @@ from rul_modeling import IncompatibleModelError, LabelSpec, RulModelBundle, eval
 logger = logging.getLogger(__name__)
 
 
-def _incomparable(version: str, detail: str) -> ChampionOutcome:
+def _incomparable(version: str, detail: str, feature_count: int | None = None) -> ChampionOutcome:
     logger.warning(
         "production model %s is not comparable with the challenger (%s); the quality floors decide alone",
         version,
         detail,
     )
-    return ChampionOutcome(ChampionStatus.INCOMPARABLE, version, detail=detail)
+    return ChampionOutcome(ChampionStatus.INCOMPARABLE, version, detail=detail, feature_count=feature_count)
 
 
 def _failed(version: str, action: str, exc: Exception) -> ChampionOutcome:
@@ -88,12 +91,15 @@ def score_champion(
         return _incomparable(version, str(exc))
     except Exception as exc:
         return _failed(version, "load", exc)
+    features = len(champion.feature_columns)
     holdout_groups = set(test_frame["split_group"])
     unseen = holdout_groups - fitted_on
     if not unseen:
         detail = f"all {len(holdout_groups)} holdout lifecycles are among its training lifecycles"
         logger.warning("production model %s cannot be compared fairly: %s", version, detail)
-        return ChampionOutcome(ChampionStatus.NO_UNSEEN_HOLDOUT, version, detail=detail)
+        return ChampionOutcome(
+            ChampionStatus.NO_UNSEEN_HOLDOUT, version, detail=detail, feature_count=features
+        )
     if unseen == holdout_groups:
         frame, detail = test_frame, ""
     else:
@@ -106,10 +112,13 @@ def score_champion(
             evaluate_bundle(champion, frame, labels),
             detail=detail,
             challenger_holdout=evaluate_bundle(challenger, frame, labels) if detail else None,
+            feature_count=features,
         )
     except FeatureSchemaError as exc:
         if tuple(champion.feature_columns) != tuple(challenger.feature_columns):
-            return _incomparable(version, f"its feature schema differs from the challenger's: {exc}")
+            return _incomparable(
+                version, f"its feature schema differs from the challenger's: {exc}", features
+            )
         return _failed(version, "re-score", exc)
     except Exception as exc:
         return _failed(version, "re-score", exc)

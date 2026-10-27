@@ -11,6 +11,8 @@ from typing import Any
 
 from ds_settings import PromotionSettings
 from failure_classifier import CLASSIFIER_PARAMS, THRESHOLD_RULE
+from feature_ablation import AblationResult
+from feature_pipeline import NULLABLE_FEATURE_COLUMNS
 from model_promotion import ChampionOutcome, PromotionDecision
 from model_registry import ModelRunRecord
 from rul_metrics import HoldoutMetrics
@@ -48,6 +50,7 @@ class TrainingReport:
     rows: dict[str, int]
     trained: TrainedModel
     holdout: HoldoutMetrics
+    ablation: AblationResult
     champion: ChampionOutcome
     decision: PromotionDecision
     policy: str
@@ -97,11 +100,14 @@ class TrainingReport:
             calibration.threshold,
             THRESHOLD_RULE,
         )
+        logger.info("%s", self.ablation.describe())
         champion = self.champion.holdout
         if champion is not None:
             logger.info(
-                "champion %s on %s | RMSE %.2f | R2 %.3f | F1 %.3f",
+                "champion %s (%s features, challenger %d) on %s | RMSE %.2f | R2 %.3f | F1 %.3f",
                 self.champion.model_version,
+                self.champion.feature_count,
+                len(self.trained.bundle.feature_columns),
                 self.champion.detail or "the same holdout",
                 champion.rmse,
                 champion.r2,
@@ -127,6 +133,7 @@ class TrainingReport:
             "holdout": holdout.as_dict(),
             "validation": self.trained.validation.as_dict(),
             "calibration": calibration.as_dict(),
+            "ablation": self.ablation.summary(),
             "champion": self.champion.as_dict(),
             "promoted": self.decision.promote,
             "promotion_reason": self.decision.reason,
@@ -164,6 +171,9 @@ class TrainingReport:
             },
             "rows": dict(self.rows),
             "feature_columns": list(bundle.feature_columns),
+            "nullable_feature_columns": [
+                column for column in bundle.feature_columns if column in NULLABLE_FEATURE_COLUMNS
+            ],
             "categories": bundle.categories,
             "matrix_columns": bundle.matrix_columns,
             "labels": {
@@ -188,6 +198,7 @@ class TrainingReport:
                 "validation_fraction": VALIDATION_FRACTION,
             },
             "library_versions": bundle.library_versions,
+            "ablation": self.ablation.as_dict(),
             "promotion": self._promotion_document(),
         }
 
@@ -200,6 +211,8 @@ class TrainingReport:
             # on them, so these are optimistic; holdout and out_of_fold are the honest numbers.
             "validation": self.trained.validation.as_dict(),
             "out_of_fold": self.trained.calibration.as_dict(),
+            # Evidence only: the same models without the spectral features, on the same split.
+            "ablation": self.ablation.as_dict(),
             "champion": self.champion.as_dict(),
             "promotion": {"promoted": self.decision.promote, "reason": self.decision.reason},
         }
@@ -231,6 +244,7 @@ class TrainingReport:
             clf_ece=holdout["clf_ece"],
             bundle_sha256=bundle_sha256,
             promotion=metadata["promotion"],
+            ablation=metadata["ablation"],
             champion_rmse=None if champion is None else champion.as_dict()["rmse"],
             champion_clf_f1=None if champion is None else champion.as_dict()["clf_f1"],
         )

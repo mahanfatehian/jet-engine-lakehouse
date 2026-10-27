@@ -10,9 +10,12 @@ written with a single atomic PUT, so readers never see a partial file.
 
 A dataset whose export has no rows is never published: its newest snapshot keeps
 holding data (an empty export at stack start-up, before CDC rows have landed, would
-otherwise shadow it). The silver feature table is exported for the last
-SNAPSHOT_WINDOW_DAYS of event time only, so each snapshot stays bounded however long
-the stack runs; ClickHouse streams the export to a local file, never into memory.
+otherwise shadow it). The silver dataset is the dbt view int_ml_features - the complete
+model input (pulse and spectral features) of every pulse - exported for the last
+SNAPSHOT_WINDOW_DAYS of event time only, so each snapshot stays bounded however long the
+stack runs; ClickHouse streams the export to a local file, never into memory. It replaced
+the v1 export of int_sensor_rolling_features (whose features it contains): snapshots
+under silver/int_sensor_rolling_features/ are no longer written or pruned.
 """
 
 from __future__ import annotations
@@ -62,10 +65,10 @@ class SnapshotDataset:
         return f"{self.zone}/{self.table}/snapshot_ts="
 
 
-SILVER_ROLLING_FEATURES = SnapshotDataset("silver", "int_sensor_rolling_features", window_column="event_ts")
+SILVER_ML_FEATURES = SnapshotDataset("silver", "int_ml_features", window_column="event_ts")
 GOLD_TRAINING_FEATURES = SnapshotDataset("gold", "mart_rul_training_features")
 GOLD_HEALTH_STATUS = SnapshotDataset("gold", "fct_engine_health_status")
-SNAPSHOT_DATASETS = (SILVER_ROLLING_FEATURES, GOLD_TRAINING_FEATURES, GOLD_HEALTH_STATUS)
+SNAPSHOT_DATASETS = (SILVER_ML_FEATURES, GOLD_TRAINING_FEATURES, GOLD_HEALTH_STATUS)
 
 
 @dataclass(frozen=True)

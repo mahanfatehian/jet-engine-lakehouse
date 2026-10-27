@@ -6,10 +6,13 @@
 Rows come from the dbt gold mart (ClickHouse) or its newest non-empty MinIO snapshot, at
 most TRAINING_MAX_ROWS of them (the newest completed lifecycles, see training_window.py).
 Whole lifecycles are split into train / validation / test; the challenger is scored on the
-test lifecycles and, when a production model exists, so is the champion. The promotion
-gate (model_promotion.py) applies absolute quality floors to every promotion and, under
-MODEL_PROMOTION_POLICY=better, the champion comparison; it fails closed. Artifacts go to
-MinIO and every non-dry run is recorded in ClickHouse ml_model_runs.
+test lifecycles and, when a production model exists, so is the champion. Both models are
+also refitted without the spectral features on the identical split: that ablation is
+logged and recorded as evidence of what the HF path adds (feature_ablation.py) and never
+influences promotion. The promotion gate (model_promotion.py) applies absolute quality
+floors to every promotion and, under MODEL_PROMOTION_POLICY=better, the champion
+comparison; it fails closed. Artifacts go to MinIO and every non-dry run is recorded in
+ClickHouse ml_model_runs.
 
 Training needs max(MIN_TRAINING_LIFECYCLES, 3) completed lifecycles: the split needs at
 least one lifecycle per side. ``--skip-if-unchanged`` skips while the newest completed
@@ -33,6 +36,7 @@ from artifact_store import ArtifactStore, S3ArtifactStore
 from champion_scoring import score_champion
 from ds_runtime import EXIT_OK, PreconditionsNotMetError, StopToken, configure_logging, positive_int, run_cli
 from ds_settings import MIN_SPLIT_LIFECYCLES, PROMOTION_POLICIES, PromotionSettings, load_settings
+from feature_ablation import AblationResult, AblationRunner, run_ablation
 from lakehouse_io import ClickHouseGateway
 from model_promotion import ChampionOutcome, PromotionDecision, decide_promotion
 from model_registry import (
@@ -93,6 +97,7 @@ class TrainingContext:
     labels: LabelSpec
     hours_per_cycle: float
     stop: StopToken
+    ablate: AblationRunner = run_ablation
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,7 @@ class TrainingOutcome:
     holdout: HoldoutMetrics
     champion: ChampionOutcome
     decision: PromotionDecision
+    ablation: AblationResult
     artifact_uri: str | None
     bundle_sha256: str | None = None
 
@@ -252,6 +258,9 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
     )
     context.stop.raise_if_stopped()
     holdout = evaluate_bundle(trained.bundle, frames["test"], context.labels)
+    context.stop.raise_if_stopped()
+    ablation = context.ablate(frames, context.labels, trained, holdout)
+    context.stop.raise_if_stopped()
     champion = score_champion(context.store, pointer, frames["test"], trained.bundle, context.labels)
     decision = decide_promotion(request.promotion_policy, holdout, champion, request.gate)
     report = TrainingReport(
@@ -261,6 +270,7 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
         rows={side: len(frame) for side, frame in frames.items()},
         trained=trained,
         holdout=holdout,
+        ablation=ablation,
         champion=champion,
         decision=decision,
         policy=request.promotion_policy,
@@ -269,12 +279,12 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
     report.log()
     if request.dry_run:
         logger.info("dry run: no artifacts, run record or production pointer written")
-        return TrainingOutcome(model_version, split, holdout, champion, decision, None)
+        return TrainingOutcome(model_version, split, holdout, champion, decision, ablation, None)
     # Last safe point: once publishing starts it runs to completion.
     context.stop.raise_if_stopped()
     published = _publish(context, report)
     return TrainingOutcome(
-        model_version, split, holdout, champion, decision, published.uri, published.bundle_sha256
+        model_version, split, holdout, champion, decision, ablation, published.uri, published.bundle_sha256
     )
 
 

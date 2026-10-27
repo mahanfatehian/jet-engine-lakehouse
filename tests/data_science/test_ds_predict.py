@@ -300,3 +300,26 @@ def test_batch_cli_exits_1_when_the_bundle_cannot_be_verified(
 
     assert len(gateway.inserts) == (1 if with_digest else 0)
     assert ("refusing to serve the production model" in caplog.text) is not with_digest
+
+
+def test_batch_cli_passes_the_spectral_lag_limit_to_the_loader(
+    tmp_path: Path, synthetic_training, inference_frame, monkeypatch
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    _promote(store, synthetic_training.trained.bundle)
+    gateway = FakeGateway(inference_frame)
+    limits: list[float] = []
+
+    def loader(_gateway, *, spectral_max_lag_seconds: float) -> pd.DataFrame:
+        limits.append(spectral_max_lag_seconds)
+        return inference_frame
+
+    monkeypatch.setenv("SPECTRAL_MAX_LAG_SECONDS", "15")
+    monkeypatch.setattr(predict_rul, "load_inference_frame", loader)
+    monkeypatch.setattr(predict_rul, "S3ArtifactStore", lambda _settings: store)
+    monkeypatch.setattr(predict_rul, "ClickHouseGateway", lambda _settings: contextlib.nullcontext(gateway))
+    monkeypatch.setattr(predict_rul, "configure_logging", lambda _level: None)
+    monkeypatch.setattr(predict_rul, "StopToken", _NoSignals)
+
+    assert predict_rul.main(["--mode", "batch"]) == EXIT_OK
+    assert limits == [15.0] and len(gateway.inserts) == 1

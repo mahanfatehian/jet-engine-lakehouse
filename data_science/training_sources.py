@@ -4,6 +4,10 @@ gold snapshot in the lakehouse.
 Every source works in two steps so a run never holds more than TRAINING_MAX_ROWS rows:
 ``inventory()`` returns one line per completed lifecycle (rows, end of life), the trainer
 plans a TrainingWindow from it, and ``load(window)`` reads only the rows of that window.
+
+Gold snapshots written before the mart gained the spectral features (v1) stay readable:
+those columns are read as missing values, exactly like pulses whose HF frames never
+landed. Any other missing column is a schema error.
 """
 
 from __future__ import annotations
@@ -14,11 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from artifact_store import ArtifactStore
 from ds_runtime import PreconditionsNotMetError
-from feature_pipeline import TRAINING_FRAME_COLUMNS, FeatureSchemaError, column_list
+from feature_pipeline import NULLABLE_FEATURE_COLUMNS, TRAINING_FRAME_COLUMNS, FeatureSchemaError, column_list
 from lakehouse_io import ClickHouseGateway, final_modifier
 from lakehouse_snapshots import (
     GOLD_TRAINING_FEATURES,
@@ -133,6 +138,15 @@ class ClickHouseTrainingSource:
         return TrainingFrame(prepare_training_frame(frame), self.name, f"clickhouse:{TRAINING_SOURCE_TABLE}")
 
 
+@dataclass(frozen=True)
+class _LocalSnapshot:
+    """A downloaded gold snapshot and the nullable training columns it predates."""
+
+    ref: SnapshotRef
+    path: Path
+    absent_columns: tuple[str, ...]
+
+
 class SnapshotTrainingSource:
     """Training rows from the newest gold snapshot that holds rows (streamed to a temp file once).
 
@@ -144,7 +158,7 @@ class SnapshotTrainingSource:
     def __init__(self, store: ArtifactStore) -> None:
         self._store = store
         self._workdir: tempfile.TemporaryDirectory[str] | None = None
-        self._snapshot: tuple[SnapshotRef, Path] | None = None
+        self._snapshot: _LocalSnapshot | None = None
 
     def __enter__(self) -> SnapshotTrainingSource:
         return self
@@ -159,36 +173,47 @@ class SnapshotTrainingSource:
             self._workdir = None
             self._snapshot = None
 
-    def _local_snapshot(self) -> tuple[SnapshotRef, Path]:
+    def _local_snapshot(self) -> _LocalSnapshot:
         if self._snapshot is None:
             ref = latest_nonempty_snapshot(self._store, GOLD_TRAINING_FEATURES)
             if ref is None:
                 raise PreconditionsNotMetError(
                     f"no gold snapshot of {TRAINING_SOURCE_TABLE} with rows in the lakehouse yet"
                 )
-            logger.info("training from gold snapshot %s (%d rows)", self._store.uri(ref.key), ref.rows)
+            uri = self._store.uri(ref.key)
+            logger.info("training from gold snapshot %s (%d rows)", uri, ref.rows)
             self._workdir = tempfile.TemporaryDirectory(prefix="ds-train-snapshot-")
             path = Path(self._workdir.name) / SNAPSHOT_FILE_NAME
             self._store.download_file(ref.key, path)
             available = set(pq.ParquetFile(path).schema_arrow.names)
-            missing = sorted(set(TRAINING_FRAME_COLUMNS) - available)
+            missing = [column for column in TRAINING_FRAME_COLUMNS if column not in available]
+            required = sorted(column for column in missing if column not in NULLABLE_FEATURE_COLUMNS)
+            if required:
+                raise FeatureSchemaError(f"snapshot {uri} lacks columns: {', '.join(required)}")
             if missing:
-                raise FeatureSchemaError(
-                    f"snapshot {self._store.uri(ref.key)} lacks columns: {', '.join(missing)}"
+                logger.warning(
+                    "snapshot %s predates %d spectral feature columns (%s): they are read as missing",
+                    uri,
+                    len(missing),
+                    ", ".join(missing),
                 )
-            self._snapshot = (ref, path)
+            self._snapshot = _LocalSnapshot(ref, path, tuple(missing))
         return self._snapshot
 
     def inventory(self) -> LifecycleInventory:
         """Rows and end of life of every completed lifecycle in the snapshot."""
-        _, path = self._local_snapshot()
+        path = self._local_snapshot().path
         return inventory_from_frame(pq.read_table(path, columns=list(_INVENTORY_COLUMNS)).to_pandas())
 
     def load(self, window: TrainingWindow) -> TrainingFrame:
         """Read only the window's lifecycles (row-group filtering), then thin them if needed."""
-        ref, path = self._local_snapshot()
+        snapshot = self._local_snapshot()
+        columns = [column for column in TRAINING_FRAME_COLUMNS if column not in snapshot.absent_columns]
         table = pq.read_table(
-            path, columns=list(TRAINING_FRAME_COLUMNS), filters=[("split_group", "in", list(window.groups))]
+            snapshot.path, columns=columns, filters=[("split_group", "in", list(window.groups))]
         )
-        frame = apply_window(table.to_pandas(), window)
-        return TrainingFrame(prepare_training_frame(frame), self.name, self._store.uri(ref.key))
+        frame = table.to_pandas()
+        for column in snapshot.absent_columns:
+            frame[column] = np.nan
+        frame = apply_window(frame, window)
+        return TrainingFrame(prepare_training_frame(frame), self.name, self._store.uri(snapshot.ref.key))

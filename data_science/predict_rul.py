@@ -2,9 +2,12 @@
 
     python data_science/predict_rul.py [--mode batch|live] [--interval-seconds 30]
 
-Reads production.json and its model bundle from MinIO, the latest row per engine
-of int_sensor_rolling_features (plus the registry's operational status) from
+Reads production.json and its model bundle from MinIO, the newest pulse per engine
+of the dbt view int_ml_features (plus the registry's operational status) from
 ClickHouse, and appends one prediction per engine to gold_engine_rul_predictions.
+A newest pulse whose HF frame has not landed yet takes the spectral features of the
+engine's newest pulse whose frame has, from the same lifecycle and at most
+SPECTRAL_MAX_LAG_SECONDS older (inference_features.py).
 ``--mode live`` repeats every ``--interval-seconds`` until SIGTERM/SIGINT.
 
 The bundle is a pickle: its SHA-256 must match the ``bundle_sha256`` production.json
@@ -36,7 +39,8 @@ from ds_runtime import (
     run_cli,
 )
 from ds_settings import load_settings
-from feature_pipeline import RAW_SENSOR_COLUMNS, load_inference_frame
+from feature_pipeline import RAW_SENSOR_COLUMNS
+from inference_features import DEFAULT_SPECTRAL_MAX_LAG_SECONDS, INFERENCE_SOURCE_TABLE, load_inference_frame
 from lakehouse_io import ClickHouseGateway
 from model_registry import (
     ArtifactLayout,
@@ -182,13 +186,17 @@ class ProductionModelCache:
 
 
 def predict_once(
-    gateway: ClickHouseGateway, models: ProductionModelCache, *, hours_per_cycle: float
+    gateway: ClickHouseGateway,
+    models: ProductionModelCache,
+    *,
+    hours_per_cycle: float,
+    spectral_max_lag_seconds: float = DEFAULT_SPECTRAL_MAX_LAG_SECONDS,
 ) -> pd.DataFrame:
     """Score every engine once and append the predictions; return them."""
     bundle = models.current()
-    frame = load_inference_frame(gateway)
+    frame = load_inference_frame(gateway, spectral_max_lag_seconds=spectral_max_lag_seconds)
     if frame.empty:
-        raise PreconditionsNotMetError("int_sensor_rolling_features has no rows yet")
+        raise PreconditionsNotMetError(f"{INFERENCE_SOURCE_TABLE} has no rows yet")
     predictions = score_engines(
         bundle, frame, hours_per_cycle=hours_per_cycle, predicted_at=datetime.now(UTC)
     )
@@ -216,12 +224,18 @@ def run_live(
     hours_per_cycle: float,
     interval_seconds: float,
     stop: StopToken,
+    spectral_max_lag_seconds: float = DEFAULT_SPECTRAL_MAX_LAG_SECONDS,
 ) -> None:
     """Predict every ``interval_seconds`` until a stop is requested; errors never end the loop."""
     logger.info("live prediction every %.0fs (SIGTERM stops gracefully)", interval_seconds)
     while not stop.stop_requested:
         try:
-            predict_once(gateway, models, hours_per_cycle=hours_per_cycle)
+            predict_once(
+                gateway,
+                models,
+                hours_per_cycle=hours_per_cycle,
+                spectral_max_lag_seconds=spectral_max_lag_seconds,
+            )
         except PreconditionsNotMetError as exc:
             logger.info("nothing scored: %s", exc)
         except ModelIntegrityError as exc:
@@ -263,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         S3ArtifactStore(settings.s3), ArtifactLayout(settings.model.artifact_prefix)
     )
     hours_per_cycle = settings.model.flight_hours_per_cycle
+    max_lag = settings.model.spectral_max_lag_seconds
     with ClickHouseGateway(settings.clickhouse) as gateway:
         if args.mode == "live":
             run_live(
@@ -271,10 +286,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 hours_per_cycle=hours_per_cycle,
                 interval_seconds=args.interval_seconds,
                 stop=stop,
+                spectral_max_lag_seconds=max_lag,
             )
         else:
             try:
-                predict_once(gateway, models, hours_per_cycle=hours_per_cycle)
+                predict_once(
+                    gateway, models, hours_per_cycle=hours_per_cycle, spectral_max_lag_seconds=max_lag
+                )
             except ModelIntegrityError as exc:
                 logger.error("refusing to serve the production model: %s", exc)
                 return EXIT_FAILURE

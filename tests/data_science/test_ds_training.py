@@ -7,20 +7,26 @@ import pandas as pd
 import pytest
 from failure_classifier import (
     CALIBRATION_FOLDS,
+    CLASSIFIER_PARAMS,
     NEUTRAL_THRESHOLD,
     THRESHOLD_BOUNDS,
     PlattCalibration,
     fit_platt,
     group_folds,
+    out_of_fold_scores,
     select_threshold,
+    without_empty_columns,
 )
+from feature_pipeline import FEATURE_COLUMNS, SPECTRAL_FEATURE_COLUMNS, build_feature_matrix, fit_categories
 from rul_metrics import brier_score, evaluate_predictions, expected_calibration_error, nasa_scores
 from rul_modeling import (
     IncompatibleModelError,
     LabelSpec,
     RulModelBundle,
+    evaluate_bundle,
     feature_importance,
     split_groups,
+    train_models,
 )
 from scipy.special import expit
 from sklearn.metrics import f1_score
@@ -82,10 +88,106 @@ def test_regressor_and_classifier_learn_the_planted_signal(synthetic_training) -
     assert holdout.lifecycles == len(synthetic_training.split.test)
 
 
+def _patchy_spectral(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """Spectral features missing on ~40 % of the rows and on one whole lifecycle (HF disabled)."""
+    rng = np.random.default_rng(seed)
+    first_lifecycle = (frame["split_group"] == frame["split_group"].iloc[0]).to_numpy()
+    patchy = frame.copy()
+    patchy.loc[(rng.random(len(patchy)) < 0.4) | first_lifecycle, list(SPECTRAL_FEATURE_COLUMNS)] = np.nan
+    return patchy
+
+
+def test_both_models_train_calibrate_and_score_with_missing_spectral_features(
+    synthetic_training, label_spec: LabelSpec, hf_disabled
+) -> None:
+    frames = {
+        side: _patchy_spectral(frame, seed)
+        for seed, (side, frame) in enumerate(synthetic_training.frames.items())
+    }
+    assert all(frame[list(SPECTRAL_FEATURE_COLUMNS)].isna().mean().min() > 0.3 for frame in frames.values())
+
+    trained = train_models(
+        frames["train"],
+        frames["validation"],
+        label_spec,
+        model_version="rul-20260101T000000Z",
+        trained_at="2026-01-01T00:00:00+00:00",
+        hours_per_cycle=2.0,
+    )
+    holdout = evaluate_bundle(trained.bundle, frames["test"], label_spec)
+
+    report = trained.calibration
+    assert np.isfinite([report.calibration.slope, report.calibration.intercept, report.oof_brier]).all()
+    assert THRESHOLD_BOUNDS[0] <= report.threshold <= THRESHOLD_BOUNDS[1]
+    assert report.rows == len(frames["train"]) + len(frames["validation"])
+    assert holdout.rows == len(frames["test"]) and np.isfinite([holdout.rmse, holdout.clf_roc_auc]).all()
+    matrix = trained.bundle.feature_matrix(hf_disabled(frames["test"]))
+    probability = trained.bundle.predict_failure_probability(matrix)
+    assert np.isfinite(trained.bundle.predict_rul_cycles(matrix)).all()
+    assert ((probability > 0) & (probability < 1)).all()
+    # Still above the promotion floors (R2 0.5, ROC-AUC 0.75) with 40 % of the spectral values gone.
+    assert holdout.r2 > 0.5 and holdout.clf_roc_auc > 0.9
+
+
+def test_models_train_when_hf_is_disabled(synthetic_training, label_spec: LabelSpec, hf_disabled) -> None:
+    # scikit-learn's HistGradientBoosting cannot bin a column without any observed value.
+    frames = {side: hf_disabled(frame) for side, frame in synthetic_training.frames.items()}
+
+    trained = train_models(
+        frames["train"],
+        frames["validation"],
+        label_spec,
+        model_version="rul-20260101T000000Z",
+        trained_at="2026-01-01T00:00:00+00:00",
+        hours_per_cycle=2.0,
+    )
+
+    bundle = trained.bundle
+    assert bundle.feature_columns == FEATURE_COLUMNS
+    holdout = evaluate_bundle(bundle, frames["test"], label_spec)
+    assert holdout.r2 > 0.5 and np.isfinite(trained.calibration.oof_brier)
+    # With HF back, the served models still score: they simply never split on the spectral features.
+    live = bundle.feature_matrix(synthetic_training.frames["test"])
+    np.testing.assert_array_equal(
+        bundle.predict_rul_cycles(live), bundle.predict_rul_cycles(bundle.feature_matrix(frames["test"]))
+    )
+    importance = feature_importance(bundle).set_index("feature")["gain"]
+    assert importance[list(SPECTRAL_FEATURE_COLUMNS)].sum() == 0.0
+
+
+def test_empty_columns_become_constant_for_a_classifier_fit_only() -> None:
+    matrix = pd.DataFrame(
+        {"a": [1.0, np.nan, 3.0], "b": [np.nan, np.nan, np.nan], "c": [np.nan, 2.0, np.nan]}, dtype=np.float32
+    )
+
+    filled = without_empty_columns(matrix)
+
+    assert list(filled.columns) == ["a", "b", "c"] and (filled.dtypes == np.float32).all()
+    assert filled["b"].tolist() == [0.0, 0.0, 0.0]
+    pd.testing.assert_frame_equal(filled[["a", "c"]], matrix[["a", "c"]])
+    assert without_empty_columns(filled) is filled and matrix["b"].isna().all()
+
+
+def test_out_of_fold_scores_must_cover_every_row(synthetic_mart: pd.DataFrame, label_spec: LabelSpec) -> None:
+    matrix = build_feature_matrix(synthetic_mart, fit_categories(synthetic_mart))
+    assert matrix[list(SPECTRAL_FEATURE_COLUMNS)].isna().any(axis=None)
+    outcome = label_spec.failure_target(synthetic_mart)
+    folds = group_folds(synthetic_mart["split_group"].to_numpy())
+    params = {**CLASSIFIER_PARAMS, "early_stopping": False, "max_iter": 5}
+
+    scores = out_of_fold_scores(matrix, outcome, folds, params)
+
+    assert np.isfinite(scores).all() and len(scores) == len(matrix)
+    _, scored_rows = folds[0]
+    with pytest.raises(ValueError, match=f"{len(scored_rows)} rows got no finite out-of-fold score"):
+        out_of_fold_scores(matrix, outcome, folds[1:], params)
+
+
 def test_bundle_carries_its_contract(synthetic_training, label_spec: LabelSpec) -> None:
     trained = synthetic_training.trained
     bundle: RulModelBundle = trained.bundle
 
+    assert bundle.feature_columns == FEATURE_COLUMNS
     assert bundle.rul_cap_cycles == label_spec.rul_cap_cycles
     assert bundle.failure_horizon_cycles == label_spec.failure_horizon_cycles
     assert THRESHOLD_BOUNDS[0] <= bundle.decision_threshold <= THRESHOLD_BOUNDS[1]

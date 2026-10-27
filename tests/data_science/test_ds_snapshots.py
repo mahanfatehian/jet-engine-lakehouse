@@ -8,15 +8,16 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from artifact_store import ArtifactNotFoundError, LocalArtifactStore
 from ds_runtime import PreconditionsNotMetError, StopToken
-from feature_pipeline import INFERENCE_FRAME_COLUMNS
+from feature_pipeline import INFERENCE_FRAME_COLUMNS, SPECTRAL_FEATURE_COLUMNS, FeatureSchemaError
 from lakehouse_snapshots import (
     GOLD_HEALTH_STATUS,
     GOLD_TRAINING_FEATURES,
-    SILVER_ROLLING_FEATURES,
+    SILVER_ML_FEATURES,
     SNAPSHOT_DATASETS,
     format_snapshot_ts,
     latest_nonempty_snapshot,
@@ -60,7 +61,7 @@ class TailOnlyStore(LocalArtifactStore):
 
 def _tables(mart: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {
-        "int_sensor_rolling_features": mart.loc[:, list(INFERENCE_FRAME_COLUMNS)],
+        "int_ml_features": mart.loc[:, list(INFERENCE_FRAME_COLUMNS)],
         "mart_rul_training_features": mart.drop(columns=["wear_factor", "status"]),
         "fct_engine_health_status": pd.DataFrame({"engine_id": ["ENG-001"], "risk_band": ["LOW"]}),
     }
@@ -73,7 +74,7 @@ def _parquet(frame: pd.DataFrame) -> bytes:
 
 
 ENGINES = {
-    "int_sensor_rolling_features": "ReplacingMergeTree",
+    "int_ml_features": "View",
     "mart_rul_training_features": "ReplacingMergeTree",
     "fct_engine_health_status": "MergeTree",
 }
@@ -86,9 +87,14 @@ def test_snapshot_keys_follow_the_lakehouse_layout() -> None:
         == "gold/mart_rul_training_features/snapshot_ts=20261026T120000Z/data.parquet"
     )
     assert (
-        snapshot_key(SILVER_ROLLING_FEATURES, "20261026T120000Z")
-        == "silver/int_sensor_rolling_features/snapshot_ts=20261026T120000Z/data.parquet"
+        snapshot_key(SILVER_ML_FEATURES, "20261026T120000Z")
+        == "silver/int_ml_features/snapshot_ts=20261026T120000Z/data.parquet"
     )
+    assert [dataset.table for dataset in SNAPSHOT_DATASETS] == [
+        "int_ml_features",
+        "mart_rul_training_features",
+        "fct_engine_health_status",
+    ]
     assert snapshot_key(GOLD_HEALTH_STATUS, "20261026T120000Z").startswith("gold/fct_engine_health_status/")
     with pytest.raises(ValueError, match="snapshot id"):
         snapshot_key(GOLD_TRAINING_FEATURES, "2026-10-26")
@@ -141,16 +147,21 @@ def test_latest_snapshot_ignores_incomplete_and_foreign_prefixes(tmp_path: Path)
 
 
 def test_snapshot_query_windows_only_the_silver_features() -> None:
-    silver = snapshot_select_sql(SILVER_ROLLING_FEATURES, "ReplacingMergeTree", 7)
+    silver = snapshot_select_sql(SILVER_ML_FEATURES, "View", 7)
+    materialized = snapshot_select_sql(SILVER_ML_FEATURES, "ReplacingMergeTree", 2)
     gold = snapshot_select_sql(GOLD_HEALTH_STATUS, "MergeTree", 7)
 
     assert silver == (
-        "SELECT * FROM `int_sensor_rolling_features` FINAL WHERE `event_ts` >= "
-        "(SELECT max(`event_ts`) FROM `int_sensor_rolling_features` FINAL) - INTERVAL 7 DAY"
+        "SELECT * FROM `int_ml_features` WHERE `event_ts` >= "
+        "(SELECT max(`event_ts`) FROM `int_ml_features`) - INTERVAL 7 DAY"
+    )
+    assert materialized == (
+        "SELECT * FROM `int_ml_features` FINAL WHERE `event_ts` >= "
+        "(SELECT max(`event_ts`) FROM `int_ml_features` FINAL) - INTERVAL 2 DAY"
     )
     assert gold == "SELECT * FROM `fct_engine_health_status`"
     with pytest.raises(ValueError, match="window_days"):
-        snapshot_select_sql(SILVER_ROLLING_FEATURES, "ReplacingMergeTree", 0)
+        snapshot_select_sql(SILVER_ML_FEATURES, "View", 0)
 
 
 def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path, synthetic_mart) -> None:
@@ -169,8 +180,9 @@ def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path
             "20261026T020000Z",
             "20261026T030000Z",
         ]
-    assert all("FINAL" in query for query in exporter.queries if "int_sensor_rolling_features" in query)
-    assert all("INTERVAL 7 DAY" in query for query in exporter.queries if "int_sensor" in query)
+    silver_queries = [query for query in exporter.queries if "int_ml_features" in query]
+    assert len(silver_queries) == 4 and all("FINAL" not in query for query in silver_queries)
+    assert all("INTERVAL 7 DAY" in query for query in silver_queries)
     assert all("FINAL" not in query for query in exporter.queries if "fct_engine_health_status" in query)
 
     with SnapshotTrainingSource(store) as source:
@@ -194,7 +206,7 @@ def test_empty_datasets_are_not_published(tmp_path: Path, synthetic_mart, caplog
             FakeExporter(tables, ENGINES), store, retention=5, now=NOW + timedelta(hours=1), stop=StopToken()
         )
 
-    assert set(written) == {"int_sensor_rolling_features", "fct_engine_health_status"}
+    assert set(written) == {"int_ml_features", "fct_engine_health_status"}
     assert list_snapshot_ids(store, GOLD_TRAINING_FEATURES, complete_only=False) == ["20261026T120000Z"]
     assert list_snapshot_ids(store, GOLD_HEALTH_STATUS, complete_only=True)[-1] == "20261026T130000Z"
     assert "skipped mart_rul_training_features" in caplog.text
@@ -276,6 +288,51 @@ def test_training_from_lakehouse_uses_the_newest_snapshot_with_rows(
     assert set(loaded.frame["split_group"]) == set(window.groups) and len(loaded.frame) <= len(mart) // 2
     assert "training from gold snapshot" in caplog.text and "20261026T100000Z" in caplog.text
     assert not workdir.exists()
+
+
+def test_missing_spectral_values_survive_the_snapshot_round_trip(tmp_path: Path, synthetic_mart) -> None:
+    store = LocalArtifactStore(tmp_path)
+    run_snapshot(
+        FakeExporter(_tables(synthetic_mart), ENGINES), store, retention=5, now=NOW, stop=StopToken()
+    )
+
+    with SnapshotTrainingSource(store) as source:
+        window = plan_training_window(source.inventory(), max_rows=10**6, min_lifecycles=3)
+        loaded = source.load(window).frame
+
+    by_pulse = synthetic_mart.set_index("telemetry_id").loc[loaded["telemetry_id"]]
+    missing = by_pulse["fan_amp_bpfo_mean_5m"].isna().to_numpy()
+    assert missing.any() and np.array_equal(loaded["fan_amp_bpfo_mean_5m"].isna().to_numpy(), missing)
+    np.testing.assert_allclose(
+        loaded["oil_temp_c_mean_5m"].to_numpy()[~missing], by_pulse["oil_temp_c_mean_5m"].to_numpy()[~missing]
+    )
+
+
+def test_training_from_a_snapshot_written_before_the_spectral_features(
+    tmp_path: Path, synthetic_mart, caplog
+) -> None:
+    store = LocalArtifactStore(tmp_path)
+    v1_mart = synthetic_mart.drop(columns=["wear_factor", "status", *SPECTRAL_FEATURE_COLUMNS])
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T100000Z"), _parquet(v1_mart))
+
+    with caplog.at_level(logging.WARNING, logger="training_sources"), SnapshotTrainingSource(store) as source:
+        window = plan_training_window(source.inventory(), max_rows=len(v1_mart) // 2, min_lifecycles=3)
+        loaded = source.load(window)
+
+    frame = loaded.frame
+    assert set(frame["split_group"]) == set(window.groups) and len(frame) == window.rows
+    assert frame[list(SPECTRAL_FEATURE_COLUMNS)].isna().all(axis=None)
+    assert "predates 10 spectral feature columns" in caplog.text
+
+
+def test_a_snapshot_without_a_pulse_feature_is_a_schema_error(tmp_path: Path, synthetic_mart) -> None:
+    store = LocalArtifactStore(tmp_path)
+    broken = synthetic_mart.drop(columns=["wear_factor", "status", "egt_c_drift", "fan_amp_bpfo_mean_5m"])
+    store.put_bytes(snapshot_key(GOLD_TRAINING_FEATURES, "20261026T100000Z"), _parquet(broken))
+
+    with SnapshotTrainingSource(store) as source, pytest.raises(FeatureSchemaError) as raised:
+        source.inventory()
+    assert str(raised.value).endswith("lacks columns: egt_c_drift")
 
 
 def test_training_from_lakehouse_skips_without_snapshots(tmp_path: Path) -> None:

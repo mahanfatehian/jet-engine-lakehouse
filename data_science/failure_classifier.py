@@ -25,6 +25,13 @@ written out explicitly because the threshold search needs the same out-of-fold p
 5. The served classifier is refitted on all train + validation rows with the same iteration
    count, and its raw scores pass through the fitted sigmoid.
 
+Missing values (the spectral features) are routed by the trees natively. A feature with no
+observed value at all in a fit's rows - every spectral feature when HF is disabled, or in a
+fold that holds none of the few lifecycles with HF data - carries nothing to split on, but
+the pinned scikit-learn cannot bin it (it raises). Such a column is made constant for that
+fit only, which gives it a single bin: the trees can never split on it, exactly as if it
+were absent, while every model keeps the full input schema.
+
 Remaining caveat: calibration holds for lifecycles like the development ones; a shift in
 operating conditions (new failure behaviour, sensor drift) can still make the model
 over-confident, which the holdout Brier score and expected calibration error expose.
@@ -124,6 +131,25 @@ def fit_platt(score: np.ndarray, outcome: np.ndarray) -> PlattCalibration:
 Fold = tuple[np.ndarray, np.ndarray]
 
 
+def empty_columns(matrix: pd.DataFrame) -> list[str]:
+    """Columns of ``matrix`` without any observed value."""
+    return list(matrix.columns[matrix.isna().all(axis=0).to_numpy()])
+
+
+def without_empty_columns(matrix: pd.DataFrame) -> pd.DataFrame:
+    """``matrix`` with every column that has no observed value replaced by a constant (see above)."""
+    empty = empty_columns(matrix)
+    if not empty:
+        return matrix
+    return matrix.assign(**dict.fromkeys(empty, np.float32(0.0)))
+
+
+def _fit(
+    params: Mapping[str, Any], matrix: pd.DataFrame, outcome: np.ndarray, **fit_params: Any
+) -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(**params).fit(without_empty_columns(matrix), outcome, **fit_params)
+
+
 def group_folds(groups: Sequence[str] | np.ndarray, max_folds: int = CALIBRATION_FOLDS) -> list[Fold]:
     """Lifecycle-grouped (fit rows, scored rows) folds: every lifecycle is scored by exactly one fold."""
     groups = np.asarray(groups)
@@ -137,13 +163,21 @@ def group_folds(groups: Sequence[str] | np.ndarray, max_folds: int = CALIBRATION
 def out_of_fold_scores(
     matrix: pd.DataFrame, outcome: np.ndarray, folds: Sequence[Fold], params: Mapping[str, Any]
 ) -> np.ndarray:
-    """Raw decision scores of every row from a model fitted without the row's lifecycle."""
+    """Raw decision scores of every row from a model fitted without the row's lifecycle.
+
+    Missing feature values (the spectral features) are routed by the trees and still
+    yield a finite score, so a row left without one means the folds did not cover it;
+    that would poison the Platt fit, so it raises instead.
+    """
     scores = np.full(len(outcome), np.nan)
     for fit_rows, scored_rows in folds:
         if np.unique(outcome[fit_rows]).size < 2:
             raise ValueError("every calibration fold needs rows on both sides of the horizon")
-        model = HistGradientBoostingClassifier(**params).fit(matrix.iloc[fit_rows], outcome[fit_rows])
+        model = _fit(params, matrix.iloc[fit_rows], outcome[fit_rows])
         scores[scored_rows] = model.decision_function(matrix.iloc[scored_rows])
+    unscored = int(np.count_nonzero(~np.isfinite(scores)))
+    if unscored:
+        raise ValueError(f"{unscored} rows got no finite out-of-fold score; the folds must cover every row")
     return scores
 
 
@@ -258,8 +292,7 @@ def fit_failure_classifier(
     """Fit, calibrate and threshold the classifier; each side is (matrix, outcome, split groups)."""
     x_train, y_train, groups_train = train
     x_val, y_val, groups_val = validation
-    probe = HistGradientBoostingClassifier(**CLASSIFIER_PARAMS)
-    probe.fit(x_train, y_train, X_val=x_val, y_val=y_val)
+    probe = _fit(CLASSIFIER_PARAMS, x_train, y_train, X_val=x_val, y_val=y_val)
     n_iter = int(probe.n_iter_)
     params = {**CLASSIFIER_PARAMS, "early_stopping": False, "max_iter": n_iter}
 
@@ -271,7 +304,10 @@ def fit_failure_classifier(
     calibration = fit_platt(oof_scores, outcome)
     oof_probability = calibration.probability(oof_scores)
     threshold = select_threshold(outcome, oof_probability)
-    model = HistGradientBoostingClassifier(**params).fit(matrix, outcome)
+    empty = empty_columns(matrix)
+    if empty:
+        logger.info("classifier: %d features have no observed value and are not used: %s", len(empty), empty)
+    model = _fit(params, matrix, outcome)
     report = _report(
         outcome,
         oof_probability,

@@ -1,12 +1,12 @@
-"""ML feature contract, feature-matrix construction, the inference loader and snapshot export.
+"""ML feature contract, feature-matrix construction and the snapshot export CLI.
 
 CLI::
 
     python data_science/feature_pipeline.py snapshot [--retention N] [--window-days D]
 
-exports int_sensor_rolling_features (silver, last D days of event time, default
-SNAPSHOT_WINDOW_DAYS) plus mart_rul_training_features and fct_engine_health_status
-(gold) from ClickHouse to the lakehouse bucket as
+exports int_ml_features (silver: the model input of every pulse, last D days of event
+time, default SNAPSHOT_WINDOW_DAYS) plus mart_rul_training_features and
+fct_engine_health_status (gold) from ClickHouse to the lakehouse bucket as
 ``<zone>/<table>/snapshot_ts=<TS>/data.parquet`` and keeps the newest N snapshots per
 dataset (default SNAPSHOT_RETENTION). Datasets with 0 rows are not published.
 Exit codes: 0 done, 3 skipped (source tables missing or every source empty),
@@ -23,9 +23,9 @@ from datetime import UTC, datetime
 import numpy as np
 import pandas as pd
 from artifact_store import S3ArtifactStore
-from ds_runtime import EXIT_OK, PreconditionsNotMetError, StopToken, configure_logging, positive_int, run_cli
+from ds_runtime import EXIT_OK, StopToken, configure_logging, positive_int, run_cli
 from ds_settings import load_settings
-from lakehouse_io import ClickHouseGateway, final_modifier
+from lakehouse_io import ClickHouseGateway
 from lakehouse_snapshots import run_snapshot
 
 RAW_SENSOR_COLUMNS: tuple[str, ...] = (
@@ -37,8 +37,8 @@ RAW_SENSOR_COLUMNS: tuple[str, ...] = (
     "oil_pressure_psi",
 )
 
-# The 46 numeric model inputs of contract section 7, in a fixed order.
-FEATURE_COLUMNS: tuple[str, ...] = (
+# The 46 numeric inputs computed from the 1 Hz telemetry pulse (contract section 7), in a fixed order.
+PULSE_FEATURE_COLUMNS: tuple[str, ...] = (
     "cycle_number",
     *RAW_SENSOR_COLUMNS,
     "vibration_mm_s_mean_5m",
@@ -81,7 +81,28 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "fuel_flow_kg_h_drift_pct",
     "rpm_drift_pct",
 )
-EXPECTED_FEATURE_COUNT = 46
+# 5-minute means of the high-frequency frame features (contract v2 section 8), in a fixed
+# order. A pulse has none of them when the HF path is disabled or lagging, or dropped its frame.
+SPECTRAL_FEATURE_COLUMNS: tuple[str, ...] = (
+    "fan_amp_bpfo_mean_5m",
+    "fan_kurtosis_mean_5m",
+    "fan_crest_factor_mean_5m",
+    "fan_amp_1x_n1_mean_5m",
+    "core_amp_1x_n2_mean_5m",
+    "fan_band_energy_hf_mean_5m",
+    "oil_temp_c_mean_5m",
+    "oil_quantity_mean_5m",
+    "oil_filter_dp_mean_5m",
+    "egt_ab_split_mean_5m",
+)
+# Every numeric model input: the pulse features, then the spectral features.
+FEATURE_COLUMNS: tuple[str, ...] = (*PULSE_FEATURE_COLUMNS, *SPECTRAL_FEATURE_COLUMNS)
+# Only these may be missing (NULL, NaN, or non-finite which counts as missing): XGBoost and
+# HistGradientBoosting route missing values natively. A missing pulse feature is an error.
+NULLABLE_FEATURE_COLUMNS = frozenset(SPECTRAL_FEATURE_COLUMNS)
+EXPECTED_PULSE_FEATURE_COUNT = 46
+EXPECTED_SPECTRAL_FEATURE_COUNT = 10
+EXPECTED_FEATURE_COUNT = EXPECTED_PULSE_FEATURE_COUNT + EXPECTED_SPECTRAL_FEATURE_COUNT
 CATEGORICAL_COLUMNS: tuple[str, ...] = ("engine_model",)
 
 IDENTIFIER_COLUMNS = ("telemetry_id", "engine_id", "engine_model", "lifecycle_id", "cycle_number", "event_ts")
@@ -114,9 +135,6 @@ _FORBIDDEN_SUFFIXES = ("_id", "_ts", "_at")
 _FORBIDDEN_PREFIXES = ("cdc_", "kafka_")
 _FORBIDDEN_FRAGMENTS = ("wear", "rul", "failure", "status", "maintenance")
 
-INFERENCE_SOURCE_TABLE = "int_sensor_rolling_features"
-REGISTRY_TABLE = "raw_engine_status_registry"
-
 TRAINING_FRAME_COLUMNS: tuple[str, ...] = tuple(
     dict.fromkeys(
         (
@@ -143,6 +161,10 @@ class FeatureSchemaError(ValueError):
     """A feature frame does not match the feature contract."""
 
 
+class FeatureValueError(ValueError):
+    """A feature that must always be present holds a missing or non-finite value."""
+
+
 def is_forbidden_feature(column: str) -> bool:
     """True when ``column`` must never be used as a model input."""
     name = column.lower()
@@ -162,8 +184,14 @@ def assert_allowed_features(columns: Iterable[str]) -> None:
 
 
 def _check_feature_contract() -> None:
-    if len(set(FEATURE_COLUMNS)) != EXPECTED_FEATURE_COUNT or len(FEATURE_COLUMNS) != EXPECTED_FEATURE_COUNT:
-        raise FeatureSchemaError(f"FEATURE_COLUMNS must hold {EXPECTED_FEATURE_COUNT} unique columns")
+    for name, columns, expected in (
+        ("PULSE_FEATURE_COLUMNS", PULSE_FEATURE_COLUMNS, EXPECTED_PULSE_FEATURE_COUNT),
+        ("SPECTRAL_FEATURE_COLUMNS", SPECTRAL_FEATURE_COLUMNS, EXPECTED_SPECTRAL_FEATURE_COUNT),
+        # Unique over the concatenation also proves the two groups are disjoint.
+        ("FEATURE_COLUMNS", FEATURE_COLUMNS, EXPECTED_FEATURE_COUNT),
+    ):
+        if len(columns) != expected or len(set(columns)) != expected:
+            raise FeatureSchemaError(f"{name} must hold {expected} unique columns")
     assert_allowed_features((*FEATURE_COLUMNS, *CATEGORICAL_COLUMNS))
 
 
@@ -174,6 +202,18 @@ def _require_columns(frame: pd.DataFrame, columns: Iterable[str]) -> None:
     missing = [column for column in columns if column not in frame.columns]
     if missing:
         raise FeatureSchemaError(f"missing columns: {', '.join(missing)}")
+
+
+def spectral_present(frame: pd.DataFrame) -> np.ndarray:
+    """Per row: True when every spectral feature is present and finite."""
+    _require_columns(frame, SPECTRAL_FEATURE_COLUMNS)
+    values = frame.loc[:, list(SPECTRAL_FEATURE_COLUMNS)].to_numpy(dtype=np.float64, na_value=np.nan)
+    return np.isfinite(values).all(axis=1)
+
+
+def spectral_coverage(frame: pd.DataFrame) -> float:
+    """Share of rows whose spectral features are all present (NaN for an empty frame)."""
+    return float(spectral_present(frame).mean()) if len(frame) else float("nan")
 
 
 def fit_categories(frame: pd.DataFrame) -> dict[str, list[str]]:
@@ -196,6 +236,21 @@ def matrix_columns(feature_columns: Sequence[str], categories: Mapping[str, Sequ
     return [*feature_columns, *indicators]
 
 
+def _check_required_values(feature_columns: Sequence[str], finite: np.ndarray) -> None:
+    """Raise FeatureValueError when a non-nullable feature has a missing or non-finite value."""
+    invalid = {
+        column: int(count)
+        for column, count in zip(feature_columns, (~finite).sum(axis=0), strict=True)
+        if count and column not in NULLABLE_FEATURE_COLUMNS
+    }
+    if invalid:
+        detail = ", ".join(f"{column} ({count} rows)" for column, count in invalid.items())
+        raise FeatureValueError(
+            f"missing or non-finite values in features that must always be present: {detail}; "
+            "only the spectral features may be missing"
+        )
+
+
 def build_feature_matrix(
     frame: pd.DataFrame,
     categories: Mapping[str, Sequence[str]],
@@ -205,12 +260,15 @@ def build_feature_matrix(
 
     Numeric features come first in ``feature_columns`` order, followed by one-hot
     indicators of the persisted category levels: unseen or missing levels encode
-    as all zeros. Non-finite numbers become NaN, which both models treat as missing.
+    as all zeros. A missing or non-finite spectral feature becomes NaN, which both
+    models treat as missing; in any other feature it raises FeatureValueError.
     """
     assert_allowed_features((*feature_columns, *categories))
     _require_columns(frame, (*feature_columns, *categories))
     numeric = frame.loc[:, list(feature_columns)].to_numpy(dtype=np.float32, na_value=np.nan)
-    numeric[~np.isfinite(numeric)] = np.nan
+    finite = np.isfinite(numeric)
+    _check_required_values(feature_columns, finite)
+    numeric[~finite] = np.nan
     blocks = [numeric]
     for column, levels in categories.items():
         values = frame[column].astype(str).to_numpy(dtype=object)
@@ -227,34 +285,6 @@ def column_list(columns: Iterable[str], table_alias: str = "") -> str:
     """SELECT list of ``columns``, each quoted and aliased to its own name."""
     qualifier = f"{table_alias}." if table_alias else ""
     return ", ".join(f"{qualifier}`{column}` AS `{column}`" for column in columns)
-
-
-def load_inference_frame(gateway: ClickHouseGateway) -> pd.DataFrame:
-    """Latest feature row of every engine joined with its latest registry status.
-
-    ``operational_status`` is empty for engines without a registry row.
-    """
-    engines = gateway.table_engines([INFERENCE_SOURCE_TABLE, REGISTRY_TABLE])
-    missing = [table for table in (INFERENCE_SOURCE_TABLE, REGISTRY_TABLE) if table not in engines]
-    if missing:
-        raise PreconditionsNotMetError(f"tables do not exist yet: {', '.join(missing)}")
-    sql = f"""
-        SELECT {column_list(INFERENCE_FRAME_COLUMNS, "f")}, r.operational_status AS operational_status
-        FROM (
-            SELECT {column_list(INFERENCE_FRAME_COLUMNS)}
-            FROM `{INFERENCE_SOURCE_TABLE}` {final_modifier(engines[INFERENCE_SOURCE_TABLE])}
-            ORDER BY event_ts DESC, telemetry_id DESC
-            LIMIT 1 BY engine_id
-        ) AS f
-        LEFT JOIN (
-            SELECT engine_id, argMax(operational_status, cdc_lsn) AS operational_status
-            FROM `{REGISTRY_TABLE}`
-            WHERE is_deleted = 0
-            GROUP BY engine_id
-        ) AS r ON r.engine_id = f.engine_id
-        ORDER BY engine_id
-    """
-    return gateway.query_df(sql)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -277,8 +307,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--window-days",
         type=positive_int,
         default=None,
-        help="days of event time exported from int_sensor_rolling_features "
-        "(default: SNAPSHOT_WINDOW_DAYS, 7)",
+        help="days of event time exported from int_ml_features (default: SNAPSHOT_WINDOW_DAYS, 7)",
     )
     return parser.parse_args(argv)
 

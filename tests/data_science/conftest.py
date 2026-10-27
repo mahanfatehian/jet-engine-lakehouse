@@ -4,6 +4,13 @@ Sensor drift grows with a hidden wear w = (cycle / failure_cycle) ** 1.7 and eac
 lifecycle's failure mode amplifies its signature sensors. Rolling, delta and drift
 features follow the dbt definitions (time-based windows per lifecycle, baseline =
 mean of the first 10 cycles), so the frames match the feature contract exactly.
+
+Spectral features are 5-minute means of per-pulse HF frame features. The planted HF
+signal: a BEARING_DEGRADATION lifecycle fails early, while its performance wear (what the
+1 Hz channels see) has only reached (1 / BEARING_LIFE_STRETCH) ** 1.7; the defect shows
+long before in fan_amp_bpfo_mean_5m and fan_kurtosis_mean_5m (damage = (cycle /
+failure_cycle) ** 4), which therefore carry information the pulse features lack. Some
+lifecycles have an HF outage: a block of pulses without spectral features (NaN).
 """
 
 from __future__ import annotations
@@ -20,10 +27,12 @@ import pandas as pd
 import pytest
 from artifact_store import LocalArtifactStore
 from ds_runtime import StopToken
+from feature_ablation import AblationResult, AblationRunner, AblationStatus
 from feature_pipeline import (
     FEATURE_COLUMNS,
     INFERENCE_FRAME_COLUMNS,
     RAW_SENSOR_COLUMNS,
+    SPECTRAL_FEATURE_COLUMNS,
     TRAINING_FRAME_COLUMNS,
 )
 from model_registry import ArtifactLayout, ModelRunRecord, RunSummary
@@ -48,9 +57,15 @@ RUL_CAP = 125
 HORIZON = 25
 START = datetime(2026, 1, 1, tzinfo=UTC)
 CLICKHOUSE_DDL = Path(__file__).resolve().parents[2] / "infrastructure" / "clickhouse" / "init-db.sql"
+BEARING_LIFE_STRETCH = 1.8
+SPECTRAL_WINDOW = "300s"
+HF_OUTAGE_PROBABILITY = 0.3
 
 
-def _sensors(rng: np.random.Generator, model: str, mode: str, wear: np.ndarray) -> dict[str, np.ndarray]:
+def _sensors(
+    rng: np.random.Generator, model: str, mode: str, wear: np.ndarray, damage: np.ndarray
+) -> dict[str, np.ndarray]:
+    """1 Hz readings driven by the performance wear; a bearing defect only adds late vibration."""
     base = dict(zip(RAW_SENSOR_COLUMNS, BASELINE_LEVELS[model], strict=True))
     boost = {name: float(name == mode) for name in FAILURE_MODES}
     n = wear.size
@@ -68,7 +83,7 @@ def _sensors(rng: np.random.Generator, model: str, mode: str, wear: np.ndarray) 
         + 20 * wear * boost["COMPRESSOR_FOULING"]
         + noise(2.5),
         "vibration_mm_s": base["vibration_mm_s"]
-        * (1 + 0.8 * wear + 1.5 * wear * boost["BEARING_DEGRADATION"])
+        * (1 + 0.8 * wear + 0.25 * damage * boost["BEARING_DEGRADATION"])
         + noise(0.04),
         "fuel_flow_kg_h": base["fuel_flow_kg_h"]
         * (1 + 0.03 * wear + 0.04 * wear * boost["COMPRESSOR_FOULING"])
@@ -110,6 +125,51 @@ def _add_window_features(lifecycle: pd.DataFrame) -> pd.DataFrame:
     return lifecycle
 
 
+def _add_spectral_features(
+    lifecycle: pd.DataFrame, rng: np.random.Generator, mode: str, wear: np.ndarray, damage: np.ndarray
+) -> pd.DataFrame:
+    """5-minute means of HF frame features; only the bearing pair sees the defect, the rest the wear."""
+    n = len(lifecycle)
+
+    def noise(scale: float) -> np.ndarray:
+        return rng.normal(0.0, scale, n)
+
+    defect = damage * {"BEARING_DEGRADATION": 1.0, "OIL_SYSTEM_LEAK": 0.3}.get(mode, 0.05)
+    hot_section = float(mode in ("HPT_BLADE_EROSION", "COMPRESSOR_FOULING"))
+    frames = {
+        "fan_amp_bpfo": 0.03 + 2.0 * defect + np.abs(noise(0.01)),
+        "fan_kurtosis": 3.0 + 7.0 * defect + noise(0.12),
+        "fan_crest_factor": 2.4 + 0.3 * wear + noise(0.08),
+        "fan_amp_1x_n1": 0.6 * lifecycle["vibration_mm_s"].to_numpy() + noise(0.02),
+        "core_amp_1x_n2": 0.25 + 0.35 * wear * hot_section + noise(0.02),
+        "fan_band_energy_hf": np.clip(0.06 + 0.05 * wear + noise(0.01), 0.0, 1.0),
+        "oil_temp_c": 85.0 + 12.0 * wear + noise(0.6),
+        "oil_quantity": 18.0 - 0.4 * wear - 5.0 * wear**2 * float(mode == "OIL_SYSTEM_LEAK") + noise(0.05),
+        "oil_filter_dp": 8.0 + 1.5 * wear + noise(0.25),
+        "egt_ab_split": np.abs(2.0 + noise(0.3)),
+    }
+    index = pd.DatetimeIndex(lifecycle["event_ts"])
+    for name, values in frames.items():
+        rolling = pd.Series(values, index=index).rolling(SPECTRAL_WINDOW, closed="both").mean()
+        lifecycle[f"{name}_mean_5m"] = rolling.to_numpy()
+    return lifecycle
+
+
+def _hf_outage(lifecycle: pd.DataFrame, rng: np.random.Generator, probability: float) -> pd.DataFrame:
+    """Blank the spectral features of a block of pulses inside the first 72 % of the lifecycle."""
+    n = len(lifecycle)
+    if rng.random() < probability:
+        start = int(rng.uniform(0.1, 0.6) * n)
+        length = max(1, int(rng.uniform(0.05, 0.12) * n))
+        lifecycle.loc[lifecycle.index[start : start + length], list(SPECTRAL_FEATURE_COLUMNS)] = np.nan
+    return lifecycle
+
+
+def without_spectral(frame: pd.DataFrame) -> pd.DataFrame:
+    """Copy of ``frame`` whose spectral features are all missing (HF disabled)."""
+    return frame.assign(**dict.fromkeys(SPECTRAL_FEATURE_COLUMNS, np.nan))
+
+
 def make_lifecycles(
     *,
     n_engines: int = 4,
@@ -118,13 +178,16 @@ def make_lifecycles(
     pulses_per_cycle: int = 2,
     pulse_seconds: int = 10,
     observed_fraction: float | None = None,
+    modes: tuple[str, ...] = FAILURE_MODES,
+    hf_outage_probability: float = HF_OUTAGE_PROBABILITY,
 ) -> pd.DataFrame:
     """Telemetry-level feature rows of synthetic lifecycles.
 
     With ``observed_fraction`` each lifecycle is cut off at that share of its life
     (an engine still in service); otherwise every lifecycle runs to failure and
     carries the mart's label columns. Ground truth (wear_factor, status) is always
-    included so tests can prove it never reaches a model.
+    included so tests can prove it never reaches a model. Failure modes are drawn
+    from ``modes``; HF outages never reach the newest pulse of a lifecycle.
     """
     rng = np.random.default_rng(seed)
     frames = []
@@ -135,7 +198,7 @@ def make_lifecycles(
         clock = START + pd.Timedelta(days=engine_index)
         for lifecycle_id in range(1, lifecycles_per_engine + 1):
             failure_cycle = int(rng.integers(90, 171))
-            mode = FAILURE_MODES[int(rng.integers(len(FAILURE_MODES)))]
+            mode = modes[int(rng.integers(len(modes)))]
             last_cycle = (
                 failure_cycle
                 if observed_fraction is None
@@ -143,6 +206,9 @@ def make_lifecycles(
             )
             cycles = np.repeat(np.arange(1, last_cycle + 1), pulses_per_cycle)
             wear = np.clip((cycles / failure_cycle) ** 1.7, 0.0, 1.0)
+            stretch = BEARING_LIFE_STRETCH if mode == "BEARING_DEGRADATION" else 1.0
+            performance = np.clip((cycles / (stretch * failure_cycle)) ** 1.7, 0.0, 1.0)
+            damage = np.clip(cycles / failure_cycle, 0.0, 1.0) ** 4
             lifecycle = pd.DataFrame(
                 {
                     "telemetry_id": np.arange(telemetry_id, telemetry_id + cycles.size, dtype=np.uint64),
@@ -151,7 +217,7 @@ def make_lifecycles(
                     "lifecycle_id": np.uint32(lifecycle_id),
                     "cycle_number": cycles.astype(np.uint32),
                     "event_ts": pd.date_range(clock, periods=cycles.size, freq=f"{pulse_seconds}s"),
-                    **_sensors(rng, model, mode, wear),
+                    **_sensors(rng, model, mode, performance, damage),
                     "wear_factor": wear,
                     "status": np.select(
                         [wear >= 1.0, wear >= 0.8, wear >= 0.5], ["FAILURE", "CRITICAL", "WARNING"], "HEALTHY"
@@ -161,6 +227,10 @@ def make_lifecycles(
             telemetry_id += cycles.size
             clock = lifecycle["event_ts"].iloc[-1] + pd.Timedelta(minutes=30)
             lifecycle = _add_window_features(lifecycle)
+            # Own stream per lifecycle: the HF features never shift the pulse data's random draws.
+            hf_rng = np.random.default_rng([seed, engine_index, lifecycle_id])
+            lifecycle = _add_spectral_features(lifecycle, hf_rng, mode, performance, damage)
+            lifecycle = _hf_outage(lifecycle, hf_rng, hf_outage_probability)
             if observed_fraction is None:
                 rul = failure_cycle - lifecycle["cycle_number"].astype(np.int64)
                 lifecycle["failure_cycle"] = np.uint32(failure_cycle)
@@ -197,6 +267,7 @@ def synthetic_mart() -> pd.DataFrame:
     frame = make_lifecycles()
     assert set(TRAINING_FRAME_COLUMNS) <= set(frame.columns)
     assert set(FEATURE_COLUMNS) <= set(frame.columns)
+    assert frame[list(SPECTRAL_FEATURE_COLUMNS)].isna().any(axis=None)
     return frame
 
 
@@ -210,6 +281,12 @@ def make_mart() -> Callable[..., pd.DataFrame]:
 def latest_rows_of() -> Callable[[pd.DataFrame], pd.DataFrame]:
     """Turns synthetic lifecycles into an inference frame (latest row per engine)."""
     return latest_rows
+
+
+@pytest.fixture(scope="session")
+def hf_disabled() -> Callable[[pd.DataFrame], pd.DataFrame]:
+    """Removes every spectral value from a frame, as if the HF path were disabled."""
+    return without_spectral
 
 
 @pytest.fixture(scope="session")
@@ -288,12 +365,23 @@ class MemoryRunRegistry:
 ARTIFACT_LAYOUT = ArtifactLayout("ml-artifacts/rul_model")
 
 
+def unmeasured_ablation(frames, labels, production, holdout) -> AblationResult:
+    """Stand-in for run_ablation in training-run tests that are not about it (it doubles training time)."""
+    return AblationResult(
+        AblationStatus.SKIPPED, 0.0, (), {}, 0.0, holdout, detail="not measured in this test"
+    )
+
+
 @pytest.fixture
 def make_context(label_spec: LabelSpec) -> Callable[..., TrainingContext]:
     """Factory of TrainingContexts over a local store, an in-memory mart and run registry."""
 
     def build(
-        root: Path, frame: pd.DataFrame, runs: MemoryRunRegistry | None = None, store=None
+        root: Path,
+        frame: pd.DataFrame,
+        runs: MemoryRunRegistry | None = None,
+        store=None,
+        ablate: AblationRunner = unmeasured_ablation,
     ) -> TrainingContext:
         return TrainingContext(
             source=FrameSource(frame),
@@ -303,6 +391,7 @@ def make_context(label_spec: LabelSpec) -> Callable[..., TrainingContext]:
             labels=label_spec,
             hours_per_cycle=2.0,
             stop=StopToken(),
+            ablate=ablate,
         )
 
     return build

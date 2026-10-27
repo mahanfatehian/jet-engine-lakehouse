@@ -252,19 +252,21 @@ def test_policy_always_promotes_past_a_failed_champion_but_not_past_the_floors(
     assert [record.promoted for record in context.runs.records] == [False, True]
 
 
-def test_champion_with_another_feature_schema_is_incomparable(
+def test_champion_needing_a_column_the_holdout_lacks_is_incomparable(
     tmp_path: Path, synthetic_mart, synthetic_training, make_context
 ) -> None:
     store = LocalArtifactStore(tmp_path)
     champion = synthetic_training.trained.bundle
+    # A future feature this mart does not have: the champion cannot be scored on the holdout.
     _promote_bundle(
-        store, replace(champion, feature_columns=(*champion.feature_columns, "fan_amp_bpfo_mean_5m"))
+        store, replace(champion, feature_columns=(*champion.feature_columns, "fan_envelope_bpfo_mean_5m"))
     )
 
     outcome = run_training(_request(), make_context(tmp_path, synthetic_mart, store=store), now=T0)
 
     assert outcome.champion.status is ChampionStatus.INCOMPARABLE
-    assert "fan_amp_bpfo_mean_5m" in outcome.champion.detail
+    assert "fan_envelope_bpfo_mean_5m" in outcome.champion.detail
+    assert outcome.champion.feature_count == len(champion.feature_columns) + 1
     assert outcome.decision.promote and "floors alone" in outcome.decision.reason
 
 

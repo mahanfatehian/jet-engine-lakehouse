@@ -15,6 +15,8 @@ PROMOTION_POLICIES = ("better", "always")
 # The train/validation/test split needs one lifecycle per side, whatever
 # MIN_TRAINING_LIFECYCLES says; fewer completed lifecycles skip training (exit 3).
 MIN_SPLIT_LIFECYCLES = 3
+# Upper bound of SPECTRAL_MAX_LAG_SECONDS: older spectral values say little about the present.
+MAX_SPECTRAL_LAG_SECONDS = 3600.0
 
 
 class ConfigError(ValueError):
@@ -59,7 +61,11 @@ class PromotionSettings:
 
 @dataclass(frozen=True)
 class ModelSettings:
-    """Labelling, training and serving parameters of the RUL model."""
+    """Labelling, training and serving parameters of the RUL model.
+
+    ``spectral_max_lag_seconds``: how much older the pulse whose spectral features fill in
+    for a lagging newest pulse may be at inference (0 disables the carry-forward).
+    """
 
     failure_horizon_cycles: int
     rul_cap_cycles: int
@@ -69,6 +75,7 @@ class ModelSettings:
     artifact_prefix: str
     training_max_rows: int = 600_000
     promotion: PromotionSettings = field(default_factory=PromotionSettings)
+    spectral_max_lag_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -154,6 +161,9 @@ def _model_settings(env: Mapping[str, str]) -> ModelSettings:
         artifact_prefix=prefix,
         training_max_rows=_integer(env, "TRAINING_MAX_ROWS", 600_000, minimum=1000),
         promotion=_promotion_settings(env),
+        spectral_max_lag_seconds=_float_in_range(
+            env, "SPECTRAL_MAX_LAG_SECONDS", 60.0, 0.0, MAX_SPECTRAL_LAG_SECONDS
+        ),
     )
 
 
