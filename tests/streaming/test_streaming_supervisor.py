@@ -318,7 +318,7 @@ def test_kafka_data_loss_is_reported_with_its_recovery_steps(caplog: pytest.LogC
     platform.starters["bronze_t"].current.fail(DATA_LOSS_ERROR)
     with caplog.at_level(logging.ERROR):
         platform.supervisor.step()
-    assert "query bronze_t stopped at a gap in the Kafka CDC log" in caplog.text
+    assert "query bronze_t stopped at a gap in its Kafka topic" in caplog.text
     assert "recover bronze_t like this" in caplog.text
     assert "Cannot fetch offset 100" in platform.state("bronze_t")["last_error"]
     platform.restart_due("bronze_t")  # retried: e.g. an operator reset the checkpoint meanwhile
@@ -348,7 +348,7 @@ def test_ordinary_failures_do_not_mention_data_loss(caplog: pytest.LogCaptureFix
     platform.starters["clickhouse_raw"].current.fail(FOREACH_BATCH_ERROR)
     with caplog.at_level(logging.ERROR):
         platform.supervisor.step()
-    assert "gap in the Kafka CDC log" not in caplog.text
+    assert "gap in its Kafka topic" not in caplog.text
     assert platform.state("clickhouse_raw")["last_error"] == (
         "An exception was raised by the Python Proxy. Return Message: "
         "clickhouse_connect.driver.exceptions.OperationalError: connection refused"

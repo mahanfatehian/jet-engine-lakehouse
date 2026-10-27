@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from streaming_config import ConfigError, load_settings, spark_conf
+from streaming_config import AVRO_DECODER_LIMITS, ConfigError, load_settings, spark_conf, trigger_interval
 
 COMPOSE_ENV = {
     "KAFKA_BOOTSTRAP_SERVERS": "kafka:29092",
@@ -25,6 +25,11 @@ COMPOSE_ENV = {
     "MAX_OFFSETS_PER_TRIGGER": "20000",
     "SPARK_DRIVER_MEMORY": "2g",
     "SPARK_LOG_LEVEL": "WARN",
+    "HF_TOPIC": "engine_hf.sensor_frames",
+    "HF_SCHEMA_PATH": "/schemas/engine_sensor_frame.avsc",
+    "HF_LAKE_TRIGGER_SECONDS": "60",
+    "HF_CLICKHOUSE_TRIGGER_SECONDS": "10",
+    "HF_MAX_OFFSETS_PER_TRIGGER": "2000",
 }
 
 
@@ -48,6 +53,39 @@ def test_defaults_target_host_published_ports() -> None:
         "WARN",
         "INFO",
     )
+
+
+def test_hf_defaults_follow_the_v2_contract() -> None:
+    settings = load_settings({})
+    assert (settings.hf_topic, settings.hf_schema_path) == (
+        "engine_hf.sensor_frames",
+        "/schemas/engine_sensor_frame.avsc",
+    )
+    assert (settings.hf_lake_trigger_seconds, settings.hf_clickhouse_trigger_seconds) == (60.0, 10.0)
+    assert settings.hf_max_offsets_per_trigger == 2000
+    assert settings.hf_fail_on_data_loss is False  # best effort, unlike the CDC queries
+    assert settings.hf_bronze_retention_days == 1
+
+
+def test_hf_settings_are_read_from_the_environment() -> None:
+    settings = load_settings(
+        {
+            "HF_TOPIC": "engine_hf.benchmark",
+            "HF_SCHEMA_PATH": "infrastructure/schemas/engine_sensor_frame.avsc",
+            "HF_LAKE_TRIGGER_SECONDS": "30",
+            "HF_CLICKHOUSE_TRIGGER_SECONDS": "2.5",
+            "HF_MAX_OFFSETS_PER_TRIGGER": "50000",
+            "HF_FAIL_ON_DATA_LOSS": "true",
+            "HF_BRONZE_RETENTION_DAYS": "7",
+        }
+    )
+    assert (settings.hf_topic, settings.hf_schema_path) == (
+        "engine_hf.benchmark",
+        "infrastructure/schemas/engine_sensor_frame.avsc",
+    )
+    assert (settings.hf_lake_trigger_seconds, settings.hf_clickhouse_trigger_seconds) == (30.0, 2.5)
+    assert (settings.hf_max_offsets_per_trigger, settings.hf_fail_on_data_loss) == (50000, True)
+    assert settings.hf_bronze_retention_days == 7
 
 
 def test_compose_environment_is_honoured() -> None:
@@ -131,6 +169,13 @@ def test_repr_hides_secrets() -> None:
         ("KAFKA_FAIL_ON_DATA_LOSS", "maybe"),
         ("KAFKA_FAIL_ON_DATA_LOSS", ""),
         ("STREAMING_HEARTBEAT_FILE", " "),
+        ("HF_TOPIC", " "),
+        ("HF_SCHEMA_PATH", ""),
+        ("HF_MAX_OFFSETS_PER_TRIGGER", "0"),
+        ("HF_LAKE_TRIGGER_SECONDS", "-1"),
+        ("HF_CLICKHOUSE_TRIGGER_SECONDS", "nan"),
+        ("HF_FAIL_ON_DATA_LOSS", "sometimes"),
+        ("HF_BRONZE_RETENTION_DAYS", "0"),
     ],
 )
 def test_invalid_values_raise_config_error(name: str, value: str) -> None:
@@ -153,6 +198,22 @@ def test_spark_conf_targets_minio_with_utc_semantics() -> None:
     assert conf["spark.hadoop.fs.s3a.aws.credentials.provider"].endswith("SimpleAWSCredentialsProvider")
     assert conf["spark.hadoop.fs.s3a.access.key"] == "minioadmin"
     assert conf["spark.hadoop.fs.s3a.secret.key"] == "s3-secret"
+
+
+def test_spark_conf_bounds_avro_decoding_and_arrow_batches() -> None:
+    conf = spark_conf(load_settings({}))
+    java_options = conf["spark.driver.extraJavaOptions"].split()
+    assert java_options == ["-Duser.timezone=UTC", *AVRO_DECODER_LIMITS]
+    limits = dict(option.removeprefix("-D").split("=") for option in AVRO_DECODER_LIMITS)
+    assert int(limits["org.apache.avro.limits.bytes.maxLength"]) >= 8 * 1024 * 1024  # topic message limit
+    assert int(limits["org.apache.avro.limits.string.maxLength"]) < 2**31 - 8  # below the JVM default
+    assert int(limits["org.apache.avro.limits.collectionItems.maxLength"]) > 65535  # UInt16 check decides
+    assert int(conf["spark.sql.execution.arrow.maxRecordsPerBatch"]) <= 1024
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [(60.0, "60000 milliseconds"), (0.0001, "1 milliseconds")])
+def test_trigger_interval_is_in_whole_milliseconds(seconds: float, expected: str) -> None:
+    assert trigger_interval(seconds) == expected
 
 
 def test_spark_conf_enables_ssl_for_https_endpoints() -> None:

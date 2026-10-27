@@ -1,4 +1,4 @@
-"""Construction of the seven streaming queries, grouped by the dependencies they need.
+"""Construction of the ten streaming queries, grouped by the dependencies they need.
 
 Path A, group ``lake`` (Kafka + MinIO) - parquet file sinks, one Kafka source and checkpoint
 per query:
@@ -8,6 +8,9 @@ Path B, group ``clickhouse`` (Kafka + ClickHouse) - one query over the three top
 at-least-once into ReplacingMergeTree tables:
     clickhouse_raw  -> raw_engine_telemetry / raw_engine_status_registry /
                        raw_maintenance_log / raw_cdc_dead_letter (foreachBatch)
+The high-frequency sensor frames add bronze_engine_sensor_frames and
+silver_engine_hf_features to the lake group and clickhouse_hf_features to the ClickHouse
+group (see ``hf_queries``); the CDC queries of a group are started first.
 
 The lake is exactly-once only for readers that honour ``<table path>/_spark_metadata``, that
 is Spark reading the table root. A micro-batch first writes its part files into the partition
@@ -38,12 +41,13 @@ from cdc_transforms import (
     parse_cdc_records,
     silver_records,
 )
-from clickhouse_rows import TableBatch, split_collected
+from clickhouse_rows import RowWriter, TableBatch, split_collected
+from hf_queries import build_hf_query_specs
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as sf
 from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from pyspark.sql.streaming.listener import QueryProgressEvent, QueryStartedEvent, QueryTerminatedEvent
-from streaming_config import StreamingSettings
+from streaming_config import StreamingSettings, trigger_interval
 from streaming_readiness import check_clickhouse_dependencies, check_lake_dependencies
 from streaming_supervisor import QueryGroup, QuerySpec
 
@@ -55,18 +59,14 @@ LAKE_GROUP = "lake"
 _ERROR_POSITION = DEAD_LETTER_COLUMNS.index("error")
 
 
-class RowWriter(Protocol):
-    """Destination of insert-ready rows (``clickhouse_sink.ClickHouseWriter`` in production)."""
-
-    def insert_rows(self, table: str, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
-        """Insert ``rows`` into ``table`` using exactly ``columns``."""
-
-
 class ClickHouseDestination(Protocol):
-    """Readiness check and writer of Path B (``clickhouse_sink.ClickHouseTarget`` in production)."""
+    """Readiness checks and writer of Path B (``clickhouse_sink.ClickHouseTarget`` in production)."""
 
     def check_ready(self) -> None:
         """Raise unless ClickHouse is connected and has every raw table."""
+
+    def check_tables(self, tables: Iterable[str]) -> None:
+        """Raise unless ``tables`` exist as well (the HF feature query checks its own tables)."""
 
     @property
     def writer(self) -> RowWriter:
@@ -185,7 +185,9 @@ def build_query_groups(
     Each query is described by a factory, so that the supervisor can restart it from its
     checkpoint without touching the others.
     """
+    hf = build_hf_query_specs(spark, settings, clickhouse)
     lake_queries = tuple(spec for table in TABLES for spec in _lake_query_specs(spark, settings, table))
+    lake_queries += hf.lake
     spark.streams.addListener(ProgressLogger(spec.name for spec in lake_queries))
     clickhouse_query = QuerySpec(
         CLICKHOUSE_QUERY_NAME,
@@ -194,7 +196,9 @@ def build_query_groups(
     )
     return (
         QueryGroup(
-            CLICKHOUSE_GROUP, partial(_check_clickhouse_ready, settings, clickhouse), (clickhouse_query,)
+            CLICKHOUSE_GROUP,
+            partial(_check_clickhouse_ready, settings, clickhouse),
+            (clickhouse_query, *hf.clickhouse),
         ),
         QueryGroup(LAKE_GROUP, partial(check_lake_dependencies, settings), lake_queries),
     )
@@ -246,7 +250,7 @@ def _start_clickhouse_query(
         .writeStream.queryName(CLICKHOUSE_QUERY_NAME)
         .foreachBatch(ClickHouseBatchHandler(clickhouse.writer, topics))
         .option("checkpointLocation", settings.checkpoint_path(CLICKHOUSE_QUERY_NAME))
-        .trigger(processingTime=_interval(settings.clickhouse_trigger_seconds))
+        .trigger(processingTime=trigger_interval(settings.clickhouse_trigger_seconds))
         .start()
     )
 
@@ -264,7 +268,7 @@ def _start_parquet_sink(
         .partitionBy(partition_column)
         .option("path", path)
         .option("checkpointLocation", settings.checkpoint_path(query_name))
-        .trigger(processingTime=_interval(settings.lake_trigger_seconds))
+        .trigger(processingTime=trigger_interval(settings.lake_trigger_seconds))
         .start()
     )
 
@@ -286,7 +290,3 @@ def _lake_recovery(settings: StreamingSettings, query_name: str, path: str) -> s
         f"starts again at batch 0 and the file sink skips every batch id already committed in "
         f"{path}/_spark_metadata."
     )
-
-
-def _interval(seconds: float) -> str:
-    return f"{max(1, round(seconds * 1000))} milliseconds"

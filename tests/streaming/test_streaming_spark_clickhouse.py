@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import json
 import math
-import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,20 +53,6 @@ def round_trip_message(sample_messages: list[Any]) -> Any:
     envelope["after"].update(telemetry_id=3, event_ts=ROUND_TRIP_TEXT)
     envelope["source"]["lsn"] = 26871000
     return base._replace(key='{"telemetry_id":3}', value=json.dumps(envelope), partition=1, offset=0)
-
-
-@pytest.fixture
-def non_utc_process_timezone(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Run the test with the Python process in UTC+03:30 (Iran, no DST)."""
-    if hasattr(time, "tzset"):
-        monkeypatch.setenv("TZ", "IRST-03:30")
-        time.tzset()
-    if not datetime(2026, 10, 26, 9).astimezone().utcoffset():
-        pytest.skip("cannot switch this process to a non-UTC local timezone")
-    yield
-    monkeypatch.undo()
-    if hasattr(time, "tzset"):
-        time.tzset()
 
 
 def test_batch_is_routed_per_table_with_dedup_and_dead_letters(sample_messages, records_frame) -> None:

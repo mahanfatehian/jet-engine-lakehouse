@@ -250,7 +250,7 @@ class QuerySupervisor:
             logger.error("full error of query %s:\n%s", entry.spec.name, text)
         if is_kafka_data_loss(text):
             logger.error(
-                "query %s stopped at a gap in the Kafka CDC log: records it had not read yet were "
+                "query %s stopped at a gap in its Kafka topic: records it had not read yet were "
                 "deleted by the topic retention, so it fails until an operator acts. %s",
                 entry.spec.name,
                 entry.spec.data_loss_recovery,

@@ -5,18 +5,22 @@ the host-published ports on ``localhost`` so that the module (and its unit tests
 no environment set; docker compose always injects the in-network service addresses.
 
 The job itself runs in its image (compose service ``streaming``, ``make stream``): the
-image bakes the Kafka source and S3A jars (spark-sql-kafka-0-10 with its Kafka client
-dependencies, hadoop-aws, aws-java-sdk-bundle) into ``pyspark/jars`` and creates the
-default ``CHECKPOINT_DIR``. A pip-installed PySpark has none of these jars, so a plain host
-run fails with "Failed to find data source: kafka" or a missing S3AFileSystem class. A host
-run additionally needs Java 17, the jars resolved at startup, for example::
+image bakes the Kafka source, Avro and S3A jars (spark-sql-kafka-0-10 with its Kafka client
+dependencies, spark-avro, hadoop-aws, aws-java-sdk-bundle) into ``pyspark/jars``, puts the
+job's modules on the PYTHONPATH of Spark's Python workers and creates the default
+``CHECKPOINT_DIR``. A pip-installed PySpark has none of these jars, so a plain host run fails
+with "Failed to find data source: kafka" or a missing S3AFileSystem class. A host run
+additionally needs Java 17, the requirements.txt packages, the jars resolved at startup, for
+example (from ``streaming/``, so that the workers find the job's modules)::
 
-    PKGS=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.apache.hadoop:hadoop-aws:3.3.4
-    PYSPARK_SUBMIT_ARGS="--packages $PKGS pyspark-shell" python spark_kafka_to_lakehouse.py
+    PKGS=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.apache.spark:spark-avro_2.12:3.5.9
+    PKGS=$PKGS,org.apache.hadoop:hadoop-aws:3.3.4
+    PYTHONPATH=. PYSPARK_SUBMIT_ARGS="--packages $PKGS pyspark-shell" python spark_kafka_to_lakehouse.py
 
-a writable ``CHECKPOINT_DIR`` (plus winutils on Windows), and the ``streaming`` container
-stopped (or another ``LAKEHOUSE_BUCKET``): a second checkpoint lineage writing the same
-file-sink paths makes Spark skip batch ids it believes are already committed.
+a writable ``CHECKPOINT_DIR`` (plus winutils on Windows), HF_SCHEMA_PATH pointing at
+``infrastructure/schemas/engine_sensor_frame.avsc``, and the ``streaming`` container stopped
+(or another ``LAKEHOUSE_BUCKET``): a second checkpoint lineage writing the same file-sink
+paths makes Spark skip batch ids it believes are already committed.
 """
 
 from __future__ import annotations
@@ -30,6 +34,19 @@ from urllib.parse import urlparse
 SPARK_LOG_LEVELS = frozenset({"ALL", "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"})
 PYTHON_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 SHUFFLE_PARTITIONS = 4
+# mapInPandas ships the HF frames (about 20 KB each at the default rates) to the Python workers
+# in Arrow batches of at most this many rows, so the memory of a feature task stays flat however
+# many frames a micro-batch holds (a backfill burst included).
+ARROW_MAX_RECORDS_PER_BATCH = 256
+# Caps of the Avro decoder, read once when the JVM loads it: a corrupted length prefix then fails
+# the decoding of its record (which is dead-lettered) instead of allocating up to 2 GB. They sit
+# far above any valid frame (HF topic messages are limited to 8 MB, a frame has a few hundred
+# channels at most).
+AVRO_DECODER_LIMITS: tuple[str, ...] = (
+    "-Dorg.apache.avro.limits.bytes.maxLength=16777216",
+    "-Dorg.apache.avro.limits.string.maxLength=65536",
+    "-Dorg.apache.avro.limits.collectionItems.maxLength=1000000",
+)
 _TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
 _FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 _JVM_MEMORY = re.compile(r"^[1-9]\d*[kmgt]$", re.IGNORECASE)
@@ -51,6 +68,17 @@ class StreamingSettings:
     # True: a query whose unread offsets were deleted by the topic retention fails instead of
     # silently skipping them (Spark's ``failOnDataLoss``).
     kafka_fail_on_data_loss: bool
+    hf_topic: str
+    hf_schema_path: str
+    hf_max_offsets_per_trigger: int
+    # The HF path is best effort, so the default is False: frames the topic retention deleted
+    # before a query read them are skipped with a Spark warning.
+    hf_fail_on_data_loss: bool
+    hf_lake_trigger_seconds: float
+    hf_clickhouse_trigger_seconds: float
+    # Age at which MinIO expires raw frames (minio-init lifecycle rule); the bronze file sink
+    # drops them from its metadata log after the same time.
+    hf_bronze_retention_days: int
     s3_endpoint_url: str
     aws_access_key_id: str
     aws_secret_access_key: str = field(repr=False)
@@ -100,6 +128,13 @@ def load_settings(env: Mapping[str, str]) -> StreamingSettings:
         kafka_starting_offsets=_text(env, "KAFKA_STARTING_OFFSETS", "earliest"),
         max_offsets_per_trigger=_positive_int(env, "MAX_OFFSETS_PER_TRIGGER", 20000),
         kafka_fail_on_data_loss=_boolean(env, "KAFKA_FAIL_ON_DATA_LOSS", True),
+        hf_topic=_text(env, "HF_TOPIC", "engine_hf.sensor_frames"),
+        hf_schema_path=_text(env, "HF_SCHEMA_PATH", "/schemas/engine_sensor_frame.avsc"),
+        hf_max_offsets_per_trigger=_positive_int(env, "HF_MAX_OFFSETS_PER_TRIGGER", 2000),
+        hf_fail_on_data_loss=_boolean(env, "HF_FAIL_ON_DATA_LOSS", False),
+        hf_lake_trigger_seconds=_positive_float(env, "HF_LAKE_TRIGGER_SECONDS", 60.0),
+        hf_clickhouse_trigger_seconds=_positive_float(env, "HF_CLICKHOUSE_TRIGGER_SECONDS", 10.0),
+        hf_bronze_retention_days=_positive_int(env, "HF_BRONZE_RETENTION_DAYS", 1),
         s3_endpoint_url=_http_url(env, "S3_ENDPOINT_URL", "http://localhost:9000"),
         aws_access_key_id=_text(env, "AWS_ACCESS_KEY_ID", "minioadmin"),
         aws_secret_access_key=_secret(env, "AWS_SECRET_ACCESS_KEY", "minioadmin"),
@@ -126,7 +161,7 @@ def spark_conf(settings: StreamingSettings) -> dict[str, str]:
     return {
         "spark.driver.memory": settings.spark_driver_memory,
         # Pin the JVM default zone as well: log4j and a few Hadoop paths ignore the session zone.
-        "spark.driver.extraJavaOptions": "-Duser.timezone=UTC",
+        "spark.driver.extraJavaOptions": " ".join(("-Duser.timezone=UTC", *AVRO_DECODER_LIMITS)),
         "spark.sql.session.timeZone": "UTC",
         "spark.sql.shuffle.partitions": str(SHUFFLE_PARTITIONS),
         # AQE never applies here (streaming plans reject it with a warning per query, and the
@@ -134,6 +169,7 @@ def spark_conf(settings: StreamingSettings) -> dict[str, str]:
         "spark.sql.adaptive.enabled": "false",
         # Spark's default INT96 is legacy; INT64 micros (UTC-adjusted) is what pyarrow/DuckDB expect.
         "spark.sql.parquet.outputTimestampType": "TIMESTAMP_MICROS",
+        "spark.sql.execution.arrow.maxRecordsPerBatch": str(ARROW_MAX_RECORDS_PER_BATCH),
         "spark.ui.showConsoleProgress": "false",
         # A driver that runs for weeks must not accumulate UI history without bound.
         "spark.ui.retainedJobs": "200",
@@ -148,6 +184,11 @@ def spark_conf(settings: StreamingSettings) -> dict[str, str]:
         "spark.hadoop.fs.s3a.access.key": settings.aws_access_key_id,
         "spark.hadoop.fs.s3a.secret.key": settings.aws_secret_access_key,
     }
+
+
+def trigger_interval(seconds: float) -> str:
+    """Spark processing-time trigger interval for ``seconds`` (at least one millisecond)."""
+    return f"{max(1, round(seconds * 1000))} milliseconds"
 
 
 def _raw(env: Mapping[str, str], name: str, default: str) -> str:

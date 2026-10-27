@@ -94,6 +94,22 @@ def test_tolerated_data_loss_is_announced(
     assert "KAFKA_FAIL_ON_DATA_LOSS=false" in caplog.text
 
 
+@pytest.mark.parametrize(("value", "announced"), [(None, True), ("true", False)])
+def test_best_effort_hf_mode_is_announced(
+    monkeypatch: pytest.MonkeyPatch,
+    heartbeat_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    value: str | None,
+    announced: bool,
+) -> None:
+    if value is not None:
+        monkeypatch.setenv("HF_FAIL_ON_DATA_LOSS", value)
+    monkeypatch.setattr(job, "run", lambda *_args: 0)
+    with caplog.at_level(logging.INFO):
+        assert job.main() == 0
+    assert ("HF_FAIL_ON_DATA_LOSS=false (best effort)" in caplog.text) is announced
+
+
 def test_unexpected_errors_exit_with_code_1(monkeypatch: pytest.MonkeyPatch, heartbeat_file: Path) -> None:
     def broken_run(*_args: object) -> int:
         raise RuntimeError("cannot launch the JVM")

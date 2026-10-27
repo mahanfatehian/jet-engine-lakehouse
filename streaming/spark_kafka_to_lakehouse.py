@@ -1,11 +1,12 @@
-"""Spark Structured Streaming job: Debezium CDC in Kafka -> MinIO lakehouse + ClickHouse.
+"""Spark Structured Streaming job: Kafka (Debezium CDC + HF sensor frames) -> MinIO + ClickHouse.
 
-Startup: write the first heartbeat, build the local-mode driver and hand the seven queries
-(see ``streaming_queries``) to the supervisor (see ``streaming_supervisor``). The lake
-queries start once Kafka and MinIO answer, ``clickhouse_raw`` once Kafka and ClickHouse
-(with its tables) answer; a query that fails is restarted from its checkpoint with a capped
-exponential backoff while the others keep running. The supervisor keeps the heartbeat file
-(STREAMING_HEARTBEAT_FILE) fresh for the container healthcheck.
+Startup: write the first heartbeat, build the local-mode driver and hand the ten queries
+(seven CDC, three high-frequency, see ``streaming_queries`` and ``hf_queries``) to the
+supervisor (see ``streaming_supervisor``). The lake queries start once Kafka and MinIO
+answer, the ClickHouse queries once Kafka and ClickHouse (with its tables) answer; a query
+that fails is restarted from its checkpoint with a capped exponential backoff while the
+others keep running. The supervisor keeps the heartbeat file (STREAMING_HEARTBEAT_FILE)
+fresh for the container healthcheck.
 
 Exit codes: 0 after a requested shutdown (SIGTERM/SIGINT), 1 when the Spark driver cannot be
 started or stops (Docker's ``restart: unless-stopped`` then restarts the job, which resumes
@@ -116,6 +117,12 @@ def main() -> int:
         logger.warning(
             "KAFKA_FAIL_ON_DATA_LOSS=false: records deleted by the Kafka topic retention before a "
             "query read them are skipped with only a Spark warning"
+        )
+    if not settings.hf_fail_on_data_loss:
+        logger.info(
+            "HF_FAIL_ON_DATA_LOSS=false (best effort): sensor frames deleted by the retention of %s "
+            "before an HF query read them are skipped with a Spark warning",
+            settings.hf_topic,
         )
     try:
         exit_code = run(settings, stop_event, heartbeat)
