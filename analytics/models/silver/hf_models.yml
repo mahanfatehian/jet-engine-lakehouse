@@ -1,0 +1,229 @@
+version: 2
+
+models:
+  - name: stg_engine_hf_features
+    description: >
+      Deduplicated, typed features of the high-frequency (HF) sensor frames, one row per frame,
+      keyed like the frame's 1 Hz pulse (telemetry_id). Incremental (append) on
+      ReplacingMergeTree(ingested_at) ordered by (engine_id, telemetry_id): each run appends the
+      raw copies ingested after max(ingested_at) - ingestion_lookback_minutes that beat the
+      published copy; the copy with the newest ingested_at wins (ties: the higher Kafka
+      partition and offset). Feature values that are NaN, infinite or negative where the
+      quantity cannot be are NULL, and so is every feature of a vibration channel without
+      variance (undefined kurtosis: a flat-line, dead or stuck sensor whose amplitudes still
+      read 0); the oil-system parameters come from process_means (channel A) and are NULL when
+      the frame does not carry them. Read with FINAL. Keeps the features of frames the raw
+      table has expired (TTL 90 days); a --full-refresh rebuilds only the frames still there.
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'telemetry_id']
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine type as sent by the edge gateway.
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle of the frame (window partition of int_vibration_features).
+      - name: cycle_number
+        data_type: UInt32
+        description: Operating cycle within the lifecycle.
+      - name: telemetry_id
+        data_type: UInt64
+        description: telemetry_id of the pulse of the same tick; the join key to the 1 Hz features.
+      - name: frame_seq
+        data_type: UInt64
+        description: Per-engine 1-based frame ordinal; gaps are frames lost on the way.
+      - name: frame_start_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Frame start (UTC); equals event_ts of the frame's pulse.
+      - name: frame_duration_ms
+        data_type: UInt32
+        description: Frame period (ms).
+      - name: n1_rpm
+        data_type: Float64
+        description: Fan (low-pressure) spool speed during the frame (rev/min).
+      - name: n2_rpm
+        data_type: Float64
+        description: Core (high-pressure) spool speed during the frame (rev/min).
+      - name: bpfo_order
+        data_type: Float64
+        description: Fan bearing outer-race defect frequency as a multiple of the N1 shaft frequency.
+      - name: vibration_sample_rate_hz
+        data_type: UInt32
+        description: Sample rate of the vibration channels (Hz).
+      - name: vibration_channels
+        data_type: UInt16
+        description: Vibration channels in the frame.
+      - name: process_channels
+        data_type: UInt16
+        description: Process channels in the frame.
+      - name: fan_rms
+        data_type: Nullable(Float64)
+        description: RMS of the fan frame velocity (mm/s; equals the pulse's vibration_mm_s). NULL when unusable.
+      - name: fan_peak
+        data_type: Nullable(Float64)
+        description: Peak absolute fan velocity (mm/s).
+      - name: fan_crest_factor
+        data_type: Nullable(Float64)
+        description: Fan peak / RMS.
+      - name: fan_kurtosis
+        data_type: Nullable(Float64)
+        description: Pearson kurtosis of the fan waveform (Gaussian noise 3, impulsive above).
+      - name: fan_amp_1x_n1
+        data_type: Nullable(Float64)
+        description: Fan spectral amplitude at the N1 shaft frequency (mm/s).
+      - name: fan_amp_1x_n2
+        data_type: Nullable(Float64)
+        description: Fan spectral amplitude at the N2 shaft frequency (mm/s).
+      - name: fan_amp_bpfo
+        data_type: Nullable(Float64)
+        description: Fan spectral amplitude at the bearing outer-race defect frequency (mm/s).
+      - name: fan_band_energy_hf
+        data_type: Nullable(Float64)
+        description: Fraction of the fan spectral energy above a quarter of the sample rate.
+      - name: fan_spectral_centroid_hz
+        data_type: Nullable(Float64)
+        description: Energy-weighted mean frequency of the fan spectrum (Hz).
+      - name: core_rms
+        data_type: Nullable(Float64)
+        description: RMS of the turbine rear frame velocity (mm/s).
+      - name: core_peak
+        data_type: Nullable(Float64)
+        description: Peak absolute core velocity (mm/s).
+      - name: core_crest_factor
+        data_type: Nullable(Float64)
+        description: Core peak / RMS.
+      - name: core_kurtosis
+        data_type: Nullable(Float64)
+        description: Pearson kurtosis of the core waveform.
+      - name: core_amp_1x_n1
+        data_type: Nullable(Float64)
+        description: Core spectral amplitude at the N1 shaft frequency (mm/s).
+      - name: core_amp_1x_n2
+        data_type: Nullable(Float64)
+        description: Core spectral amplitude at the N2 shaft frequency (mm/s; core unbalance).
+      - name: core_amp_bpfo
+        data_type: Nullable(Float64)
+        description: Core spectral amplitude at the fan bearing defect frequency (mm/s).
+      - name: core_band_energy_hf
+        data_type: Nullable(Float64)
+        description: Fraction of the core spectral energy above a quarter of the sample rate.
+      - name: core_spectral_centroid_hz
+        data_type: Nullable(Float64)
+        description: Energy-weighted mean frequency of the core spectrum (Hz).
+      - name: egt_ab_split
+        data_type: Nullable(Float64)
+        description: Mean absolute difference of the redundant EGT sensors A and B (degC).
+      - name: oil_temp_c
+        data_type: Nullable(Float64)
+        description: Frame mean of process parameter OIL_T_A (oil temperature, degC); NULL when absent.
+      - name: oil_quantity
+        data_type: Nullable(Float64)
+        description: Frame mean of process parameter OIL_QTY_A (oil quantity, L); NULL when absent.
+      - name: oil_filter_dp
+        data_type: Nullable(Float64)
+        description: Frame mean of process parameter OIL_DP_A (oil filter differential pressure, psid); NULL when absent.
+      - name: frame_bytes
+        data_type: UInt32
+        description: Size of the Avro frame (bytes).
+      - name: kafka_partition
+        data_type: Int32
+        description: Kafka partition of the winning copy.
+      - name: kafka_offset
+        data_type: Int64
+        description: Kafka offset of the winning copy.
+      - name: ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Time the winning copy landed in ClickHouse; the incremental watermark and row version.
+
+  - name: int_vibration_features
+    description: >
+      Point-in-time spectral features, one row per HF frame: the 5-minute rolling means of the
+      spectral and oil-system features (CONTRACT_V2.md section 8). Time-based RANGE frame of
+      300 s over epoch seconds of frame_start_ts, partitioned by (engine_id, lifecycle_id), the
+      current frame included; NULL values are skipped and a mean without any value is NULL.
+      Built from the HF stream alone (a frame counts even when its 1 Hz pulse is missing);
+      int_ml_features attaches each frame's features to its pulse. Incremental (append) on
+      ReplacingMergeTree(feature_computed_at, is_deleted) ordered by (engine_id, lifecycle_id,
+      telemetry_id): each run recomputes every lifecycle touched by new, late or corrected
+      frames and retracts frames that moved to another lifecycle. ALWAYS read it with FINAL.
+    config:
+      tags: ["features"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'lifecycle_id', 'telemetry_id']
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle of the frame (window partition).
+      - name: telemetry_id
+        data_type: UInt64
+        description: telemetry_id of the frame's pulse.
+      - name: cycle_number
+        data_type: UInt32
+        description: Operating cycle within the lifecycle.
+      - name: frame_start_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Frame start (UTC); orders the rolling window.
+      - name: fan_amp_bpfo_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_bpfo_mean_5m') }}"
+      - name: fan_kurtosis_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_kurtosis_mean_5m') }}"
+      - name: fan_crest_factor_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_crest_factor_mean_5m') }}"
+      - name: fan_amp_1x_n1_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_1x_n1_mean_5m') }}"
+      - name: core_amp_1x_n2_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('core_amp_1x_n2_mean_5m') }}"
+      - name: fan_band_energy_hf_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_band_energy_hf_mean_5m') }}"
+      - name: oil_temp_c_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_temp_c_mean_5m') }}"
+      - name: oil_quantity_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_quantity_mean_5m') }}"
+      - name: oil_filter_dp_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_filter_dp_mean_5m') }}"
+      - name: egt_ab_split_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('egt_ab_split_mean_5m') }}"
+      - name: frames_5m
+        data_type: UInt32
+        description: >
+          HF frames of the lifecycle in [frame_start_ts - 300 s, frame_start_ts]: the coverage
+          behind the means (300 at 1 Hz without loss).
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: source_ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: >
+          ingested_at of the stg_engine_hf_features copy the row was computed from; its maximum
+          is the incremental watermark of this model. Not a feature.
+      - name: feature_computed_at
+        data_type: "DateTime64(6, 'UTC')"
+        description: Build time of the row and ReplacingMergeTree version (the newest computation wins). Not a feature.
+      - name: is_deleted
+        data_type: UInt8
+        description: 1 on retraction rows of frames that left the lifecycle; FINAL hides them. Not a feature.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]

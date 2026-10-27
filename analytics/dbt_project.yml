@@ -1,11 +1,14 @@
 # dbt-clickhouse project of the jet-engine lakehouse.
 #
-#   silver: stg_* (deduplicated CDC images) and int_* (lifecycles, rolling sensor features)
+#   silver: stg_* (deduplicated CDC images and HF frame features), int_* (lifecycles, rolling
+#           sensor features, rolling spectral features of the HF frames) and int_ml_features
+#           (the ML feature vector: sensor + spectral features of every pulse)
 #   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs),
 #           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest)
 #
-# Every model is a ReplacingMergeTree so that consumers can always read it with FINAL;
-# incremental models rely on FINAL for correctness. See models/**/*.yml for column docs.
+# Every table model is a ReplacingMergeTree so that consumers can always read it with FINAL;
+# incremental models rely on FINAL for correctness. int_ml_features is a view over FINAL reads
+# and is read as is. See models/**/*.yml for column docs.
 name: iot_engine_analytics
 version: "1.0.0"
 profile: iot_engine
@@ -50,6 +53,20 @@ vars:
   anomaly_egt_drift_c: 25.0               # at the HEALTHY p99, below the WARNING p50: early warning
   anomaly_vibration_ratio: 1.5            # above the HEALTHY p99, below the WARNING p50: early warning
   anomaly_oil_pressure_drop_psi: 1.0      # above the WARNING p99: fires late (CRITICAL), at every failure
+  # is_bearing_defect_anomaly: either 5-minute KPI of the fan vibration of the HF frames
+  # (CONTRACT_V2.md section 3) exceeds its threshold. A healthy bearing has no BPFO tone, only
+  # the spectral noise floor, and a tonal waveform has a kurtosis below 3 (a sine 1.5, Gaussian
+  # noise 3); a spall adds the BPFO tone and impacts, which grow ~w^3..w^3.5. Not yet calibrated
+  # on live HF data: derived from a Monte-Carlo of the simulator's frame model through the
+  # streaming feature extraction (48 lifecycles, simulator defaults, 2048 Hz), p50 / p90 / p99:
+  #                           HEALTHY            WARNING            CRITICAL           BEARING FAILURE p10
+  #   fan_amp_bpfo_mean_5m    0.03 / 0.05 / 0.18 0.10 / 0.76 / 1.52 0.31 / 2.35 / 3.48 2.29 (OIL 0.84, others 0.14)
+  #   fan_kurtosis_mean_5m    1.93 / 2.01 / 2.08 2.14 / 2.30 / 2.88 2.33 / 3.70 / 5.26 3.33 (others <= 2.8 at p90)
+  # With these defaults no HEALTHY pulse is flagged; BEARING_DEGRADATION is flagged on 62 % of
+  # its WARNING pulses and at every failure, OIL_SYSTEM_LEAK (oil-starved bearings) late, the
+  # other modes never. Recalibrate from the live KPI percentiles per status like the flags above.
+  anomaly_fan_amp_bpfo_mm_s: 0.5          # 2x the HEALTHY p99 of bearing lifecycles (0.24)
+  anomaly_fan_kurtosis: 3.5               # above every HEALTHY pulse and the other modes' failures
   anomaly_stale_telemetry_seconds: 300    # seconds since the last telemetry pulse
   # fct_engine_health_status degradation_index: each drift KPI is scaled to 0..1, reaching 1 at
   # this full scale, set near the KPI's FAILURE p50 so that the index keeps grading CRITICAL

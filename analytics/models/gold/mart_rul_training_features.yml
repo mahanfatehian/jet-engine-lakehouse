@@ -3,16 +3,17 @@ version: 2
 models:
   - name: mart_rul_training_features
     description: >
-      RUL training set (CONTRACT.md section 7): every feature row of int_sensor_rolling_features
-      that belongs to a COMPLETED lifecycle (one with a FAILURE pulse), up to and including the
-      failure cycle, labelled with the remaining useful life. Only the newest
-      `mart_max_lifecycles_per_engine` (default 50) completed lifecycles of each engine are kept,
-      which bounds the rebuild cost and the training set on a long-running stack; the lifecycle
-      count therefore stops growing once every engine has reached the cap. Group-aware
-      train/test splits use split_group so that no lifecycle leaks across the split. The 46
-      numeric model inputs are cycle_number plus the 45 Float64 feature columns; engine_model is
-      the only categorical input. wear_factor, status, maintenance ids and timestamps are
-      deliberately absent.
+      RUL training set (CONTRACT.md section 7): every feature row of int_ml_features (the
+      feature interface predict_rul.py scores as well) that belongs to a COMPLETED lifecycle (one
+      with a FAILURE pulse), up to and including the failure cycle, labelled with the remaining
+      useful life. Only the newest `mart_max_lifecycles_per_engine` (default 50) completed
+      lifecycles of each engine are kept, which bounds the rebuild cost and the training set on
+      a long-running stack; the lifecycle count therefore stops growing once every engine has
+      reached the cap. Group-aware train/test splits use split_group so that no lifecycle leaks
+      across the split. The numeric model inputs are cycle_number, the 45 Float64 feature
+      columns and the 10 Nullable spectral features of the HF path (CONTRACT_V2.md section 8;
+      NULL where a pulse has no HF frame); engine_model is the only categorical input.
+      wear_factor, status, maintenance ids and timestamps are deliberately absent.
       Table (rebuilt every run) on ReplacingMergeTree ordered by (engine_id, lifecycle_id,
       telemetry_id); rows are unique, so it can be read with or without FINAL.
     config:
@@ -203,6 +204,36 @@ models:
       - name: rpm_drift_pct
         data_type: Float64
         description: 100 * (rpm - baseline) / baseline (0 when the baseline is 0).
+      - name: fan_amp_bpfo_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_bpfo_mean_5m') }}"
+      - name: fan_kurtosis_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_kurtosis_mean_5m') }}"
+      - name: fan_crest_factor_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_crest_factor_mean_5m') }}"
+      - name: fan_amp_1x_n1_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_1x_n1_mean_5m') }}"
+      - name: core_amp_1x_n2_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('core_amp_1x_n2_mean_5m') }}"
+      - name: fan_band_energy_hf_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_band_energy_hf_mean_5m') }}"
+      - name: oil_temp_c_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_temp_c_mean_5m') }}"
+      - name: oil_quantity_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_quantity_mean_5m') }}"
+      - name: oil_filter_dp_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_filter_dp_mean_5m') }}"
+      - name: egt_ab_split_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('egt_ab_split_mean_5m') }}"
       - name: failure_cycle
         data_type: UInt32
         description: Cycle of the lifecycle's FAILURE pulse (label source).

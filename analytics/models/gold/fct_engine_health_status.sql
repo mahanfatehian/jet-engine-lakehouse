@@ -18,11 +18,19 @@
     columns age it by the cycles flown since the scored pulse, and risk_band_adjusted re-applies
     the predictor's RUL rule (HIGH within the horizon, MEDIUM within twice the horizon) to the
     adjusted RUL. A band only ever escalates: the failure probability cannot be aged.
+
+    The spectral KPIs come from the newest HF frame of the engine's current lifecycle
+    (int_vibration_features), which may be a few seconds older than the newest pulse: the HF
+    path lags the CDC path. They are NULL while HF is disabled or has not delivered a frame of
+    the current lifecycle yet, and the bearing-defect flag is then not raised.
 -#}
 
 {%- set latest_columns = raw_sensor_columns()
     + ['vibration_mm_s_mean_5m', 'egt_c_mean_5m', 'oil_pressure_psi_mean_5m']
     + drift_feature_columns() -%}
+{%- set spectral_kpis = [
+    'fan_amp_bpfo_mean_5m', 'fan_kurtosis_mean_5m', 'oil_quantity_mean_5m', 'oil_filter_dp_mean_5m',
+] -%}
 
 with registry_latest as (
 
@@ -126,6 +134,38 @@ engine_state as (
 
 ),
 
+latest_spectral as (
+
+    -- newest HF frame of each engine's current lifecycle (none before HF delivered one), so a
+    -- repaired engine never inherits the spectral KPIs of the lifecycle that failed
+    select
+        engine_id,
+        toNullable(frame_start_ts) as spectral_frame_ts,
+        {%- for column in spectral_kpis %}
+        {{ column }} as spectral_{{ column }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from {{ ref('int_vibration_features') }} final
+    -- the sorting-key prefix prunes every other lifecycle
+    where (engine_id, lifecycle_id) in (select engine_id, resolved_lifecycle_id from engine_state)
+    order by engine_id, frame_start_ts desc, telemetry_id desc
+    limit 1 by engine_id
+
+),
+
+observed_state as (
+
+    -- one join per CTE: with two, the analyzer names the columns of `engine_state.*` qualified
+    select
+        engine_state.*,
+        spectral_frame_ts,
+        {%- for column in spectral_kpis %}
+        spectral_{{ column }}{{ ',' if not loop.last }}
+        {%- endfor %}
+    from engine_state
+    left join latest_spectral using (engine_id)
+
+),
+
 latest_predictions as (
 
     -- newest prediction per engine lifecycle; the table may be empty before the first model
@@ -149,12 +189,16 @@ latest_predictions as (
 assessed as (
 
     select
-        engine_state.*,
+        observed_state.*,
         toUInt8(coalesce(latest_egt_c_drift > {{ number_var('anomaly_egt_drift_c') }}, 0)) as egt_drift_flag,
         toUInt8(coalesce(latest_vibration_mm_s_ratio > {{ number_var('anomaly_vibration_ratio') }}, 0))
             as vibration_growth_flag,
         toUInt8(coalesce(latest_oil_pressure_psi_drop > {{ number_var('anomaly_oil_pressure_drop_psi') }}, 0))
             as oil_pressure_drop_flag,
+        -- no HF data is no evidence of a defect: the 1 Hz vibration flag still watches the engine
+        toUInt8(coalesce({{ bearing_defect_detected(
+            'spectral_fan_amp_bpfo_mean_5m', 'spectral_fan_kurtosis_mean_5m'
+        ) }}, 0)) as bearing_defect_flag,
         -- an engine that never reported telemetry is as unobservable as a silent one
         toUInt8(coalesce(staleness_seconds > {{ number_var('anomaly_stale_telemetry_seconds') }}, 1))
             as stale_telemetry_flag,
@@ -180,10 +224,10 @@ assessed as (
         prediction_risk_band,
         prediction_model_version,
         prediction_predicted_at
-    from engine_state
+    from observed_state
     left join latest_predictions
-        on latest_predictions.engine_id = engine_state.engine_id
-        and latest_predictions.prediction_lifecycle_id = engine_state.resolved_lifecycle_id
+        on latest_predictions.engine_id = observed_state.engine_id
+        and latest_predictions.prediction_lifecycle_id = observed_state.resolved_lifecycle_id
 
 ),
 
@@ -235,12 +279,18 @@ select
     {%- for column in latest_columns %}
     latest_{{ column }} as {{ column }},
     {%- endfor %}
+    spectral_frame_ts as last_hf_frame_ts,
+    {%- for column in spectral_kpis %}
+    spectral_{{ column }} as {{ column }},
+    {%- endfor %}
     egt_drift_flag as is_egt_drift_anomaly,
     vibration_growth_flag as is_vibration_growth_anomaly,
     oil_pressure_drop_flag as is_oil_pressure_drop_anomaly,
+    bearing_defect_flag as is_bearing_defect_anomaly,
     stale_telemetry_flag as is_telemetry_stale,
     toUInt8(
-        egt_drift_flag + vibration_growth_flag + oil_pressure_drop_flag + stale_telemetry_flag
+        egt_drift_flag + vibration_growth_flag + oil_pressure_drop_flag + bearing_defect_flag
+        + stale_telemetry_flag
     ) as anomaly_count,
     degradation as degradation_index,
     round(100.0 * (1.0 - degradation), 1) as health_score,

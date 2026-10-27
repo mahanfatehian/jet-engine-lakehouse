@@ -1,9 +1,11 @@
 {#-
-    Single source of truth for the ML feature interface (CONTRACT.md section 7).
+    Single source of truth for the ML feature interface (CONTRACT.md section 7, CONTRACT_V2.md
+    section 8).
 
-    The order returned here is the physical column order of int_sensor_rolling_features and
-    mart_rul_training_features, and matches FEATURE_COLUMNS in data_science/feature_pipeline.py
-    (cycle_number followed by every float feature).
+    The order returned here is the physical column order of int_sensor_rolling_features,
+    int_ml_features and mart_rul_training_features, and matches FEATURE_COLUMNS in
+    data_science/feature_pipeline.py (cycle_number followed by every float feature, then the
+    spectral features of the high-frequency path).
 -#}
 
 {% macro raw_sensor_columns() %}
@@ -78,6 +80,39 @@
 
 
 {% macro feature_output_columns() %}
-    {#- identifiers + float features: the column prefix shared by the silver feature table and the gold mart -#}
+    {#- identifiers + float features: the column prefix of every feature model -#}
     {{ return(feature_identifier_columns() + float_feature_columns()) }}
+{% endmacro %}
+
+
+{% macro spectral_feature_sources() %}
+    {#-
+        The 10 spectral features of the high-frequency (HF) path, in their fixed order
+        (SPECTRAL_FEATURE_COLUMNS of the ML contract). Each is the 5-minute rolling mean
+        (int_vibration_features) of one per-frame column of stg_engine_hf_features, and each is
+        Nullable: absent when the HF path is disabled or lagging.
+    -#}
+    {{ return([
+        {'name': 'fan_amp_bpfo_mean_5m', 'source': 'fan_amp_bpfo'},
+        {'name': 'fan_kurtosis_mean_5m', 'source': 'fan_kurtosis'},
+        {'name': 'fan_crest_factor_mean_5m', 'source': 'fan_crest_factor'},
+        {'name': 'fan_amp_1x_n1_mean_5m', 'source': 'fan_amp_1x_n1'},
+        {'name': 'core_amp_1x_n2_mean_5m', 'source': 'core_amp_1x_n2'},
+        {'name': 'fan_band_energy_hf_mean_5m', 'source': 'fan_band_energy_hf'},
+        {'name': 'oil_temp_c_mean_5m', 'source': 'oil_temp_c'},
+        {'name': 'oil_quantity_mean_5m', 'source': 'oil_quantity'},
+        {'name': 'oil_filter_dp_mean_5m', 'source': 'oil_filter_dp'},
+        {'name': 'egt_ab_split_mean_5m', 'source': 'egt_ab_split'},
+    ]) }}
+{% endmacro %}
+
+
+{% macro spectral_feature_columns() %}
+    {{ return(spectral_feature_sources() | map(attribute='name') | list) }}
+{% endmacro %}
+
+
+{% macro ml_feature_output_columns() %}
+    {#- identifiers + 45 float features + 10 spectral features: shared by int_ml_features and the mart -#}
+    {{ return(feature_output_columns() + spectral_feature_columns()) }}
 {% endmacro %}

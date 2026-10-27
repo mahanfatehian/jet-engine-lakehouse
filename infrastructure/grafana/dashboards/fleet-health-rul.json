@@ -325,7 +325,7 @@
     {
       "type": "stat",
       "title": "Anomaly flags raised",
-      "description": "Sum of the calibrated anomaly flags over the selected engines: EGT drift, vibration growth, oil-pressure drop and stale telemetry (fct_engine_health_status.anomaly_count).",
+      "description": "Sum of the calibrated anomaly flags over the selected engines: EGT drift, vibration growth, oil-pressure drop, bearing defect (HF fan vibration) and stale telemetry (fct_engine_health_status.anomaly_count).",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -549,7 +549,7 @@
     {
       "type": "table",
       "title": "Fleet health board",
-      "description": "One row per engine from gold fct_engine_health_status (rebuilt by dbt every DBT_INTERVAL_SECONDS): registry status, current cycle, the sensor-driven health score (100 = healthy; bands calibrated on the live fleet: HEALTHY pulses p05 80, WARNING median 58, CRITICAL median 3), the four calibrated anomaly flags, and the newest RUL prediction of the current lifecycle aged to the current cycle (cycles, flight hours, risk band). Sorted by risk, then remaining life. Click an engine for its vibration analytics.",
+      "description": "One row per engine from gold fct_engine_health_status (rebuilt by dbt every DBT_INTERVAL_SECONDS): registry status, current cycle, the sensor-driven health score (100 = healthy; bands calibrated on the live fleet: HEALTHY pulses p05 80, WARNING median 58, CRITICAL median 3), the five calibrated anomaly flags (bearing defect: the 5-minute BPFO tone or kurtosis of the HF fan vibration), and the newest RUL prediction of the current lifecycle aged to the current cycle (cycles, flight hours, risk band). Sorted by risk, then remaining life. Click an engine for its vibration analytics.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -570,7 +570,7 @@
           "format": 1,
           "pluginVersion": "4.23.2",
           "queryType": "table",
-          "rawSql": "SELECT\n    engine_id AS `Engine`,\n    engine_model AS `Model`,\n    operational_status AS `Status`,\n    current_lifecycle_id AS `Lifecycle`,\n    current_cycle AS `Cycle`,\n    health_score AS `Health score`,\n    is_egt_drift_anomaly AS `EGT drift`,\n    is_vibration_growth_anomaly AS `Vibration growth`,\n    is_oil_pressure_drop_anomaly AS `Oil pressure drop`,\n    is_telemetry_stale AS `Stale telemetry`,\n    predicted_rul_cycles_adjusted AS `RUL now (cycles)`,\n    predicted_rul_hours_adjusted AS `RUL now (hours)`,\n    failure_probability AS `P(failure in horizon)`,\n    risk_band_adjusted AS `Risk`,\n    model_version AS `Model version`\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY\n    multiIf(risk_band_adjusted = 'HIGH', 0, risk_band_adjusted = 'MEDIUM', 1,\n            risk_band_adjusted = 'LOW', 2, 3),\n    predicted_rul_cycles_adjusted,\n    health_score,\n    engine_id",
+          "rawSql": "SELECT\n    engine_id AS `Engine`,\n    engine_model AS `Model`,\n    operational_status AS `Status`,\n    current_lifecycle_id AS `Lifecycle`,\n    current_cycle AS `Cycle`,\n    health_score AS `Health score`,\n    is_egt_drift_anomaly AS `EGT drift`,\n    is_vibration_growth_anomaly AS `Vibration growth`,\n    is_oil_pressure_drop_anomaly AS `Oil pressure drop`,\n    is_bearing_defect_anomaly AS `Bearing defect`,\n    is_telemetry_stale AS `Stale telemetry`,\n    predicted_rul_cycles_adjusted AS `RUL now (cycles)`,\n    predicted_rul_hours_adjusted AS `RUL now (hours)`,\n    failure_probability AS `P(failure in horizon)`,\n    risk_band_adjusted AS `Risk`,\n    model_version AS `Model version`\nFROM fct_engine_health_status FINAL\nWHERE $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY\n    multiIf(risk_band_adjusted = 'HIGH', 0, risk_band_adjusted = 'MEDIUM', 1,\n            risk_band_adjusted = 'LOW', 2, 3),\n    predicted_rul_cycles_adjusted,\n    health_score,\n    engine_id",
           "refId": "A"
         }
       ],
@@ -811,6 +811,45 @@
             "matcher": {
               "id": "byName",
               "options": "Oil pressure drop"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "color": "transparent",
+                        "index": 0,
+                        "text": "ok"
+                      },
+                      "1": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "ALERT"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bearing defect"
             },
             "properties": [
               {

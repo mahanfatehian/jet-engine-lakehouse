@@ -9,10 +9,12 @@ models:
       the engine's current lifecycle. The pipeline loop scores engines after `dbt run`, so that
       prediction is typically one dbt interval (DBT_INTERVAL_SECONDS) old when the table is
       built: predicted_rul_cycles and its siblings are the model output as scored, the
-      *_adjusted columns age it by the cycles flown since (cycles_since_prediction).
-      Thresholds and scales are the anomaly_* and degradation_full_scale_* vars. Table (rebuilt
-      every run) on ReplacingMergeTree ordered by engine_id; rows are unique, so it can be read
-      with or without FINAL.
+      *_adjusted columns age it by the cycles flown since (cycles_since_prediction). The
+      spectral KPIs and the bearing-defect flag come from the newest HF frame of the current
+      lifecycle (last_hf_frame_ts); they are NULL / 0 while the HF path is disabled or has not
+      delivered a frame of that lifecycle. Thresholds and scales are the anomaly_* and
+      degradation_full_scale_* vars. Table (rebuilt every run) on ReplacingMergeTree ordered by
+      engine_id; rows are unique, so it can be read with or without FINAL.
     config:
       tags: ["kpi"]
     data_tests:
@@ -21,7 +23,15 @@ models:
           arguments:
             expression: >
               anomaly_count = is_egt_drift_anomaly + is_vibration_growth_anomaly
-              + is_oil_pressure_drop_anomaly + is_telemetry_stale
+              + is_oil_pressure_drop_anomaly + is_bearing_defect_anomaly + is_telemetry_stale
+      - expression_is_true:
+          name: fct_engine_health_status_no_hf_frame_reads_as_unknown
+          arguments:
+            expression: >
+              isNotNull(last_hf_frame_ts)
+              or (isNull(fan_amp_bpfo_mean_5m) and isNull(fan_kurtosis_mean_5m)
+              and isNull(oil_quantity_mean_5m) and isNull(oil_filter_dp_mean_5m)
+              and is_bearing_defect_anomaly = 0)
       - expression_is_true:
           name: fct_engine_health_status_no_telemetry_reads_as_unknown
           arguments:
@@ -135,6 +145,31 @@ models:
       - name: rpm_drift_pct
         data_type: Nullable(Float64)
         description: Shaft speed drift vs lifecycle baseline (%).
+      - name: last_hf_frame_ts
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: >
+          frame_start_ts of the newest HF frame of the current lifecycle, the time the spectral
+          KPIs refer to (the HF path lags the CDC path by seconds). NULL without such a frame.
+      - name: fan_amp_bpfo_mean_5m
+        data_type: Nullable(Float64)
+        description: Bearing-defect KPI at the newest HF frame (5-minute mean BPFO tone amplitude, mm/s).
+        data_tests:
+          - non_negative
+      - name: fan_kurtosis_mean_5m
+        data_type: Nullable(Float64)
+        description: Impulsiveness KPI at the newest HF frame (5-minute mean fan kurtosis; Gaussian noise 3).
+        data_tests:
+          - non_negative
+      - name: oil_quantity_mean_5m
+        data_type: Nullable(Float64)
+        description: Oil quantity at the newest HF frame (5-minute mean of OIL_QTY_A, L; drops in a leak).
+        data_tests:
+          - non_negative
+      - name: oil_filter_dp_mean_5m
+        data_type: Nullable(Float64)
+        description: Oil filter dP at the newest HF frame (5-minute mean of OIL_DP_A, psid; rises with debris).
+        data_tests:
+          - non_negative
       - name: is_egt_drift_anomaly
         data_type: UInt8
         description: 1 when egt_c_drift > var anomaly_egt_drift_c.
@@ -146,6 +181,13 @@ models:
         description: >
           1 when oil_pressure_psi_drop > var anomaly_oil_pressure_drop_psi. The 5-minute KPI
           dilutes the late oil-pressure collapse, so this is a late (CRITICAL) signal.
+      - name: is_bearing_defect_anomaly
+        data_type: UInt8
+        description: >
+          1 when fan_amp_bpfo_mean_5m > var anomaly_fan_amp_bpfo_mm_s or fan_kurtosis_mean_5m >
+          var anomaly_fan_kurtosis (a bearing defect tone or impulsive fan vibration). 0 without
+          HF data: missing frames are no evidence of a defect, and is_vibration_growth_anomaly
+          still watches the 1 Hz vibration level.
       - name: is_telemetry_stale
         data_type: UInt8
         description: >
@@ -153,12 +195,12 @@ models:
           engine never reported telemetry.
       - name: anomaly_count
         data_type: UInt8
-        description: Number of raised anomaly flags (0..4).
+        description: Number of raised anomaly flags (0..5).
         data_tests:
           - accepted_range:
               arguments:
                 min_value: 0
-                max_value: 4
+                max_value: 5
       - name: degradation_index
         data_type: Nullable(Float64)
         description: >

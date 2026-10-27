@@ -1,0 +1,253 @@
+version: 2
+
+models:
+  - name: int_ml_features
+    description: >
+      The ML feature vector of every live telemetry pulse (CONTRACT_V2.md sections 8 and 9), the
+      single feature interface of mart_rul_training_features and predict_rul.py: the 46 numeric
+      point-in-time features of int_sensor_rolling_features (cycle_number plus 45 Float64
+      columns) followed by the 10 spectral features of the pulse's own HF frame
+      (int_vibration_features; Nullable Float64, NULL when HF is disabled, dropped the frame or
+      is lagging). A view: int_sensor_rolling_features FINAL LEFT JOIN int_vibration_features
+      FINAL USING (engine_id, lifecycle_id, telemetry_id), so it always has exactly the rows of
+      int_sensor_rolling_features FINAL and a newly landed frame shows up at the next read.
+      Read it as is (no FINAL needed); a filter on (engine_id, lifecycle_id) is pushed down
+      into both reads and prunes them by their sorting key.
+    config:
+      tags: ["features", "ml"]
+    columns:
+      - name: telemetry_id
+        data_type: UInt64
+        description: Source pulse id (engine_telemetry.telemetry_id).
+        data_tests:
+          - unique
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: >
+          Engine model from the latest registry state (categorical ML feature). UNKNOWN while the
+          engine's registry row has not landed yet; the lifecycle is recomputed once it has.
+        data_tests:
+          - not_null
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Run-to-failure lifecycle of the engine (window partition).
+      - name: cycle_number
+        data_type: UInt32
+        description: Operating cycle within the lifecycle (numeric ML feature).
+      - name: event_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Measurement time of the pulse (UTC); orders the rolling windows.
+      - name: rpm
+        data_type: Float64
+        description: Shaft speed (rev/min) of the pulse.
+      - name: core_temp_c
+        data_type: Float64
+        description: Core temperature (degC) of the pulse.
+      - name: egt_c
+        data_type: Float64
+        description: Exhaust gas temperature (degC) of the pulse.
+      - name: vibration_mm_s
+        data_type: Float64
+        description: Vibration velocity (mm/s) of the pulse.
+      - name: fuel_flow_kg_h
+        data_type: Float64
+        description: Fuel flow (kg/h) of the pulse.
+      - name: oil_pressure_psi
+        data_type: Float64
+        description: Oil pressure (psi) of the pulse.
+      - name: vibration_mm_s_mean_5m
+        data_type: Float64
+        description: Mean of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of vibration_mm_s (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_min_5m
+        data_type: Float64
+        description: Minimum of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_max_5m
+        data_type: Float64
+        description: Maximum of vibration_mm_s over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: vibration_mm_s_mean_15m
+        data_type: Float64
+        description: Mean of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of vibration_mm_s (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_min_15m
+        data_type: Float64
+        description: Minimum of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_max_15m
+        data_type: Float64
+        description: Maximum of vibration_mm_s over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_mean_5m
+        data_type: Float64
+        description: Mean of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of egt_c (0 for a single pulse) over the lifecycle's pulses
+          in [event_ts - 300 s, event_ts].
+      - name: egt_c_min_5m
+        data_type: Float64
+        description: Minimum of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_max_5m
+        data_type: Float64
+        description: Maximum of egt_c over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: egt_c_mean_15m
+        data_type: Float64
+        description: Mean of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of egt_c (0 for a single pulse) over the lifecycle's pulses
+          in [event_ts - 900 s, event_ts].
+      - name: egt_c_min_15m
+        data_type: Float64
+        description: Minimum of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: egt_c_max_15m
+        data_type: Float64
+        description: Maximum of egt_c over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_mean_5m
+        data_type: Float64
+        description: Mean of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_std_5m
+        data_type: Float64
+        description: >
+          Population standard deviation of oil_pressure_psi (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_min_5m
+        data_type: Float64
+        description: Minimum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_max_5m
+        data_type: Float64
+        description: Maximum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 300 s, event_ts].
+      - name: oil_pressure_psi_mean_15m
+        data_type: Float64
+        description: Mean of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_std_15m
+        data_type: Float64
+        description: >
+          Population standard deviation of oil_pressure_psi (0 for a single pulse) over the
+          lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_min_15m
+        data_type: Float64
+        description: Minimum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: oil_pressure_psi_max_15m
+        data_type: Float64
+        description: Maximum of oil_pressure_psi over the lifecycle's pulses in [event_ts - 900 s, event_ts].
+      - name: vibration_mm_s_delta_1
+        data_type: Float64
+        description: vibration_mm_s minus the previous pulse's value in the lifecycle (0 for the first pulse).
+      - name: vibration_mm_s_roc_5m
+        data_type: Float64
+        description: >
+          Change of vibration_mm_s per minute since the oldest pulse of the 5m window; 0 when no
+          time has elapsed.
+      - name: vibration_mm_s_roc_15m
+        data_type: Float64
+        description: >
+          Change of vibration_mm_s per minute since the oldest pulse of the 15m window; 0 when no
+          time has elapsed.
+      - name: egt_c_delta_1
+        data_type: Float64
+        description: egt_c minus the previous pulse's value in the lifecycle (0 for the first pulse).
+      - name: egt_c_roc_5m
+        data_type: Float64
+        description: >
+          Change of egt_c per minute since the oldest pulse of the 5m window; 0 when no time has
+          elapsed.
+      - name: egt_c_roc_15m
+        data_type: Float64
+        description: >
+          Change of egt_c per minute since the oldest pulse of the 15m window; 0 when no time has
+          elapsed.
+      - name: oil_pressure_psi_delta_1
+        data_type: Float64
+        description: >
+          oil_pressure_psi minus the previous pulse's value in the lifecycle (0 for the first
+          pulse).
+      - name: oil_pressure_psi_roc_5m
+        data_type: Float64
+        description: >
+          Change of oil_pressure_psi per minute since the oldest pulse of the 5m window; 0 when no
+          time has elapsed.
+      - name: oil_pressure_psi_roc_15m
+        data_type: Float64
+        description: >
+          Change of oil_pressure_psi per minute since the oldest pulse of the 15m window; 0 when no
+          time has elapsed.
+      - name: egt_c_drift
+        data_type: Float64
+        description: egt_c_mean_5m minus the lifecycle baseline EGT (degC).
+      - name: core_temp_c_drift
+        data_type: Float64
+        description: core_temp_c minus the lifecycle baseline core temperature (degC).
+      - name: vibration_mm_s_ratio
+        data_type: Float64
+        description: >
+          vibration_mm_s_mean_5m divided by the lifecycle baseline vibration (1 when the baseline is
+          0).
+      - name: oil_pressure_psi_drop
+        data_type: Float64
+        description: >
+          Lifecycle baseline oil pressure minus oil_pressure_psi_mean_5m (positive = pressure loss,
+          psi).
+      - name: fuel_flow_kg_h_drift_pct
+        data_type: Float64
+        description: 100 * (fuel_flow_kg_h - baseline) / baseline (0 when the baseline is 0).
+      - name: rpm_drift_pct
+        data_type: Float64
+        description: 100 * (rpm - baseline) / baseline (0 when the baseline is 0).
+      - name: fan_amp_bpfo_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_bpfo_mean_5m') }}"
+      - name: fan_kurtosis_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_kurtosis_mean_5m') }}"
+      - name: fan_crest_factor_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_crest_factor_mean_5m') }}"
+      - name: fan_amp_1x_n1_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_amp_1x_n1_mean_5m') }}"
+      - name: core_amp_1x_n2_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('core_amp_1x_n2_mean_5m') }}"
+      - name: fan_band_energy_hf_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('fan_band_energy_hf_mean_5m') }}"
+      - name: oil_temp_c_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_temp_c_mean_5m') }}"
+      - name: oil_quantity_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_quantity_mean_5m') }}"
+      - name: oil_filter_dp_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('oil_filter_dp_mean_5m') }}"
+      - name: egt_ab_split_mean_5m
+        data_type: Nullable(Float64)
+        description: "{{ doc('egt_ab_split_mean_5m') }}"
+      - name: baseline_cycles
+        data_type: UInt32
+        description: >
+          Value of the `baseline_cycles` var the row's drift features were computed with (see
+          int_sensor_rolling_features). Not a feature.
+      - name: source_ingested_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: ingested_at of the stg_engine_telemetry version the row was computed from. Not a feature.
+      - name: feature_computed_at
+        data_type: "DateTime64(6, 'UTC')"
+        description: Build time of the sensor features of the row. Not a feature.
+      - name: spectral_frames_5m
+        data_type: Nullable(UInt32)
+        description: >
+          HF frames behind the spectral means (int_vibration_features.frames_5m); NULL exactly
+          when the pulse has no HF frame. Not a feature.

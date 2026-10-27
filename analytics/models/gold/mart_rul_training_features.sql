@@ -9,8 +9,11 @@
 {#-
     RUL training set (CONTRACT.md section 7): the point-in-time features of every pulse of a
     COMPLETED lifecycle (one that has a FAILURE pulse), labelled with the cycles left until that
-    failure. Rebuilt on every run so late pulses, corrected rows and late work orders (failure
-    mode) are always reflected. Ground truth (wear_factor) and status never become columns here.
+    failure. The features come from int_ml_features, the interface predict_rul.py scores too:
+    the 46 sensor features plus the 10 spectral features of the HF path (CONTRACT_V2.md
+    section 8; NULL where a pulse has no HF frame). Rebuilt on every run so late pulses, late HF
+    frames, corrected rows and late work orders (failure mode) are always reflected. Ground
+    truth (wear_factor) and status never become columns here.
 
     Only the newest `mart_max_lifecycles_per_engine` completed lifecycles of each engine are
     kept, so the cost of this rebuild and the size of the training set stay bounded however long
@@ -34,9 +37,10 @@ with completed_lifecycles as (
 pulse_features as (
 
     select
-        {{ feature_output_columns() | join(',\n        ') }}
-    from {{ ref('int_sensor_rolling_features') }} final
-    -- the sorting-key prefix prunes every lifecycle outside the training window
+        {{ ml_feature_output_columns() | join(',\n        ') }}
+    from {{ ref('int_ml_features') }}
+    -- pushed down into both FINAL reads of the view, where the sorting-key prefix prunes every
+    -- lifecycle outside the training window
     where (engine_id, lifecycle_id) in (select engine_id, lifecycle_id from completed_lifecycles)
 
 ),
@@ -44,7 +48,7 @@ pulse_features as (
 labelled as (
 
     select
-        {{ feature_output_columns() | join(',\n        ') }},
+        {{ ml_feature_output_columns() | join(',\n        ') }},
         lifecycle_failure_cycle,
         lifecycle_failure_mode,
         toInt32(lifecycle_failure_cycle) - toInt32(cycle_number) as remaining_cycles
@@ -56,7 +60,7 @@ labelled as (
 )
 
 select
-    {{ feature_output_columns() | join(',\n    ') }},
+    {{ ml_feature_output_columns() | join(',\n    ') }},
     cast(lifecycle_failure_cycle as UInt32) as failure_cycle,
     cast(remaining_cycles as Int32) as rul_cycles,
     cast(least(remaining_cycles, {{ int_var('rul_cap_cycles') }}) as Int32) as rul_cycles_capped,

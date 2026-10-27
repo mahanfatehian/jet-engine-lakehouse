@@ -3,10 +3,12 @@ version: 2
 sources:
   - name: engine_raw
     description: >
-      Landing tables in ClickHouse. The raw_* tables hold the Debezium CDC images of the
-      PostgreSQL operational tables, written by the Spark streaming job (Path B). Every raw
-      table carries the CDC metadata columns cdc_op, cdc_lsn, cdc_source_ts, cdc_emitted_ts,
+      Landing tables in ClickHouse. The raw_* CDC tables hold the Debezium CDC images of the
+      PostgreSQL operational tables, written by the Spark streaming job (Path B). Every one of
+      them carries the CDC metadata columns cdc_op, cdc_lsn, cdc_source_ts, cdc_emitted_ts,
       is_deleted, kafka_partition, kafka_offset and the server-assigned ingested_at.
+      raw_engine_hf_features and hf_ingest_batches are written by the same job from the Avro
+      high-frequency (HF) sensor frames (CONTRACT_V2.md); they carry no CDC metadata.
       gold_engine_rul_predictions is written by data_science/predict_rul.py.
     schema: "{{ env_var('CLICKHOUSE_DB', 'iot_engine') }}"
     loader: spark-structured-streaming
@@ -156,3 +158,141 @@ sources:
                     severity: warn
           - name: model_version
             description: rul-YYYYMMDDTHHMMSSZ of the model that produced the prediction.
+
+      - name: raw_engine_hf_features
+        description: >
+          One row per high-frequency (HF) sensor frame: the Spark job decodes the Avro frame
+          (kHz vibration waveforms plus redundant A/B process channels of one tick) and keeps
+          only its features (ReplacingMergeTree(ingested_at) ordered by engine_id, telemetry_id:
+          a merge keeps the copy with the newest ingested_at, on a tie the one inserted last; TTL
+          90 days on frame_start_ts; a table created before the version column keeps its engine,
+          which is harmless because staging elects copies by ingested_at itself).
+          Delivery is at least once and best effort: a frame can land more than once, late, or
+          never. The raw frames live in the bronze lake only.
+        config:
+          loaded_at_field: ingested_at
+          freshness:
+            # warn only: the HF path is best effort, the 1 Hz CDC path is the system of record
+            warn_after: {count: 10, period: minute}
+        columns:
+          - name: engine_id
+            description: Engine identifier; also the Kafka message key.
+          - name: engine_model
+            description: Engine type as sent by the edge gateway, e.g. CFM56-7B.
+          - name: lifecycle_id
+            description: Lifecycle of the frame (same as its pulse).
+          - name: cycle_number
+            description: Operating cycle within the lifecycle (same as its pulse).
+          - name: telemetry_id
+            description: engine_telemetry.telemetry_id of the 1 Hz pulse of the same tick; the join key.
+          - name: frame_seq
+            description: Per-engine 1-based frame ordinal (count of the engine's pulses); gaps are lost frames.
+          - name: frame_start_ts
+            description: Frame start (UTC); equals event_ts of the pulse of the same tick.
+          - name: frame_duration_ms
+            description: Frame period (SIM_HF_FRAME_MS).
+          - name: n1_rpm
+            description: Fan (low-pressure) spool speed during the frame.
+          - name: n2_rpm
+            description: Core (high-pressure) spool speed during the frame.
+          - name: bpfo_order
+            description: Fan bearing outer-race defect frequency as a multiple of the N1 shaft frequency.
+          - name: vibration_sample_rate_hz
+            description: Sample rate of the vibration channels (SIM_HF_SAMPLE_RATE_HZ).
+          - name: vibration_channels
+            description: Vibration channels in the frame (fan_frame_vel and core_trf_vel first).
+          - name: process_channels
+            description: Process channels in the frame (redundant A/B sensors).
+          - name: fan_rms
+            description: >
+              RMS of the fan frame velocity waveform (mm/s); equals the pulse's vibration_mm_s.
+              The fan_* and core_* (turbine rear frame) features share one definition per suffix.
+          - name: fan_peak
+            description: Peak absolute velocity (mm/s).
+          - name: fan_crest_factor
+            description: Peak / RMS (dimensionless; a pure tone is 1.41, impacts raise it).
+          - name: fan_kurtosis
+            description: Pearson kurtosis of the waveform (Gaussian noise 3, impulsive > 3).
+          - name: fan_amp_1x_n1
+            description: Hann-windowed spectral amplitude at the N1 shaft frequency (mm/s; fan unbalance).
+          - name: fan_amp_1x_n2
+            description: Spectral amplitude at the N2 shaft frequency (mm/s; core unbalance).
+          - name: fan_amp_bpfo
+            description: Peak spectral amplitude within 3 % of bpfo_order x N1 frequency (mm/s; bearing defect).
+          - name: fan_band_energy_hf
+            description: Fraction of the spectral energy above a quarter of the sample rate (0..1).
+          - name: fan_spectral_centroid_hz
+            description: Energy-weighted mean frequency of the spectrum (Hz).
+          - name: egt_ab_split
+            description: Mean absolute difference of the redundant EGT sensors A and B over the frame (degC).
+          - name: process_means
+            description: >
+              Mean of every process channel over the frame, by parameter name with sensor suffix
+              (e.g. OIL_T_A degC, OIL_QTY_A L, OIL_DP_A psid, EGT_B degC, N1_A rpm).
+          - name: frame_bytes
+            description: Size of the Avro frame on the wire (bytes).
+          - name: kafka_partition
+            description: Kafka partition of the frame (engine_hf.sensor_frames).
+          - name: kafka_offset
+            description: Kafka offset of the frame; with the partition it orders copies that landed together.
+          - name: ingested_at
+            description: Server time the row landed in ClickHouse; the newest copy of a frame wins.
+        data_tests:
+          - finite_values:
+              arguments:
+                columns:
+                  - fan_rms
+                  - fan_peak
+                  - fan_crest_factor
+                  - fan_kurtosis
+                  - fan_amp_1x_n1
+                  - fan_amp_1x_n2
+                  - fan_amp_bpfo
+                  - fan_band_energy_hf
+                  - fan_spectral_centroid_hz
+                  - core_rms
+                  - core_peak
+                  - core_crest_factor
+                  - core_kurtosis
+                  - core_amp_1x_n1
+                  - core_amp_1x_n2
+                  - core_amp_bpfo
+                  - core_band_energy_hf
+                  - core_spectral_centroid_hz
+                  - egt_ab_split
+              config:
+                # stg_engine_hf_features turns such values into NULL; this reports the producer
+                severity: warn
+          - expression_is_true:
+              name: raw_engine_hf_features_amplitudes_non_negative
+              arguments:
+                expression: >
+                  not (fan_rms < 0 or fan_peak < 0 or fan_amp_bpfo < 0 or fan_amp_1x_n1 < 0
+                  or core_rms < 0 or core_peak < 0 or core_amp_1x_n2 < 0 or egt_ab_split < 0)
+              config:
+                severity: warn
+
+      - name: hf_ingest_batches
+        description: >
+          One row per HF micro-batch the Spark job wrote to raw_engine_hf_features (MergeTree,
+          TTL 30 days): throughput and latency of the HF path for dashboards. Not read by any
+          model; documented as part of the HF landing zone.
+        columns:
+          - name: batch_id
+            description: Spark micro-batch id of the clickhouse_hf_features query.
+          - name: batch_started_at
+            description: Time the batch started (UTC).
+          - name: frames
+            description: Frames written by the batch.
+          - name: bytes
+            description: Frame bytes the batch processed.
+          - name: engines
+            description: Distinct engines in the batch.
+          - name: min_frame_ts
+            description: Oldest frame_start_ts of the batch.
+          - name: max_frame_ts
+            description: Newest frame_start_ts of the batch; ingested_at minus it is the HF path latency.
+          - name: duration_ms
+            description: Processing time of the batch (ms).
+          - name: ingested_at
+            description: Server time the batch row landed in ClickHouse.
