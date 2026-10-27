@@ -211,3 +211,16 @@ def test_target_reports_missing_tables(monkeypatch: pytest.MonkeyPatch) -> None:
     target = clickhouse_sink.ClickHouseTarget(load_settings({}), no_shutdown)
     with pytest.raises(clickhouse_sink.MissingTablesError, match="raw_cdc_dead_letter"):
         target.check_ready()
+
+
+def test_target_checks_extra_tables_apart_from_the_raw_tables(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeClient(tables=[*clickhouse_sink.REQUIRED_TABLES, "raw_engine_hf_features"])
+    monkeypatch.setattr(clickhouse_sink.clickhouse_connect, "get_client", lambda **_kwargs: client)
+    target = clickhouse_sink.ClickHouseTarget(load_settings({}), no_shutdown)
+    with pytest.raises(RuntimeError, match="not connected"):
+        target.check_tables(["raw_engine_hf_features"])
+    target.check_ready()  # the CDC tables exist: the CDC query may start
+    target.check_tables(["raw_engine_hf_features"])
+    with pytest.raises(clickhouse_sink.MissingTablesError, match="hf_ingest_batches"):
+        target.check_tables(["raw_engine_hf_features", "hf_ingest_batches"])
+    assert client.queries == 3

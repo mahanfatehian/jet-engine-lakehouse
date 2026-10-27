@@ -19,11 +19,29 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from cdc_schemas import DEAD_LETTER_COLUMNS, TableSpec
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+class RowWriter(Protocol):
+    """Destination of insert-ready rows (``clickhouse_sink.ClickHouseWriter`` in production)."""
+
+    def insert_rows(self, table: str, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+        """Insert ``rows`` into ``table`` using exactly ``columns``."""
+
+
+def epoch_micros(instant: datetime) -> int:
+    """Epoch microseconds of a timezone-aware datetime (the inverse of :func:`to_utc_datetime`)."""
+    return (instant - _EPOCH) // timedelta(microseconds=1)
+
+
+# ClickHouse DateTime64 range: instants outside it cannot be stored faithfully.
+DATETIME64_MIN_MICROS = epoch_micros(datetime(1900, 1, 1, tzinfo=UTC))
+DATETIME64_MAX_MICROS = epoch_micros(datetime(2299, 12, 31, 23, 59, 59, 999999, tzinfo=UTC))
+
 _DEAD_LETTER_TIMESTAMP = DEAD_LETTER_COLUMNS.index("kafka_timestamp")
 _DEAD_LETTER_TEXT = (DEAD_LETTER_COLUMNS.index("raw_key"), DEAD_LETTER_COLUMNS.index("raw_value"))
 

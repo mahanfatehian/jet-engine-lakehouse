@@ -1,17 +1,27 @@
 # Python dependencies of the streaming image, fully pinned for CPython 3.11 on linux/x86_64
 # (python:3.11-slim-bookworm). The direct pins (pyspark and clickhouse-connect from the
-# interface contract, section 9, plus pytest) were resolved into the transitive pins with
+# interface contract, section 9; pandas, numpy and pyarrow from the v2 contract, section 10;
+# plus pytest) were resolved into the transitive pins with
 #   uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28
 
 # Streaming job
 pyspark==3.5.9
 clickhouse-connect==1.11.0
+# mapInPandas feature extraction of the high-frequency frames: the latest releases that
+# PySpark 3.5 supports (it predates pandas 3 and numpy 2).
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==17.0.0
 
 # Transitive runtime dependencies
 backports-zstd==1.8.0  # clickhouse-connect (Python < 3.14)
 certifi==2026.10.23  # clickhouse-connect
 lz4==4.4.5  # clickhouse-connect
 py4j==0.10.9.9  # pyspark
+python-dateutil==3.0.0  # pandas
+pytz==2026.5  # pandas
+six==1.17.0  # python-dateutil
+tzdata==2026.5  # pandas, python-dateutil
 urllib3==2.8.0  # clickhouse-connect
 
 # Test tooling: the image is the reference environment for tests/streaming because it is

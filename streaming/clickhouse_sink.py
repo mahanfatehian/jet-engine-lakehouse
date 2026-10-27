@@ -154,6 +154,16 @@ class ClickHouseTarget:
             self._writer = ClickHouseWriter(self._client, self._settings.clickhouse_db, self._wait)
         verify_tables(self._client, self._settings.clickhouse_db, self._tables, self._wait, SINGLE_ATTEMPT)
 
+    def check_tables(self, tables: Iterable[str]) -> None:
+        """Check, in one attempt, that ``tables`` exist too (the HF feature tables).
+
+        Kept apart from :meth:`check_ready` so that a database missing only these tables
+        holds back the queries that need them, not the CDC path.
+        """
+        if self._client is None:
+            raise RuntimeError("ClickHouse is not connected: check_ready() has not succeeded yet")
+        verify_tables(self._client, self._settings.clickhouse_db, tables, self._wait, SINGLE_ATTEMPT)
+
     @property
     def writer(self) -> ClickHouseWriter:
         """Writer of the connected client; :meth:`check_ready` must have succeeded once."""

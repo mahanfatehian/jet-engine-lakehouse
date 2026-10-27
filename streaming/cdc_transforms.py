@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import operator
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
 from functools import reduce
 
 from cdc_schemas import DEAD_LETTER_COLUMNS, DELETE_OP, SUPPORTED_OPS, FieldKind, FieldSpec, TableSpec
+from clickhouse_rows import DATETIME64_MAX_MICROS, DATETIME64_MIN_MICROS
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as sf
 from pyspark.sql.types import DataType, DoubleType, IntegerType, LongType, StringType, StructField, StructType
@@ -37,15 +37,9 @@ _ENVELOPE = "_envelope"
 _IMAGE = "_image"
 
 
-def _epoch_micros(instant: datetime) -> int:
-    return (instant - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)
-
-
 # ClickHouse DateTime64 range: instants outside it cannot be stored faithfully.
-_MIN_MICROS = _epoch_micros(datetime(1900, 1, 1, tzinfo=UTC))
-_MAX_MICROS = _epoch_micros(datetime(2299, 12, 31, 23, 59, 59, 999999, tzinfo=UTC))
-_MIN_MILLIS = _MIN_MICROS // 1000
-_MAX_MILLIS = _MAX_MICROS // 1000
+_MIN_MILLIS = DATETIME64_MIN_MICROS // 1000
+_MAX_MILLIS = DATETIME64_MAX_MICROS // 1000
 
 _JSON_TYPES: dict[FieldKind, DataType] = {
     FieldKind.STRING: StringType(),
@@ -202,7 +196,7 @@ def _millis_to_timestamp(millis: Column) -> Column:
 
 def _invalid_timestamp(text: Column) -> Column:
     parsed = sf.try_to_timestamp(text)
-    return parsed.isNull() | ~sf.unix_micros(parsed).between(_MIN_MICROS, _MAX_MICROS)
+    return parsed.isNull() | ~sf.unix_micros(parsed).between(DATETIME64_MIN_MICROS, DATETIME64_MAX_MICROS)
 
 
 def _failing_fields(
