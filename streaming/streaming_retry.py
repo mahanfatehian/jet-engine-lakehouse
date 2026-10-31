@@ -55,11 +55,16 @@ class RetryPolicy:
             raise ValueError("delays must satisfy 0 < base_delay_s <= max_delay_s")
 
     def delays(self) -> tuple[float, ...]:
-        """Waits between consecutive attempts (one fewer than ``attempts``)."""
+        """Waits between consecutive attempts (one fewer than ``attempts``), without jitter."""
         return tuple(
-            capped_backoff(failures, self.base_delay_s, self.max_delay_s)
+            capped_backoff(failures, self.base_delay_s, self.max_delay_s, jitter=False)
             for failures in range(1, self.attempts)
         )
+
+    @property
+    def max_total_delay_s(self) -> float:
+        """Worst-case total wait (no jitter) before the policy is exhausted."""
+        return sum(self.delays())
 
 
 def call_with_retry(
