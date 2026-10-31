@@ -52,6 +52,7 @@ class HeartbeatWriter:
         self._clock = clock
         self._wall_clock = wall_clock
         self._last_write: float | None = None
+        self._first_write: float | None = None
         self._failing = False
 
     def publish(self, status: Mapping[str, object], *, force: bool = False) -> bool:
@@ -62,11 +63,22 @@ class HeartbeatWriter:
         now = self._clock()
         if not force and self._last_write is not None and now - self._last_write < self._min_interval_s:
             return False
-        payload = {"timestamp": self._wall_clock(), "pid": os.getpid(), **status}
+        if self._first_write is None:
+            self._first_write = now
+        elapsed = round(now - self._first_write, 1)
+        payload = {"timestamp": self._wall_clock(), "pid": os.getpid(), "uptime_s": elapsed, **status}
         if not self._write(json.dumps(payload, indent=2, default=str) + "\n"):
             return False
         self._last_write = now
         return True
+
+    def remove(self) -> None:
+        """Delete the heartbeat file on graceful shutdown (best-effort)."""
+        for target in (self.path, self._temp_path):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _write(self, text: str) -> bool:
         try:
