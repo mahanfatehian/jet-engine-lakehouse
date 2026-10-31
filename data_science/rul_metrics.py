@@ -8,7 +8,9 @@ from dataclasses import asdict, dataclass
 import numpy as np
 from sklearn.metrics import (
     f1_score,
+    max_error,
     mean_absolute_error,
+    median_absolute_error,
     precision_score,
     r2_score,
     recall_score,
@@ -77,6 +79,8 @@ class HoldoutMetrics:
     lifecycles: int
     rmse: float
     mae: float
+    median_ae: float
+    max_error: float
     r2: float
     late_life_rmse: float
     nasa_score: float
@@ -123,6 +127,8 @@ def evaluate_predictions(
         lifecycles=int(lifecycles),
         rmse=_rmse(target, rul_pred),
         mae=float(mean_absolute_error(target, rul_pred)),
+        median_ae=float(median_absolute_error(target, rul_pred)),
+        max_error=float(max_error(target, rul_pred)),
         r2=float(r2_score(target, rul_pred)),
         late_life_rmse=_rmse(target[late_life], rul_pred[late_life]),
         nasa_score=float(scores.mean()),
