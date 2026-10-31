@@ -58,11 +58,25 @@ class TableBatch:
     duplicates: int
 
 
+def clamp_timestamp(micros: int) -> int:
+    """Clamp epoch microseconds to the ClickHouse DateTime64 storable range [1900-01-01, 2299-12-31].
+
+    Values outside this range would be silently truncated by ClickHouse; clamping keeps the
+    row insertable while making the out-of-range instant obvious (it lands exactly on the
+    boundary).
+    """
+    return max(DATETIME64_MIN_MICROS, min(micros, DATETIME64_MAX_MICROS))
+
+
 def to_utc_datetime(micros: int | None) -> datetime | None:
-    """Exact timezone-aware UTC datetime for epoch microseconds (``None`` stays ``None``)."""
+    """Exact timezone-aware UTC datetime for epoch microseconds (``None`` stays ``None``).
+
+    Microsecond values outside the ClickHouse DateTime64 range are clamped to
+    the nearest boundary.
+    """
     if micros is None:
         return None
-    return _EPOCH + timedelta(microseconds=micros)
+    return _EPOCH + timedelta(microseconds=clamp_timestamp(micros))
 
 
 def convert_row(values: Sequence[Any], timestamp_positions: frozenset[int]) -> Row:
