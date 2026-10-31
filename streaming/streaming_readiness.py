@@ -82,3 +82,25 @@ def _check(probes: Sequence[tuple[str, Callable[[], None]]]) -> None:
             probe()
         except DependencyNotReadyError as exc:
             raise DependencyNotReadyError(f"{name}: {exc}") from exc
+
+
+def check_all_dependencies(settings: StreamingSettings) -> None:
+    """Raise :class:`DependencyNotReadyError` unless Kafka, MinIO and ClickHouse all answer.
+
+    Unlike ``check_lake_dependencies`` / ``check_clickhouse_dependencies`` this probes
+    every service and collects *all* failures into a single error so operators see every
+    unavailable dependency at once.
+    """
+    failures: list[str] = []
+    probes: Sequence[tuple[str, Callable[[], None]]] = (
+        ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
+        ("MinIO", lambda: probe_http(settings.s3_health_url)),
+        ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
+    )
+    for name, probe in probes:
+        try:
+            probe()
+        except DependencyNotReadyError as exc:
+            failures.append(f"{name}: {exc}")
+    if failures:
+        raise DependencyNotReadyError("; ".join(failures))
