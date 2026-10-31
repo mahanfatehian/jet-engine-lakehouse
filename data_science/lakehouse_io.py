@@ -88,6 +88,20 @@ class ClickHouseGateway:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    def ping(self) -> bool:
+        """Return True when the server responds to a lightweight probe."""
+        try:
+            return self._retry("ping ClickHouse", lambda: self._client.ping())
+        except Exception:
+            return False
+
+    def command(self, statement: str, parameters: Mapping[str, Any] | None = None) -> None:
+        """Execute a DDL or non-SELECT statement (CREATE TABLE, INSERT, ALTER, etc.)."""
+        self._retry(
+            "execute ClickHouse command",
+            lambda: self._client.command(statement, parameters=dict(parameters or {})),
+        )
+
     def table_engines(self, tables: Iterable[str]) -> dict[str, str]:
         """Map each existing table (or view) among ``tables`` to its engine name."""
         names = sorted(set(tables))
