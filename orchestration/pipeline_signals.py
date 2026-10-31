@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import time
+from collections.abc import Callable
 from types import FrameType
 
 logger = logging.getLogger(__name__)
@@ -20,10 +22,12 @@ class ShutdownFlag:
     is still shutting down gets killed right away.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         self._event = threading.Event()
         self._requests = 0
         self._reason = ""
+        self._clock = clock
+        self._start = clock()
 
     def request(self, reason: str) -> None:
         """Record a stop request; ``reason`` names its origin, e.g. the signal name."""
@@ -49,9 +53,18 @@ class ShutdownFlag:
         """Origin of the first stop request, empty while running."""
         return self._reason
 
+    @property
+    def elapsed_seconds(self) -> float:
+        """Seconds since the flag was created (wall-clock-independent)."""
+        return self._clock() - self._start
+
     def wait(self, timeout: float) -> bool:
         """Sleep up to ``timeout`` seconds; return True early as soon as a stop is requested."""
         return self._event.wait(timeout)
+
+    def __repr__(self) -> str:
+        state = "requested" if self.requested else "running"
+        return f"ShutdownFlag({state}, elapsed={self.elapsed_seconds:.1f}s)"
 
 
 def install_signal_handlers(
