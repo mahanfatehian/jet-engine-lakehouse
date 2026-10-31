@@ -8,6 +8,7 @@ immediately instead of keeping the container alive until the retries are exhaust
 from __future__ import annotations
 
 import logging
+import random
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
@@ -27,10 +28,16 @@ class RetryAbortedError(RuntimeError):
     """Raised when shutdown is requested while waiting for the next attempt."""
 
 
-def capped_backoff(failures: int, base_delay_s: float, max_delay_s: float) -> float:
-    """Wait after ``failures`` consecutive failures: ``base_delay_s * 2**(failures - 1)``, capped."""
+def capped_backoff(failures: int, base_delay_s: float, max_delay_s: float, *, jitter: bool = True) -> float:
+    """Wait after ``failures`` consecutive failures: ``base_delay_s * 2**(failures - 1)``, capped.
+
+    When ``jitter`` is True (the default) the delay is multiplied by a uniform random
+    factor in [0.5, 1.0) so that concurrent queries do not retry in lockstep against a
+    recovering broker (thundering-herd avoidance).
+    """
     exponent = min(max(failures, 1) - 1, _MAX_BACKOFF_EXPONENT)
-    return min(base_delay_s * 2**exponent, max_delay_s)
+    delay = min(base_delay_s * 2**exponent, max_delay_s)
+    return delay * random.uniform(0.5, 1.0) if jitter else delay
 
 
 @dataclass(frozen=True, slots=True)
