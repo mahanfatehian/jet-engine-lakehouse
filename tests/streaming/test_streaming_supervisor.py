@@ -1,15 +1,18 @@
 """Unit tests of the query supervisor with fake queries, gates and clock (no JVM needed).
 
 They cover the independence of the lake and ClickHouse groups, restarts with capped
-exponential backoff, the failure count, data-loss reporting, the heartbeat and shutdown.
+exponential backoff and its jitter, the failure count, data-loss reporting, the heartbeat and
+shutdown. The supervisor draws its jitter from ``FixedRandom(0.0)`` unless a test says
+otherwise, which leaves every wait at its documented backoff step.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+import random
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import pytest
@@ -18,6 +21,7 @@ from streaming_readiness import DependencyNotReadyError
 from streaming_supervisor import (
     EXIT_DRIVER_STOPPED,
     EXIT_OK,
+    POLL_SECONDS,
     QueryGroup,
     QuerySpec,
     QuerySupervisor,
@@ -123,13 +127,39 @@ class FakeClock:
         self.now += seconds
 
 
+class FixedRandom(random.Random):
+    """A generator whose every ``random()`` draw is ``value``: 0.0 leaves each wait unjittered."""
+
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+class ScriptedRandom(random.Random):
+    """A generator that draws the given values in order."""
+
+    def __init__(self, draws: Iterable[float]) -> None:
+        super().__init__()
+        self._draws = iter(draws)
+
+    def random(self) -> float:
+        return next(self._draws)
+
+
 class FakeHeartbeat:
     def __init__(self) -> None:
         self.published: list[tuple[dict[str, Any], bool]] = []
+        self.removals: list[int] = []  # publishes seen before each remove()
 
     def publish(self, status: Mapping[str, object], *, force: bool = False) -> bool:
         self.published.append((copy.deepcopy(dict(status)), force))
         return True
+
+    def remove(self) -> None:
+        self.removals.append(len(self.published))
 
     @property
     def last(self) -> dict[str, Any]:
@@ -159,6 +189,7 @@ class Platform:
         clickhouse_ready: bool = True,
         stop_event: threading.Event | None = None,
         driver_alive: Callable[[], bool] = lambda: True,
+        rng: random.Random | None = None,
     ) -> None:
         self.clock = FakeClock()
         self.heartbeat = FakeHeartbeat()
@@ -177,6 +208,7 @@ class Platform:
             clock=self.clock,
             wall_clock=self.wall_clock,
             poll_s=0.0,
+            rng=rng or FixedRandom(0.0),
         )
 
     def wall_clock(self) -> str:
@@ -389,6 +421,9 @@ def test_requested_shutdown_drains_and_stops_every_query(caplog: pytest.LogCaptu
     assert final["status"] == "stopped"
     assert {query["state"] for query in final["queries"].values()} == {"stopped"}
     assert {query["next_attempt_in_s"] for query in final["queries"].values()} == {None}
+    # Then the heartbeat is removed, once and after that final state: a restarted container must
+    # not pass its healthcheck on this process's file.
+    assert platform.heartbeat.removals == [len(platform.heartbeat.published)]
 
 
 def test_query_ending_during_shutdown_is_not_restarted(caplog: pytest.LogCaptureFixture) -> None:
@@ -415,6 +450,59 @@ def test_lost_driver_ends_supervision_with_a_failure_code(caplog: pytest.LogCapt
     assert "the Spark driver has stopped" in caplog.text
     assert [platform.starters[name].current.stop_calls for name in QUERY_NAMES] == [0, 0, 0]
     assert platform.heartbeat.last["status"] == "stopped"
+    assert platform.heartbeat.removals == []  # not a requested stop: the restarted process replaces it
+
+
+def test_backoff_waits_are_jittered_between_half_and_all_of_each_step() -> None:
+    def recheck_waits(seed: int) -> list[float]:
+        platform = Platform(clickhouse_ready=False, rng=random.Random(seed))
+        waits = []
+        for _ in range(8):
+            platform.supervisor.step()
+            waits.append(platform.state("clickhouse_raw")["next_attempt_in_s"])
+            platform.clock.advance(60.0)  # due again, whatever the draw
+        return waits
+
+    steps = [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0]
+    waits = recheck_waits(seed=5)
+    assert all(step / 2 <= wait <= step for wait, step in zip(waits, steps, strict=True)), waits
+    assert waits != steps
+    assert recheck_waits(seed=5) == waits  # the injected generator is the only source of randomness
+
+
+def test_without_an_injected_generator_the_supervisor_jitters_with_its_own() -> None:
+    # The production configuration: nothing is injected, the supervisor creates its own generator.
+    names = [f"q{index}" for index in range(10)]
+    group = QueryGroup("lake", Gate(False), tuple(QuerySpec(name, Starter(name)) for name in names))
+    supervisor = QuerySupervisor([group], threading.Event(), FakeHeartbeat(), clock=FakeClock())
+    supervisor.step()
+    queries = supervisor.snapshot()["queries"]
+    assert isinstance(queries, dict)
+    waits = [queries[name]["next_attempt_in_s"] for name in names]
+    assert all(1.0 <= wait <= 2.0 for wait in waits), waits
+    assert len(set(waits)) > 1, waits  # ten draws of a real generator, not one fixed wait
+
+
+def test_queries_that_failed_together_restart_in_different_rounds() -> None:
+    # MinIO is down: both lake queries wait for it with equal failure counts, in step while the
+    # draws are 0.0, until the third check, whose second draw is 0.75: 8 s for bronze_t,
+    # 8 - 0.75 * 4 = 5 s for silver_t.
+    platform = Platform(rng=ScriptedRandom([0.0, 0.0, 0.0, 0.0, 0.0, 0.75]))
+    platform.gates["lake"].ready = False
+    for wait in (2.0, 4.0):
+        platform.supervisor.step()
+        assert [platform.state(name)["next_attempt_in_s"] for name in ("bronze_t", "silver_t")] == [wait] * 2
+        platform.clock.advance(wait)
+    platform.supervisor.step()
+    assert [platform.state(name)["next_attempt_in_s"] for name in ("bronze_t", "silver_t")] == [8.0, 5.0]
+    platform.gates["lake"].ready = True
+    platform.restart_due("silver_t")
+    assert platform.runs() == [1, 0, 1]
+    # bronze_t is not due yet, nor in the supervisor's next round.
+    assert platform.state("bronze_t")["next_attempt_in_s"] == 3.0 > POLL_SECONDS
+    platform.restart_due("bronze_t")
+    assert platform.runs() == [1, 1, 1]
+    assert platform.gates["lake"].calls == 5  # three checks for both, then one per query
 
 
 @pytest.mark.parametrize(

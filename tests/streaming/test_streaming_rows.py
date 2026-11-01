@@ -7,11 +7,26 @@ from datetime import UTC, datetime
 
 import pytest
 from cdc_schemas import DEAD_LETTER_COLUMNS, ENGINE_TELEMETRY, MAINTENANCE_LOG
-from clickhouse_rows import convert_row, dead_letter_row, deduplicate, split_collected, to_utc_datetime
+from clickhouse_rows import (
+    DATETIME64_MAX_MICROS,
+    DATETIME64_MIN_MICROS,
+    clamp_timestamp,
+    convert_row,
+    dead_letter_row,
+    deduplicate,
+    split_collected,
+    to_utc_datetime,
+)
 
 # 2026-10-26T09:00:01.123456Z in epoch microseconds, computed independently of the code under test.
 ROUND_TRIP_MICROS = 1_793_005_201_123_456
 ROUND_TRIP_INSTANT = datetime(2026, 10, 26, 9, 0, 1, 123456, tzinfo=UTC)
+# The ClickHouse DateTime64 range.
+DATETIME64_FIRST = datetime(1900, 1, 1, tzinfo=UTC)
+DATETIME64_LAST = datetime(2299, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+# A record timestamp a producer set in microseconds where Kafka expects milliseconds: Spark
+# reads it as the year 58,788, which no Python datetime can hold.
+MICROS_AS_MILLIS = ROUND_TRIP_MICROS * 1000
 
 
 def _clickhouse_ticks(value: datetime, precision: int) -> int:
@@ -41,6 +56,37 @@ def test_to_utc_datetime_known_instants(micros: int, expected: datetime) -> None
 
 def test_to_utc_datetime_keeps_null() -> None:
     assert to_utc_datetime(None) is None
+
+
+@pytest.mark.parametrize(
+    ("micros", "expected"),
+    [
+        (DATETIME64_MAX_MICROS + 1, datetime(2300, 1, 1, tzinfo=UTC)),
+        (DATETIME64_MIN_MICROS - 1, datetime(1899, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)),
+        (32_503_680_000_000_000, datetime(3000, 1, 1, tzinfo=UTC)),
+    ],
+)
+def test_to_utc_datetime_is_exact_outside_the_datetime64_range_too(micros: int, expected: datetime) -> None:
+    # Valid rows never get here (they are dead-lettered upstream); were one to, it must not be rewritten.
+    assert to_utc_datetime(micros) == expected
+    assert convert_row((micros,), frozenset({0})) == (expected,)
+
+
+@pytest.mark.parametrize(
+    ("micros", "expected"),
+    [
+        (ROUND_TRIP_MICROS, ROUND_TRIP_MICROS),
+        (0, 0),
+        (DATETIME64_MIN_MICROS, DATETIME64_MIN_MICROS),
+        (DATETIME64_MAX_MICROS, DATETIME64_MAX_MICROS),
+        (DATETIME64_MIN_MICROS - 1, DATETIME64_MIN_MICROS),
+        (DATETIME64_MAX_MICROS + 1, DATETIME64_MAX_MICROS),
+        (MICROS_AS_MILLIS, DATETIME64_MAX_MICROS),
+        (-(2**63), DATETIME64_MIN_MICROS),
+    ],
+)
+def test_clamp_timestamp_moves_only_instants_outside_the_range(micros: int, expected: int) -> None:
+    assert clamp_timestamp(micros) == expected
 
 
 @pytest.mark.parametrize("fraction", [0, 1, 123456, 499999, 500000, 999998, 999999])
@@ -73,6 +119,34 @@ def test_dead_letter_row_converts_timestamp_and_defaults_missing_key() -> None:
         "not json",
         "malformed",
     )
+
+
+@pytest.mark.parametrize(
+    ("kafka_micros", "stored"),
+    [
+        (DATETIME64_MAX_MICROS, DATETIME64_LAST),
+        (32_503_680_000_000_000, DATETIME64_LAST),  # the year 3000
+        (MICROS_AS_MILLIS, DATETIME64_LAST),
+        (DATETIME64_MIN_MICROS - 1, DATETIME64_FIRST),
+        (None, None),  # Spark's Kafka source always sets a timestamp; nothing is made up if not
+    ],
+)
+def test_dead_letter_row_clamps_the_broker_timestamp_into_the_datetime64_range(
+    kafka_micros: int | None, stored: datetime | None
+) -> None:
+    record = ("engine_hf.sensor_frames", 0, 7, kafka_micros, "JT9D-001", "AAAA", "null value")
+    row = dead_letter_row(record)
+    assert row == ("engine_hf.sensor_frames", 0, 7, stored, "JT9D-001", "AAAA", "null value")
+
+
+def test_dead_letter_of_a_timestamp_python_cannot_represent_is_still_insertable() -> None:
+    with pytest.raises(OverflowError):  # what failed the batch, on every replay, before the clamp
+        to_utc_datetime(MICROS_AS_MILLIS)
+    topic = "engine_cdc.public.engine_telemetry"
+    record = (topic, 2, 41, MICROS_AS_MILLIS, None, "{}", "missing op")
+    nulls = (None,) * len(ENGINE_TELEMETRY.clickhouse_columns)
+    batch = split_collected(ENGINE_TELEMETRY, [(record, *nulls)])
+    assert batch.dead_letters == [(topic, 2, 41, DATETIME64_LAST, "", "{}", "missing op")]
 
 
 def test_deduplicate_keeps_first_occurrence_per_key() -> None:

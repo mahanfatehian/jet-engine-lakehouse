@@ -1,48 +1,33 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
+There are no releases: fixes land on `main`, and only the latest `main` is supported.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-If you discover a security vulnerability in the IoT Jet Engine Lakehouse
-platform, please report it responsibly:
+Please do **not** open a public issue. Report it privately through GitHub's private
+vulnerability reporting:
+<https://github.com/mahanfatehian/jet-engine-lakehouse/security/advisories/new> (the
+repository's **Security** tab, **Report a vulnerability**).
 
-1. **Do not** open a public issue.
-2. Send a detailed description to the repository owner via a private
-   vulnerability report on GitHub (Security → Advisories → "Report a
-   vulnerability").
-3. Include reproduction steps, the affected component (simulator, streaming,
-   data-science, orchestration, infrastructure) and the potential impact.
-
-We aim to acknowledge reports within 48 hours and to issue a fix or mitigation
-within 14 days for confirmed vulnerabilities.
+Include the affected component (simulator, streaming, dbt, data science, orchestration or
+infrastructure), the steps to reproduce and the impact you expect. This is a single-maintainer
+project, so reports are handled on a best-effort basis; a confirmed vulnerability is fixed on
+`main` and disclosed in a GitHub security advisory.
 
 ## Scope
 
-The following components are in scope:
+In scope: the code and configuration in this repository, that is the simulator, the Spark
+streaming job, the dbt project, the data-science and orchestration jobs, the Dockerfiles and
+the compose stack with its service configuration (Postgres, Debezium, Kafka, Schema Registry,
+MinIO, ClickHouse, Grafana).
 
-* **Simulator** – engine telemetry generation and HF signal production.
-* **Streaming** – Spark Structured Streaming, Kafka consumers, ClickHouse
-  sinks.
-* **Data Science** – RUL model training, inference, promotion pipeline.
-* **Orchestration** – pipeline scheduler, task runner, inter-process locks.
-* **Infrastructure** – Docker Compose stack, ClickHouse/Postgres/MinIO/Kafka
-  configuration, Debezium CDC connectors.
+Out of scope:
 
-## Out of Scope
-
-* Issues that require physical access to the host machine.
-* Denial-of-service attacks against third-party dependencies.
-* Vulnerabilities in upstream base images that already have a published CVE
-  and an available patch.
-
-## Disclosure Timeline
-
-* **Day 0** – report received and acknowledged.
-* **Day 7** – initial triage and severity assessment shared with the reporter.
-* **Day 14** – fix merged (or a mitigation deployed with a tracked follow-up).
-* **Day 30** – public advisory published (coordinated with the reporter).
+* The single-node defaults the README lists under *Production hardening notes*, such as the
+  default credentials, a single Kafka broker and no TLS: they are documented trade-offs of a
+  reference platform.
+* Vulnerabilities in third-party images and packages themselves: report them upstream
+  (Dependabot proposes updated pins here every week).
+* Attacks that need physical access to the host.

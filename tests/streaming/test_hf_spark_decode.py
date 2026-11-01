@@ -188,6 +188,17 @@ def test_dead_letter_of_a_keyless_null_record_has_empty_texts(schema_json, hf_re
     assert row[4:] == ("", "", "null value")
 
 
+def test_dead_letter_of_a_record_stamped_in_microseconds_is_insertable(schema_json, hf_records) -> None:
+    # A producer that passes microseconds as the Kafka timestamp (milliseconds) dates its records
+    # in the year 58,788: Spark carries that instant, Python's datetime cannot.
+    stamped = 1_793_005_202_500_000 * 1000
+    records = hf_records([b"\x01garbage"]).withColumn("kafka_timestamp", sf.timestamp_micros(sf.lit(stamped)))
+    (record,) = dead_letters(decode_frames(records, schema_json)).collect()
+    assert record["kafka_timestamp"] == stamped
+    row = dead_letter_row(record)
+    assert row[3] == datetime(2299, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)  # the end of the DateTime64 range
+
+
 def test_bronze_keeps_every_record_verbatim(make_frame, avro_frames, hf_records) -> None:
     (good,) = avro_frames([make_frame()], schema_id=9)
     values = [good, b"\x01garbage", None]

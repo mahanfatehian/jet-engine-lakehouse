@@ -6,14 +6,20 @@ dependencies answer would only fail its first micro-batch, so the supervisor run
 checks before every (re)start. Each check makes one bounded attempt: retrying with backoff
 is the supervisor's job, which keeps an unavailable dependency from delaying the queries
 that do not need it.
+
+A group check stops at the first dependency that does not answer: the supervisor only needs to
+know that the group must wait. :func:`unavailable_dependencies` instead probes every dependency
+and reports each one that is down, for operators (the ``--check-dependencies`` mode of
+``spark_kafka_to_lakehouse``).
 """
 
 from __future__ import annotations
 
+import http.client
 import socket
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 from streaming_config import StreamingSettings
 
@@ -23,6 +29,9 @@ PROBE_TIMEOUT_S = 3.0
 
 # Probes target in-network endpoints: an HTTP(S)_PROXY from the environment must not apply.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+Probe = tuple[str, Callable[[], None]]
+"""A dependency's name and its probe: one bounded attempt that raises unless it answers."""
 
 
 class DependencyNotReadyError(RuntimeError):
@@ -40,6 +49,8 @@ def probe_http(url: str, timeout_s: float = PROBE_TIMEOUT_S) -> None:
         raise DependencyNotReadyError(f"{url} answered HTTP {exc.code}") from exc
     except OSError as exc:  # URLError, refused connections and timeouts are all OSErrors
         raise DependencyNotReadyError(f"{url} is unreachable: {exc}") from exc
+    except http.client.HTTPException as exc:  # e.g. a port that speaks another protocol
+        raise DependencyNotReadyError(f"{url} did not answer HTTP: {exc!r}") from exc
 
 
 def probe_tcp(bootstrap_servers: str, timeout_s: float = PROBE_TIMEOUT_S) -> None:
@@ -55,27 +66,28 @@ def probe_tcp(bootstrap_servers: str, timeout_s: float = PROBE_TIMEOUT_S) -> Non
     raise DependencyNotReadyError("no Kafka bootstrap server is reachable (" + "; ".join(failures) + ")")
 
 
+def dependency_probes(settings: StreamingSettings) -> tuple[Probe, Probe, Probe]:
+    """The probes of every dependency of the job: Kafka, MinIO and ClickHouse."""
+    return (
+        ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
+        ("MinIO", lambda: probe_http(settings.s3_health_url)),
+        ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
+    )
+
+
 def check_lake_dependencies(settings: StreamingSettings) -> None:
     """Raise :class:`DependencyNotReadyError` unless Kafka and MinIO answer (Path A)."""
-    _check(
-        (
-            ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
-            ("MinIO", lambda: probe_http(settings.s3_health_url)),
-        )
-    )
+    kafka, minio, _ = dependency_probes(settings)
+    _check((kafka, minio))
 
 
 def check_clickhouse_dependencies(settings: StreamingSettings) -> None:
     """Raise :class:`DependencyNotReadyError` unless Kafka and ClickHouse answer (Path B)."""
-    _check(
-        (
-            ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
-            ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
-        )
-    )
+    kafka, _, clickhouse = dependency_probes(settings)
+    _check((kafka, clickhouse))
 
 
-def _check(probes: Sequence[tuple[str, Callable[[], None]]]) -> None:
+def _check(probes: Sequence[Probe]) -> None:
     """Run the probes in order; the error names the first dependency that did not answer."""
     for name, probe in probes:
         try:
@@ -84,23 +96,12 @@ def _check(probes: Sequence[tuple[str, Callable[[], None]]]) -> None:
             raise DependencyNotReadyError(f"{name}: {exc}") from exc
 
 
-def check_all_dependencies(settings: StreamingSettings) -> None:
-    """Raise :class:`DependencyNotReadyError` unless Kafka, MinIO and ClickHouse all answer.
-
-    Unlike ``check_lake_dependencies`` / ``check_clickhouse_dependencies`` this probes
-    every service and collects *all* failures into a single error so operators see every
-    unavailable dependency at once.
-    """
+def unavailable_dependencies(probes: Iterable[Probe]) -> list[str]:
+    """Run every probe once, also after a failure; ``"<name>: <reason>"`` per dependency that is down."""
     failures: list[str] = []
-    probes: Sequence[tuple[str, Callable[[], None]]] = (
-        ("Kafka", lambda: probe_tcp(settings.kafka_bootstrap_servers)),
-        ("MinIO", lambda: probe_http(settings.s3_health_url)),
-        ("ClickHouse", lambda: probe_http(settings.clickhouse_ping_url)),
-    )
     for name, probe in probes:
         try:
             probe()
         except DependencyNotReadyError as exc:
             failures.append(f"{name}: {exc}")
-    if failures:
-        raise DependencyNotReadyError("; ".join(failures))
+    return failures

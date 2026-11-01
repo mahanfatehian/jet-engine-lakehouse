@@ -56,7 +56,9 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing or otherwise unacceptable behaviour may be
-reported to the project team responsible for enforcement. All complaints will be
+reported to the repository owner, [@mahanfatehian](https://github.com/mahanfatehian),
+on GitHub. Content that also breaks GitHub's Community Guidelines can be reported to
+GitHub as well (**Report content** on the comment or issue). All complaints will be
 reviewed and investigated promptly and fairly.
 
 All project maintainers are obligated to respect the privacy and security of the

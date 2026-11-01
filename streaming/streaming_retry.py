@@ -3,6 +3,13 @@
 Waiting is delegated to an injected ``wait(seconds) -> bool`` callable (normally
 ``threading.Event.wait`` of the shutdown event) so that a SIGTERM interrupts a backoff
 immediately instead of keeping the container alive until the retries are exhausted.
+
+The backoff itself is deterministic (:func:`capped_backoff`), so the waits of a
+:class:`RetryPolicy` are exact and documented figures stay true. Randomness is opt-in:
+:func:`equal_jitter` takes the ``random.Random`` to draw from. The query supervisor uses it so
+that queries that failed together do not all restart in the same round; ``call_with_retry``
+does not, as its callers (the inserts of the two ClickHouse queries) are too few to retry in a
+herd.
 """
 
 from __future__ import annotations
@@ -28,16 +35,21 @@ class RetryAbortedError(RuntimeError):
     """Raised when shutdown is requested while waiting for the next attempt."""
 
 
-def capped_backoff(failures: int, base_delay_s: float, max_delay_s: float, *, jitter: bool = True) -> float:
-    """Wait after ``failures`` consecutive failures: ``base_delay_s * 2**(failures - 1)``, capped.
-
-    When ``jitter`` is True (the default) the delay is multiplied by a uniform random
-    factor in [0.5, 1.0) so that concurrent queries do not retry in lockstep against a
-    recovering broker (thundering-herd avoidance).
-    """
+def capped_backoff(failures: int, base_delay_s: float, max_delay_s: float) -> float:
+    """Wait after ``failures`` consecutive failures: ``base_delay_s * 2**(failures - 1)``, capped."""
     exponent = min(max(failures, 1) - 1, _MAX_BACKOFF_EXPONENT)
-    delay = min(base_delay_s * 2**exponent, max_delay_s)
-    return delay * random.uniform(0.5, 1.0) if jitter else delay
+    return min(base_delay_s * 2**exponent, max_delay_s)
+
+
+def equal_jitter(delay_s: float, rng: random.Random) -> float:
+    """``delay_s`` with equal jitter: half of it fixed, the other half drawn from ``rng``.
+
+    The result lies between ``delay_s / 2`` and ``delay_s``: never longer than the deterministic
+    delay, so worst-case figures stay true, and at least half of it, so a doubled backoff step
+    never waits less than any wait of the step before. A draw of 0.0 (``rng.random()``) returns
+    ``delay_s`` itself.
+    """
+    return delay_s - delay_s / 2 * rng.random()
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,15 +67,19 @@ class RetryPolicy:
             raise ValueError("delays must satisfy 0 < base_delay_s <= max_delay_s")
 
     def delays(self) -> tuple[float, ...]:
-        """Waits between consecutive attempts (one fewer than ``attempts``), without jitter."""
+        """Waits between consecutive attempts (one fewer than ``attempts``)."""
         return tuple(
-            capped_backoff(failures, self.base_delay_s, self.max_delay_s, jitter=False)
+            capped_backoff(failures, self.base_delay_s, self.max_delay_s)
             for failures in range(1, self.attempts)
         )
 
     @property
     def max_total_delay_s(self) -> float:
-        """Worst-case total wait (no jitter) before the policy is exhausted."""
+        """Longest total wait before the policy gives up: the sum of :meth:`delays`.
+
+        ``call_with_retry`` waits that long when every attempt fails (a shutdown request cuts
+        it short), on top of the time the attempts themselves take.
+        """
         return sum(self.delays())
 
 

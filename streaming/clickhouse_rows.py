@@ -12,6 +12,11 @@ Collected row layout (see ``cdc_transforms.clickhouse_projection``)::
 
 ``dead_letter`` is ``None`` for a valid record, otherwise a struct ordered like
 ``DEAD_LETTER_COLUMNS`` with ``kafka_timestamp`` in epoch microseconds.
+
+Conversions are exact: ``cdc_transforms`` and ``hf_decode`` dead-letter every record whose
+timestamps fall outside the DateTime64 range, so valid rows never need a correction. The one
+instant no validation covers is the broker's record timestamp of a dead letter, which
+:func:`dead_letter_row` clamps into the range (see :func:`clamp_timestamp`).
 """
 
 from __future__ import annotations
@@ -59,24 +64,19 @@ class TableBatch:
 
 
 def clamp_timestamp(micros: int) -> int:
-    """Clamp epoch microseconds to the ClickHouse DateTime64 storable range [1900-01-01, 2299-12-31].
+    """Epoch microseconds moved into the DateTime64 range, 1900-01-01 to 2299-12-31T23:59:59.999999.
 
-    Values outside this range would be silently truncated by ClickHouse; clamping keeps the
-    row insertable while making the out-of-range instant obvious (it lands exactly on the
-    boundary).
+    For the ``kafka_timestamp`` of a dead letter only (see :func:`dead_letter_row`): an instant
+    outside the range is stored on its nearest boundary, where it is recognisable as such.
     """
     return max(DATETIME64_MIN_MICROS, min(micros, DATETIME64_MAX_MICROS))
 
 
 def to_utc_datetime(micros: int | None) -> datetime | None:
-    """Exact timezone-aware UTC datetime for epoch microseconds (``None`` stays ``None``).
-
-    Microsecond values outside the ClickHouse DateTime64 range are clamped to
-    the nearest boundary.
-    """
+    """Exact timezone-aware UTC datetime for epoch microseconds (``None`` stays ``None``)."""
     if micros is None:
         return None
-    return _EPOCH + timedelta(microseconds=clamp_timestamp(micros))
+    return _EPOCH + timedelta(microseconds=micros)
 
 
 def convert_row(values: Sequence[Any], timestamp_positions: frozenset[int]) -> Row:
@@ -88,9 +88,18 @@ def convert_row(values: Sequence[Any], timestamp_positions: frozenset[int]) -> R
 
 
 def dead_letter_row(record: Sequence[Any]) -> Row:
-    """Insert row for ``raw_cdc_dead_letter`` from a collected dead-letter struct."""
+    """Insert row for ``raw_cdc_dead_letter`` from a collected dead-letter struct.
+
+    ``kafka_timestamp`` is the record timestamp the producer chose, and the broker keeps any
+    (no timestamp limit is configured). It is clamped into the DateTime64 range: ClickHouse
+    cannot store an instant outside it faithfully, and beyond the year 9999 Python cannot even
+    represent one (OverflowError), which would fail the batch on every replay. The dead letter
+    is the last resort for a bad record and must always be insertable.
+    """
     values = list(record)
-    values[_DEAD_LETTER_TIMESTAMP] = to_utc_datetime(values[_DEAD_LETTER_TIMESTAMP])
+    kafka_timestamp = values[_DEAD_LETTER_TIMESTAMP]
+    if kafka_timestamp is not None:
+        values[_DEAD_LETTER_TIMESTAMP] = to_utc_datetime(clamp_timestamp(kafka_timestamp))
     for position in _DEAD_LETTER_TEXT:
         # Non-nullable String columns: a record without a Kafka key is stored as ''.
         values[position] = values[position] or ""

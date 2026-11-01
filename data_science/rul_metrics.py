@@ -72,15 +72,16 @@ class HoldoutMetrics:
     only covers rows whose true RUL is within the cap (where the target is exact).
     ``nasa_score`` is the mean per-row C-MAPSS score (comparable across holdout
     sizes), ``nasa_score_sum`` the classic sum. ``clf_brier`` and ``clf_ece`` measure
-    how well the published failure probabilities are calibrated.
+    how well the published failure probabilities are calibrated. ``median_ae`` and
+    ``max_error`` (cycles, against the capped target) show the typical and the worst
+    miss next to the RMSE, which a few large misses dominate. Fields added after the
+    first release default to NaN, so metric documents written before them still load.
     """
 
     rows: int
     lifecycles: int
     rmse: float
     mae: float
-    median_ae: float
-    max_error: float
     r2: float
     late_life_rmse: float
     nasa_score: float
@@ -93,6 +94,8 @@ class HoldoutMetrics:
     positive_rate: float
     clf_brier: float = math.nan
     clf_ece: float = math.nan
+    median_ae: float = math.nan
+    max_error: float = math.nan
 
     def as_dict(self) -> dict[str, float | int | None]:
         """JSON-safe mapping (NaN becomes None)."""

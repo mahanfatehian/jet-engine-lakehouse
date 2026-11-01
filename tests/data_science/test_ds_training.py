@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -18,7 +20,13 @@ from failure_classifier import (
     without_empty_columns,
 )
 from feature_pipeline import FEATURE_COLUMNS, SPECTRAL_FEATURE_COLUMNS, build_feature_matrix, fit_categories
-from rul_metrics import brier_score, evaluate_predictions, expected_calibration_error, nasa_scores
+from rul_metrics import (
+    HoldoutMetrics,
+    brier_score,
+    evaluate_predictions,
+    expected_calibration_error,
+    nasa_scores,
+)
 from rul_modeling import (
     IncompatibleModelError,
     LabelSpec,
@@ -301,6 +309,26 @@ def test_metrics_use_capped_target_and_late_life_rows() -> None:
     assert metrics.positive_rate == 0.25
     assert metrics.clf_brier == pytest.approx((0.01 + 0.04 + 0.09 + 0.01) / 4)
     assert metrics.clf_ece == pytest.approx((0.1 + 0.2 + 0.3 + 0.1) / 4)
+    # Absolute misses on the capped target: 0, 0, 10, 10 cycles.
+    assert metrics.median_ae == pytest.approx(5.0) and metrics.max_error == pytest.approx(10.0)
+
+
+def test_metric_documents_written_before_median_ae_and_max_error_still_load() -> None:
+    metrics = evaluate_predictions(
+        rul_true=np.array([200.0, 60.0, 10.0]),
+        rul_pred=np.array([125.0, 50.0, 20.0]),
+        failure_probability=np.array([0.1, 0.3, 0.9]),
+        threshold=0.5,
+        rul_cap_cycles=125,
+        failure_horizon_cycles=25,
+        lifecycles=1,
+    )
+    older = {key: value for key, value in metrics.as_dict().items() if key not in {"median_ae", "max_error"}}
+
+    restored = HoldoutMetrics(**older)
+
+    assert restored.rmse == metrics.rmse and math.isnan(restored.median_ae) and math.isnan(restored.max_error)
+    assert restored.as_dict()["median_ae"] is None, "JSON-safe: an unknown metric is null, not NaN"
 
 
 def test_brier_score_and_calibration_error_known_values() -> None:

@@ -11,16 +11,25 @@ fresh for the container healthcheck.
 Exit codes: 0 after a requested shutdown (SIGTERM/SIGINT), 1 when the Spark driver cannot be
 started or stops (Docker's ``restart: unless-stopped`` then restarts the job, which resumes
 from its checkpoints), 2 for an invalid configuration.
+
+``--check-dependencies`` is a reachability probe: it checks once, with the job's settings, that
+Kafka accepts a TCP connection and that MinIO and ClickHouse answer HTTP, logs one line per
+dependency that does not answer, and exits 0 when all of them answer, 1 otherwise. ClickHouse
+credentials and tables are checked by the job itself when it starts its ClickHouse queries. It
+starts no Spark driver and leaves the heartbeat file alone, so it can run next to the job:
+``docker exec de_streaming python spark_kafka_to_lakehouse.py --check-dependencies``.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import signal
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 from types import FrameType
@@ -30,7 +39,8 @@ from pyspark.sql import SparkSession
 from streaming_config import ConfigError, StreamingSettings, load_settings, spark_conf
 from streaming_heartbeat import HeartbeatWriter
 from streaming_queries import build_query_groups
-from streaming_supervisor import QuerySupervisor
+from streaming_readiness import Probe, dependency_probes, unavailable_dependencies
+from streaming_supervisor import EXIT_OK, QuerySupervisor
 
 logger = logging.getLogger("spark_kafka_to_lakehouse")
 
@@ -84,6 +94,29 @@ def driver_alive(spark: SparkSession) -> bool:
         return False
 
 
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    """Command-line options; an unknown option exits with code 2 (argparse), like a bad setting."""
+    parser = argparse.ArgumentParser(description="Kafka -> MinIO + ClickHouse streaming job.")
+    parser.add_argument(
+        "--check-dependencies",
+        action="store_true",
+        help="reachability probe: check once that Kafka, MinIO and ClickHouse answer, report each one "
+        "that does not, and exit (credentials and tables are checked when the job starts its queries)",
+    )
+    return parser.parse_args(argv)
+
+
+def check_dependencies(probes: Sequence[Probe]) -> int:
+    """Run every probe once; ``EXIT_OK`` when all answer, else one error line each and ``EXIT_FAILURE``."""
+    failures = unavailable_dependencies(probes)
+    for failure in failures:
+        logger.error("dependency not ready: %s", failure)
+    if failures:
+        return EXIT_FAILURE
+    logger.info("dependencies answer: %s", ", ".join(name for name, _ in probes))
+    return EXIT_OK
+
+
 def run(settings: StreamingSettings, stop_event: threading.Event, heartbeat: HeartbeatWriter) -> int:
     """Build the driver, then supervise the streaming queries until shutdown."""
     spark = build_spark_session(settings)
@@ -99,8 +132,9 @@ def run(settings: StreamingSettings, stop_event: threading.Event, heartbeat: Hea
         spark.stop()
 
 
-def main() -> int:
-    """Process entrypoint; returns the exit code."""
+def main(argv: Sequence[str] = ()) -> int:
+    """Process entrypoint (``argv`` without the program name); returns the exit code."""
+    options = parse_args(argv)
     try:
         settings = load_settings(os.environ)
     except ConfigError as exc:
@@ -108,6 +142,8 @@ def main() -> int:
         logger.error("invalid configuration: %s", exc)
         return EXIT_CONFIG_ERROR
     configure_logging(settings.log_level)
+    if options.check_dependencies:
+        return check_dependencies(dependency_probes(settings))
     stop_event = threading.Event()
     install_signal_handlers(stop_event)
     heartbeat = HeartbeatWriter(Path(settings.heartbeat_file))
@@ -134,4 +170,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

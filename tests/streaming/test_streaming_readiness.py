@@ -13,8 +13,10 @@ from streaming_readiness import (
     DependencyNotReadyError,
     check_clickhouse_dependencies,
     check_lake_dependencies,
+    dependency_probes,
     probe_http,
     probe_tcp,
+    unavailable_dependencies,
 )
 
 FAST_TIMEOUT_S = 1.0
@@ -57,6 +59,24 @@ def tcp_listener() -> Iterator[int]:
         yield listener.getsockname()[1]
 
 
+@pytest.fixture
+def non_http_server() -> Iterator[int]:
+    """A port that reads a request and answers in another protocol (an SSH banner), then hangs up."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+
+        def serve_one() -> None:
+            connection, _ = listener.accept()
+            with connection, connection.makefile("rb") as request:
+                while request.readline() not in (b"\r\n", b""):  # read the whole request first
+                    pass
+                connection.sendall(b"SSH-2.0-OpenSSH_9.2\r\n")
+
+        threading.Thread(target=serve_one, daemon=True).start()
+        yield listener.getsockname()[1]
+
+
 def _unused_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -76,6 +96,11 @@ def test_http_probe_rejects_server_errors(http_server: Callable[[int], str]) -> 
 def test_http_probe_rejects_unreachable_endpoint() -> None:
     with pytest.raises(DependencyNotReadyError, match="unreachable"):
         probe_http(f"http://127.0.0.1:{_unused_port()}/ping", timeout_s=FAST_TIMEOUT_S)
+
+
+def test_http_probe_rejects_an_endpoint_that_does_not_speak_http(non_http_server: int) -> None:
+    with pytest.raises(DependencyNotReadyError, match=r"/ping did not answer HTTP: BadStatusLine\('SSH-2\.0"):
+        probe_http(f"http://127.0.0.1:{non_http_server}/ping", timeout_s=FAST_TIMEOUT_S)
 
 
 def test_tcp_probe_accepts_any_reachable_bootstrap_server(tcp_listener: int) -> None:
@@ -127,3 +152,34 @@ def test_clickhouse_check_names_the_missing_dependency(http_server: Callable[[in
     settings = _settings(_unused_port(), http_server(200), clickhouse_port)
     with pytest.raises(DependencyNotReadyError, match=r"^Kafka: no Kafka bootstrap server is reachable"):
         check_clickhouse_dependencies(settings)
+
+
+def test_unavailable_dependencies_runs_every_probe_and_names_each_failure() -> None:
+    calls: list[str] = []
+
+    def probe(name: str, error: str | None = None) -> Callable[[], None]:
+        def run() -> None:
+            calls.append(name)
+            if error is not None:
+                raise DependencyNotReadyError(error)
+
+        return run
+
+    probes = [
+        ("Kafka", probe("Kafka", "no broker")),
+        ("MinIO", probe("MinIO")),
+        ("ClickHouse", probe("ClickHouse", "HTTP 503")),
+    ]
+    assert unavailable_dependencies(probes) == ["Kafka: no broker", "ClickHouse: HTTP 503"]
+    assert calls == ["Kafka", "MinIO", "ClickHouse"]  # the first failure does not end the check
+    assert unavailable_dependencies([("MinIO", probe("MinIO"))]) == []
+
+
+def test_dependency_probes_target_the_configured_endpoints(
+    http_server: Callable[[int], str], tcp_listener: int
+) -> None:
+    clickhouse_port = _unused_port()
+    settings = _settings(tcp_listener, http_server(200), clickhouse_port)
+    assert [name for name, _ in dependency_probes(settings)] == ["Kafka", "MinIO", "ClickHouse"]
+    (failure,) = unavailable_dependencies(dependency_probes(settings))
+    assert failure.startswith(f"ClickHouse: http://127.0.0.1:{clickhouse_port}/ping is unreachable")

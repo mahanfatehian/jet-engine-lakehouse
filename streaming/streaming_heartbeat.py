@@ -9,10 +9,15 @@ call stops refreshing it. The per-query fields tell which query is unhealthy and
 ``active``, ``last_progress_at`` (when the query was last seen completing a trigger, empty
 triggers included, so a stale value marks a stalled query), ``consecutive_failures`` and
 ``last_error``.
+
+A requested stop removes the file (:meth:`HeartbeatWriter.remove`): a restarted container keeps
+its ``/tmp``, and the next process must not pass the healthcheck on its predecessor's
+heartbeat before writing its own.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -32,7 +37,12 @@ def utc_now_iso() -> str:
 
 
 class HeartbeatWriter:
-    """Writes ``{"timestamp", "pid", **status}`` as JSON, atomically (temporary file + rename).
+    """Writes ``{"timestamp", "pid", "uptime_s", **status}`` as JSON, atomically (temporary file + rename).
+
+    ``uptime_s`` is the time from this writer's first :meth:`publish` to this write, on the
+    monotonic ``clock`` (wall-clock steps do not change it), rounded to 0.1 s. The job publishes
+    its first heartbeat at start-up, before Spark boots, so it is the age of the process less
+    its start-up imports, and it starts again from 0 after a restart.
 
     Readers never see a partially written file. Write failures are logged once and never
     raised: a full or read-only disk must not stop the queries (the healthcheck reports it).
@@ -52,7 +62,7 @@ class HeartbeatWriter:
         self._clock = clock
         self._wall_clock = wall_clock
         self._last_write: float | None = None
-        self._first_write: float | None = None
+        self._first_publish: float | None = None
         self._failing = False
 
     def publish(self, status: Mapping[str, object], *, force: bool = False) -> bool:
@@ -63,22 +73,24 @@ class HeartbeatWriter:
         now = self._clock()
         if not force and self._last_write is not None and now - self._last_write < self._min_interval_s:
             return False
-        if self._first_write is None:
-            self._first_write = now
-        elapsed = round(now - self._first_write, 1)
-        payload = {"timestamp": self._wall_clock(), "pid": os.getpid(), "uptime_s": elapsed, **status}
+        if self._first_publish is None:
+            self._first_publish = now
+        uptime_s = round(now - self._first_publish, 1)
+        payload = {"timestamp": self._wall_clock(), "pid": os.getpid(), "uptime_s": uptime_s, **status}
         if not self._write(json.dumps(payload, indent=2, default=str) + "\n"):
             return False
         self._last_write = now
         return True
 
     def remove(self) -> None:
-        """Delete the heartbeat file on graceful shutdown (best-effort)."""
+        """Delete the file and a leftover temporary file; best effort, never raises.
+
+        A missing file is fine. A file that cannot be removed is left as it is: it then holds
+        the final state, which the supervisor publishes before removing it.
+        """
         for target in (self.path, self._temp_path):
-            try:
+            with contextlib.suppress(OSError):
                 target.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     def _write(self, text: str) -> bool:
         try:

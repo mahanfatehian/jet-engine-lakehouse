@@ -3,11 +3,13 @@
 Two rate-source queries stand in for a lake query and ``clickhouse_raw``: the second one's
 sink fails once (like a ClickHouse outage). The supervisor must restart only that query,
 which replays the failed micro-batch from its checkpoint, while the first keeps committing.
+The stop request at the end must leave no heartbeat file behind.
 """
 
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +25,13 @@ from streaming_supervisor import EXIT_OK, QueryGroup, QuerySpec, QuerySupervisor
 
 TIMEOUT_S = 120.0
 FAILING_BATCH = 2
+
+
+class NoJitter(random.Random):
+    """Draws 0.0: the restart waits its full 1 s backoff, which the timing checks rely on."""
+
+    def random(self) -> float:
+        return 0.0
 
 
 class BatchRecorder:
@@ -91,17 +100,21 @@ def test_failed_query_restarts_from_its_checkpoint_while_the_other_keeps_running
         poll_s=0.2,
         restart_base_delay_s=1.0,
         restart_max_delay_s=1.0,
+        rng=NoJitter(),
     )
     exit_codes: list[int] = []
     thread = threading.Thread(target=lambda: exit_codes.append(supervisor.run()), daemon=True)
     thread.start()
     try:
         recovered = wait_until(lambda: sum(batch_id > FAILING_BATCH for batch_id, _ in flaky.committed) >= 2)
+        running = json.loads(heartbeat_file.read_text(encoding="utf-8"))
     finally:
         stop_event.set()
         thread.join(TIMEOUT_S)
     assert recovered, f"flaky never recovered: attempts={flaky.attempts}"
     assert exit_codes == [EXIT_OK]
+    assert (running["status"], set(running["queries"])) == ("running", {"steady", "flaky"})
+    assert not heartbeat_file.exists()  # removed by the requested stop
 
     attempted = [batch_id for batch_id, _ in flaky.attempts]
     retry = attempted.index(FAILING_BATCH) + 1
@@ -111,7 +124,7 @@ def test_failed_query_restarts_from_its_checkpoint_while_the_other_keeps_running
     restarted_at = flaky.attempts[retry][1]
     assert any(flaky.failed_at < committed_at < restarted_at for _, committed_at in steady.committed)
 
-    status = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+    status: dict[str, Any] = supervisor.snapshot()
     assert status["status"] == "stopped"
     flaky_state, steady_state = status["queries"]["flaky"], status["queries"]["steady"]
     assert (flaky_state["restarts"], flaky_state["consecutive_failures"]) == (1, 0)

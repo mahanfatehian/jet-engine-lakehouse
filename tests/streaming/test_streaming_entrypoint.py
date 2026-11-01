@@ -16,6 +16,10 @@ pytest.importorskip("pyspark")
 pytest.importorskip("clickhouse_connect")
 
 import spark_kafka_to_lakehouse as job
+from streaming_config import StreamingSettings
+from streaming_readiness import DependencyNotReadyError, Probe
+
+MINIO_DOWN = "http://minio:9000/minio/health/live is unreachable: <urlopen error [Errno 111] refused>"
 
 
 @pytest.fixture
@@ -50,7 +54,7 @@ class FakeContext:
     def __init__(self, stopped: bool) -> None:
         self.stopped = stopped
 
-    def isStopped(self) -> bool:  # noqa: N802 - JVM API
+    def isStopped(self) -> bool:
         return self.stopped
 
 
@@ -61,6 +65,19 @@ def fake_spark(context: FakeContext | None) -> SimpleNamespace:
         return context
 
     return SimpleNamespace(sparkContext=SimpleNamespace(_jsc=SimpleNamespace(sc=sc)))
+
+
+class FakeProbe:
+    """A readiness probe that answers, or fails with ``error`` like the real probes do."""
+
+    def __init__(self, error: str | None = None) -> None:
+        self.error = error
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.error is not None:
+            raise DependencyNotReadyError(self.error)
 
 
 def test_invalid_configuration_exits_with_code_2(
@@ -138,3 +155,52 @@ def test_logging_uses_utc_iso_timestamps(restore_logging: None) -> None:
     record.created, record.msecs = 0.0, 0.0
     assert handler.format(record) == "1970-01-01T00:00:00.000Z INFO t: message"
     assert logging.getLogger("py4j").level == logging.WARNING
+
+
+def test_dependency_check_reports_every_dependency_that_does_not_answer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    kafka, minio = FakeProbe(), FakeProbe(MINIO_DOWN)
+    clickhouse = FakeProbe("http://clickhouse:8123/ping answered HTTP 503")
+    with caplog.at_level(logging.INFO):
+        exit_code = job.check_dependencies((("Kafka", kafka), ("MinIO", minio), ("ClickHouse", clickhouse)))
+    assert exit_code == job.EXIT_FAILURE
+    assert (kafka.calls, minio.calls, clickhouse.calls) == (1, 1, 1)  # a failure does not end the check
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.ERROR, f"dependency not ready: MinIO: {MINIO_DOWN}"),
+        (logging.ERROR, "dependency not ready: ClickHouse: http://clickhouse:8123/ping answered HTTP 503"),
+    ]
+
+
+def test_dependency_check_passes_when_every_dependency_answers(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.INFO):
+        assert job.check_dependencies((("Kafka", FakeProbe()), ("MinIO", FakeProbe()))) == job.EXIT_OK
+    assert caplog.messages == ["dependencies answer: Kafka, MinIO"]
+
+
+@pytest.mark.parametrize(("minio_error", "exit_code"), [(None, 0), (MINIO_DOWN, 1)])
+def test_check_dependencies_option_probes_once_and_leaves_the_job_alone(
+    monkeypatch: pytest.MonkeyPatch, heartbeat_file: Path, minio_error: str | None, exit_code: int
+) -> None:
+    probes = {"Kafka": FakeProbe(), "MinIO": FakeProbe(minio_error), "ClickHouse": FakeProbe()}
+    configured: list[StreamingSettings] = []
+    runs: list[object] = []
+
+    def fake_dependency_probes(settings: StreamingSettings) -> tuple[Probe, ...]:
+        configured.append(settings)
+        return tuple(probes.items())
+
+    monkeypatch.setattr(job, "dependency_probes", fake_dependency_probes)
+    monkeypatch.setattr(job, "run", lambda *args: runs.append(args) or 0)
+    assert job.main(["--check-dependencies"]) == exit_code
+    assert [probe.calls for probe in probes.values()] == [1, 1, 1]
+    assert [settings.heartbeat_file for settings in configured] == [str(heartbeat_file)]  # the job's settings
+    assert runs == []  # no Spark driver
+    assert not heartbeat_file.exists()  # a job running next to the check keeps its own heartbeat
+
+
+def test_unknown_option_exits_with_code_2(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exited:
+        job.main(["--verbose"])
+    assert exited.value.code == job.EXIT_CONFIG_ERROR
+    assert "unrecognized arguments: --verbose" in capsys.readouterr().err

@@ -65,10 +65,12 @@ class TrainingReport:
         """Human-readable metric lines plus one machine-readable JSON summary line."""
         holdout = self.holdout
         logger.info(
-            "holdout regressor  | RMSE %.2f | MAE %.2f | R2 %.3f | "
+            "holdout regressor  | RMSE %.2f | MAE %.2f | median AE %.2f | max error %.1f | R2 %.3f | "
             "late-life RMSE %.2f | NASA %.3f/row (sum %.1f)",
             holdout.rmse,
             holdout.mae,
+            holdout.median_ae,
+            holdout.max_error,
             holdout.r2,
             holdout.late_life_rmse,
             holdout.nasa_score,
@@ -240,6 +242,8 @@ class TrainingReport:
             validation_lifecycles=len(self.split.validation),
             late_life_rmse=holdout["late_life_rmse"],
             nasa_score_sum=holdout["nasa_score_sum"],
+            median_ae=holdout["median_ae"],
+            max_error=holdout["max_error"],
             clf_brier=holdout["clf_brier"],
             clf_ece=holdout["clf_ece"],
             bundle_sha256=bundle_sha256,

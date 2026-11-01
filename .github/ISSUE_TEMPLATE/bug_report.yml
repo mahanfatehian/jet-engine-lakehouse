@@ -1,0 +1,24 @@
+name: Bug report
+description: Something in the stack, the pipeline or the docs does not work as described.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: behaviour
+    attributes:
+      label: What you expected and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Ideally a failing test, or the output of `make verify` or `make logs SERVICE=<name>`.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Docker version, the memory Docker may use and the commit you run (`git rev-parse --short HEAD`).
+    validations:
+      required: true

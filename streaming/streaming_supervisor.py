@@ -12,13 +12,22 @@ round (``POLL_SECONDS``) the supervisor
 
 A failing query or an unavailable dependency therefore never stops the other group, nor the
 other queries of its own group. The loop only ends on a stop request (SIGTERM/SIGINT: drain,
-stop every query, exit 0) or when the Spark driver itself is gone (exit 1, so that Docker's
-restart policy starts a fresh process).
+stop every query, remove the heartbeat file, exit 0) or when the Spark driver itself is gone
+(exit 1, so that Docker's restart policy starts a fresh process).
+
+Every backoff wait carries equal jitter (``streaming_retry.equal_jitter``): between half and
+all of its 2 s ... 60 s step, drawn per query from the supervisor's own ``random.Random`` (tests
+inject a seeded one or a stub). A dependency
+outage fails the queries of a group together, with equal failure counts; without jitter they
+would all restart in the same round once it is over, and replay their failed micro-batches
+against the dependency that has just come back. The price: while the outage lasts, the queries
+of a group fall due at different moments, and each one triggers its own dependency check.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -26,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from streaming_heartbeat import utc_now_iso
-from streaming_retry import capped_backoff
+from streaming_retry import capped_backoff, equal_jitter
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +80,8 @@ class HeartbeatPublisher(Protocol):
     """Destination of the supervisor state (``streaming_heartbeat.HeartbeatWriter``)."""
 
     def publish(self, status: Mapping[str, object], *, force: bool = False) -> bool: ...
+
+    def remove(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +169,7 @@ class QuerySupervisor:
         restart_base_delay_s: float = RESTART_BASE_DELAY_SECONDS,
         restart_max_delay_s: float = RESTART_MAX_DELAY_SECONDS,
         drain_timeout_s: float = DRAIN_TIMEOUT_SECONDS,
+        rng: random.Random | None = None,
     ) -> None:
         self._groups = tuple(groups)
         self._entries = [_Supervised(spec, group.name) for group in self._groups for spec in group.queries]
@@ -170,6 +182,8 @@ class QuerySupervisor:
         self._base_delay_s = restart_base_delay_s
         self._max_delay_s = restart_max_delay_s
         self._drain_timeout_s = drain_timeout_s
+        # Source of the backoff jitter: a fresh generator of its own unless a test injects one.
+        self._rng = rng if rng is not None else random.Random()
         self._status = "running"
 
     def run(self) -> int:
@@ -183,6 +197,9 @@ class QuerySupervisor:
             self._stop_event.wait(self._poll_s)
         logger.info("shutdown requested: draining and stopping %d queries", self._running_count())
         self._shutdown(drain=True)
+        # The job ends on purpose: its heartbeat must not vouch for the container's next process.
+        # The final state was published first, so a file that cannot be removed stays truthful.
+        self._heartbeat.remove()
         return EXIT_OK
 
     def step(self) -> None:
@@ -305,11 +322,12 @@ class QuerySupervisor:
             )
 
     def _record_failure(self, entry: _Supervised, reason: str) -> float:
-        """Count a failed attempt and schedule the next one; returns the backoff delay."""
+        """Count a failed attempt and schedule the next one; returns the (jittered) backoff delay."""
         entry.consecutive_failures += 1
         entry.last_error = reason
         entry.last_error_at = self._wall_clock()
-        delay = capped_backoff(entry.consecutive_failures, self._base_delay_s, self._max_delay_s)
+        backoff = capped_backoff(entry.consecutive_failures, self._base_delay_s, self._max_delay_s)
+        delay = equal_jitter(backoff, self._rng)
         entry.next_attempt_at = self._clock() + delay
         return delay
 
