@@ -20,6 +20,7 @@ ENV_VARS = (
     "PREDICT_INTERVAL_SECONDS",
     "SNAPSHOT_INTERVAL_SECONDS",
     "TRAIN_INTERVAL_SECONDS",
+    "RECONCILE_INTERVAL_SECONDS",
     "PIPELINE_LOCK_DIR",
     "PIPELINE_GATE_ON_DBT_TESTS",
 )
@@ -95,6 +96,17 @@ def test_task_mode_exits_with_the_tasks_exit_code(cli: CliHarness, exit_code: in
 
     assert pipeline_runner.main(["task", "predict"]) == exit_code
     assert cli.executed == ["predict"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 3, 65])
+def test_task_reconcile_exits_with_the_verdict_of_the_audit(cli: CliHarness, exit_code: int) -> None:
+    cli.exit_codes[TaskName.RECONCILE] = exit_code
+
+    assert pipeline_runner.main(["task", "reconcile", "--", "--window-hours", "24"]) == exit_code
+    assert cli.executed == ["reconcile"]
+    argv = cli.specs[0].argv
+    assert Path(argv[1]).parts[-2:] == ("data_science", "reconcile_lakehouse.py")
+    assert argv[2:] == ("--window-hours", "24")
 
 
 def test_task_train_does_not_skip_unchanged_data(cli: CliHarness) -> None:
@@ -247,6 +259,7 @@ def test_loop_wires_scheduler_heartbeat_locks_and_skip_if_unchanged(
 
     monkeypatch.setattr(pipeline_runner, "PipelineScheduler", FakeScheduler)
     monkeypatch.setenv("DBT_INTERVAL_SECONDS", "45")
+    monkeypatch.setenv("RECONCILE_INTERVAL_SECONDS", "1800")
     monkeypatch.setenv("PIPELINE_GATE_ON_DBT_TESTS", "off")
     heartbeat_file = tmp_path / "hb.json"
 
@@ -254,6 +267,7 @@ def test_loop_wires_scheduler_heartbeat_locks_and_skip_if_unchanged(
     assert cli.specs[0].argv[-1] == "--skip-if-unchanged"
     assert built["heartbeat"].path == heartbeat_file
     assert built["intervals"].dbt_seconds == 45.0
+    assert built["intervals"].reconcile_seconds == 1800.0
     assert built["gate"] is False
     assert cli.runner_kwargs == [{"on_poll": built["heartbeat"].tick}]
     assert cli.lock_kwargs == [{"on_poll": built["heartbeat"].tick}]

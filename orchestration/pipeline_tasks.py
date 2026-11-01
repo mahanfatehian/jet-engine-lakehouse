@@ -16,9 +16,15 @@ from pipeline_config import RunnerSettings
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_SKIPPED = 3  # contract: "skipped: preconditions not met", never a crash
+EXIT_DATA_MISMATCH = 65  # sysexits EX_DATAERR: reconcile found a layer that disagrees with the source
 EXIT_LOCK_TIMEOUT = 75  # sysexits EX_TEMPFAIL: another run held the task's lock for too long
 EXIT_TIMEOUT = 124  # same convention as coreutils `timeout`
 EXIT_SPAWN_FAILED = 127  # shell convention for "command not found / not executable"
+# Failure exit codes with one fixed meaning, spelled out in the FAILED log line of a task.
+EXIT_CODE_MEANINGS: dict[int, str] = {
+    EXIT_DATA_MISMATCH: "a data layer disagrees with the source",
+    EXIT_SPAWN_FAILED: "the command could not be started",
+}
 
 
 class TaskName(StrEnum):
@@ -30,6 +36,7 @@ class TaskName(StrEnum):
     SNAPSHOT = "snapshot"
     TRAIN = "train"
     PREDICT = "predict"
+    RECONCILE = "reconcile"
 
 
 class TaskStatus(StrEnum):
@@ -67,6 +74,7 @@ TASK_TIMEOUT_SECONDS: dict[TaskName, float] = {
     TaskName.SNAPSHOT: 10 * 60,
     TaskName.TRAIN: 30 * 60,
     TaskName.PREDICT: 5 * 60,
+    TaskName.RECONCILE: 10 * 60,
 }
 
 # Applied with setdefault, so an operator can still override them: ANSI colour codes only
@@ -108,6 +116,12 @@ def classify_exit_code(exit_code: int) -> TaskStatus:
     if exit_code == EXIT_SKIPPED:
         return TaskStatus.SKIPPED
     return TaskStatus.FAILED
+
+
+def describe_exit_code(exit_code: int) -> str:
+    """``exit code N``, followed by its meaning when the code has a fixed one (EXIT_CODE_MEANINGS)."""
+    meaning = EXIT_CODE_MEANINGS.get(exit_code)
+    return f"exit code {exit_code}: {meaning}" if meaning else f"exit code {exit_code}"
 
 
 def normalize_returncode(returncode: int) -> int:
@@ -153,6 +167,8 @@ def build_task_spec(
     elif task is TaskName.TRAIN:
         skip = ("--skip-if-unchanged",) if loop_mode else ()
         argv = _data_science_command(settings, "train_rul_model.py", *skip, *extra_args)
+    elif task is TaskName.RECONCILE:
+        argv = _data_science_command(settings, "reconcile_lakehouse.py", *extra_args)
     else:
         argv = _data_science_command(settings, "predict_rul.py", "--mode", "batch", *extra_args)
     return TaskSpec(task, argv, settings.repo_root, timeout)

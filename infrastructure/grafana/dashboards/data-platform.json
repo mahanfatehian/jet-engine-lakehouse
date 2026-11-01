@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Health of the data platform: CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, ClickHouse storage, and the high-frequency sensor-frame path.",
+  "description": "Health of the data platform: CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, ClickHouse storage, the high-frequency sensor-frame path, and the end-to-end reconciliation audit of every layer against the source.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -1811,6 +1811,385 @@
         "sortBy": []
       },
       "id": 19
+    },
+    {
+      "type": "row",
+      "title": "Reconciliation audit (PostgreSQL source vs raw, staging and silver lake)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "panels": [],
+      "id": 20
+    },
+    {
+      "type": "table",
+      "title": "Latest reconciliation by layer",
+      "description": "The newest run of the reconciliation audit (orchestrator task reconcile, every RECONCILE_INTERVAL_SECONDS, or make reconcile). Per engine and hour of event time it compares the pulses the PostgreSQL source committed with those raw_engine_telemetry, stg_engine_telemetry and the silver lake Parquet hold. OK: every (engine, hour) cell matches; GAPS: some cell has MISSING or EXTRA pulses, and the task fails and backs off; INFO: the best-effort HF frame layer, whose coverage is reported but never fails a run. Pulses committed less than RECONCILE_LAG_SECONDS (600 s) before the run are still in flight and not compared; staging is held to the pulses whose readings are finite.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    layer AS `Layer`,\n    multiIf(max(informational) = 1, 'INFO', countIf(status != 'OK') = 0, 'OK', 'GAPS') AS `Status`,\n    uniqExact(engine_id) AS `Engines`,\n    uniqExact(event_hour) AS `Hours`,\n    sum(source_rows) AS `Source pulses`,\n    sum(layer_rows) AS `Layer pulses`,\n    sum(layer_rows) / nullIf(sum(source_rows), 0) AS `Of the source`,\n    countIf(status = 'MISSING') AS `Missing cells`,\n    countIf(status = 'EXTRA') AS `Extra cells`,\n    concat(formatDateTime(any(window_start), '%Y-%m-%d %H:%i'), ' .. ', formatDateTime(any(window_end), '%H:%i')) AS `Window (UTC)`,\n    any(run_at) AS `Run (UTC)`\nFROM ops_reconciliation\nWHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)\nGROUP BY layer\nORDER BY indexOf(['raw', 'staging', 'silver', 'hf_frames'], layer)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "OK": {
+                        "color": "green",
+                        "index": 0,
+                        "text": "OK"
+                      },
+                      "GAPS": {
+                        "color": "red",
+                        "index": 1,
+                        "text": "GAPS"
+                      },
+                      "INFO": {
+                        "color": "blue",
+                        "index": 2,
+                        "text": "INFO"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Of the source"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Missing cells"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Extra cells"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Source pulses"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Layer pulses"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 21
+    },
+    {
+      "type": "table",
+      "title": "Cells that differ from the source (latest run)",
+      "description": "Every (layer, engine, hour of event time) cell of the newest reconciliation run whose pulse count differs from the source, largest difference first. MISSING: the layer holds fewer pulses than the source committed; EXTRA: more (Difference = layer - source). INFO rows are HF frames, best effort by design. No data: every cell matches the source.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    layer AS `Layer`,\n    engine_id AS `Engine`,\n    event_hour AS `Event hour (UTC)`,\n    source_rows AS `Source pulses`,\n    layer_rows AS `Layer pulses`,\n    difference AS `Difference`,\n    if(informational = 1, 'INFO', status) AS `Status`\nFROM ops_reconciliation\nWHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)\n  AND status != 'OK'\nORDER BY informational, abs(difference) DESC, layer, engine_id, event_hour\nLIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "MISSING": {
+                        "color": "red",
+                        "index": 0,
+                        "text": "MISSING"
+                      },
+                      "EXTRA": {
+                        "color": "orange",
+                        "index": 1,
+                        "text": "EXTRA"
+                      },
+                      "INFO": {
+                        "color": "blue",
+                        "index": 2,
+                        "text": "INFO"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "basic"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Difference"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Source pulses"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Layer pulses"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 22
     }
   ],
   "refresh": "30s",

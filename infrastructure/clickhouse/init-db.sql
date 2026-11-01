@@ -10,6 +10,7 @@
 --   gold_engine_rul_predictions RUL predictions written by data_science/predict_rul.py
 --   ml_model_runs               training run registry written by train_rul_model.py
 --   v_engine_rul_latest         latest prediction per engine
+--   ops_reconciliation          end-to-end reconciliation audit (reconcile_lakehouse.py)
 -- dbt builds the silver/gold models on top of the raw_* tables.
 -- =============================================================================
 
@@ -249,3 +250,32 @@ PARTITION BY toYYYYMM(batch_started_at)
 ORDER BY batch_started_at
 TTL toDateTime(batch_started_at) + INTERVAL 30 DAY
 COMMENT 'One row per HF micro-batch: frames, bytes and frame-time span, for throughput dashboards';
+
+-- -----------------------------------------------------------------------------
+-- Operations: the reconciliation audit (orchestrator task `reconcile`, make
+-- reconcile) compares, per engine and hour of event time, the pulses the
+-- PostgreSQL source committed with those raw, staging and the silver lake hold.
+-- Every run appends one row per layer, engine and hour; the latest run is the
+-- rows with the highest run_at.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ops_reconciliation
+(
+    run_id         UUID,
+    run_at         DateTime64(3, 'UTC'),
+    window_start   DateTime('UTC'),
+    window_end     DateTime('UTC'),
+    layer          LowCardinality(String),
+    engine_id      LowCardinality(String),
+    event_hour     DateTime('UTC'),
+    source_rows    UInt64,
+    layer_rows     UInt64,
+    difference     Int64,
+    status         LowCardinality(String),
+    informational  UInt8
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(run_at)
+ORDER BY (run_at, layer, engine_id, event_hour)
+TTL toDateTime(run_at) + INTERVAL 30 DAY
+COMMENT 'Reconciliation runs: source pulses a layer must hold vs pulses it holds, per layer, engine and event hour (OK, MISSING or EXTRA; informational = best-effort HF layer)';

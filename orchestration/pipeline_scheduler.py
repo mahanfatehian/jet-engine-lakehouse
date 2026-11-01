@@ -1,17 +1,23 @@
 """Scheduling policy of the ``loop`` mode (contract section 8).
 
 A cycle starts every DBT_INTERVAL_SECONDS with ``dbt run``; when that succeeds, ``dbt test``
-always follows (each run's output gets a fresh verdict), then predict, train and snapshot,
-each only when it is due. A failed ``dbt run`` skips the rest of its cycle. A failed
-``dbt test`` skips train and snapshot of its cycle (PIPELINE_GATE_ON_DBT_TESTS): no model
-learns from, and no lake snapshot publishes, data that failed its tests, while predict keeps
-serving the current production model. Training is attempted after every dbt run while no
-production model exists (bootstrap), afterwards every TRAIN_INTERVAL_SECONDS.
+always follows (each run's output gets a fresh verdict), then predict, the reconciliation
+audit, train and snapshot, each only when it is due. A failed ``dbt run`` skips the rest of
+its cycle. A failed ``dbt test`` skips train and snapshot of its cycle
+(PIPELINE_GATE_ON_DBT_TESTS): no model learns from, and no lake snapshot publishes, data that
+failed its tests, while predict keeps serving the current production model and the audit
+still runs. Training is attempted after every dbt run while no production model exists
+(bootstrap), afterwards every TRAIN_INTERVAL_SECONDS.
 
 The lake snapshot is never taken in the cycle of the loop's first successful dbt run: on a
 fresh stack that run precedes the first CDC rows, and an empty export would become the
 newest snapshot. A snapshot that exits 3 (no data to export yet) is retried after the next
-dbt run instead of a whole SNAPSHOT_INTERVAL_SECONDS later.
+dbt run instead of a whole SNAPSHOT_INTERVAL_SECONDS later, and so is a reconciliation that
+exits 3: on a fresh stack nothing was committed RECONCILE_LAG_SECONDS ago yet, and the first
+comparison should follow as soon as something was. The reconciliation follows predict, so it
+never delays a prediction and, once a production model exists, audits the staging layer this
+cycle's dbt run built before training and the export start; one that finds mismatches fails
+and backs off like any other task.
 
 All interval arithmetic uses the start time of the cycle, so a task whose interval equals
 the dbt interval runs in every cycle no matter how long the tasks before it took. The
@@ -43,7 +49,10 @@ SCHEDULED_TASKS: tuple[TaskName, ...] = (
     TaskName.SNAPSHOT,
     TaskName.TRAIN,
     TaskName.PREDICT,
+    TaskName.RECONCILE,
 )
+# For these, exit 3 means "nothing to work on yet": retried after the next dbt run, not an interval later.
+RETRY_SKIPPED_NEXT_CYCLE: frozenset[TaskName] = frozenset({TaskName.SNAPSHOT, TaskName.RECONCILE})
 MAX_BACKOFF_SECONDS = 1800.0
 IDLE_POLL_SECONDS = 5.0
 _MAX_BACKOFF_EXPONENT = 32  # 2**32 cadences is far beyond any cap; avoids float overflow
@@ -67,11 +76,12 @@ def dependent_tasks(bootstrap: bool) -> tuple[TaskName, ...]:
 
     While no production model exists, training precedes prediction so that a freshly promoted
     first model serves predictions in the same cycle. Afterwards prediction goes first: it is
-    the latency-sensitive output of the pipeline, retraining is not.
+    the latency-sensitive output of the pipeline, retraining is not. The reconciliation audit
+    follows prediction in both modes.
     """
     if bootstrap:
-        return (TaskName.DBT_TEST, TaskName.TRAIN, TaskName.PREDICT, TaskName.SNAPSHOT)
-    return (TaskName.DBT_TEST, TaskName.PREDICT, TaskName.TRAIN, TaskName.SNAPSHOT)
+        return (TaskName.DBT_TEST, TaskName.TRAIN, TaskName.PREDICT, TaskName.RECONCILE, TaskName.SNAPSHOT)
+    return (TaskName.DBT_TEST, TaskName.PREDICT, TaskName.RECONCILE, TaskName.TRAIN, TaskName.SNAPSHOT)
 
 
 def model_available_after(result: TaskResult, available: bool) -> bool:
@@ -168,13 +178,14 @@ class PipelineScheduler:
         """Regular cadence of ``task`` in seconds, as seen by this cycle-driven loop."""
         intervals = self._intervals
         bootstrap_training = task is TaskName.TRAIN and not self.model_available
-        snapshot_pending = task is TaskName.SNAPSHOT and self._last_status(task) is TaskStatus.SKIPPED
-        if task in (TaskName.DBT_RUN, TaskName.DBT_TEST) or bootstrap_training or snapshot_pending:
+        pending = task in RETRY_SKIPPED_NEXT_CYCLE and self._last_status(task) is TaskStatus.SKIPPED
+        if task in (TaskName.DBT_RUN, TaskName.DBT_TEST) or bootstrap_training or pending:
             return intervals.dbt_seconds
         own = {
             TaskName.PREDICT: intervals.predict_seconds,
             TaskName.SNAPSHOT: intervals.snapshot_seconds,
             TaskName.TRAIN: intervals.train_seconds,
+            TaskName.RECONCILE: intervals.reconcile_seconds,
         }[task]
         # Dependent tasks get one chance per cycle; anchoring their backoff on the cycle
         # length keeps "doubling the wait" meaningful for intervals shorter than a cycle.
@@ -202,7 +213,9 @@ class PipelineScheduler:
         logger.info("cycle %d starting (%s)", self.cycles_completed + 1, mode)
         results = [self._run(TaskName.DBT_RUN, cycle_at)]
         if results[0].status is TaskStatus.FAILED:
-            logger.warning("dbt run failed: skipping dbt test, train, predict and snapshot in this cycle")
+            logger.warning(
+                "dbt run failed: skipping dbt test, predict, reconcile, train and snapshot in this cycle"
+            )
         else:
             results.extend(self._run_dependents(cycle_at, bootstrap))
             self._dbt_succeeded_in_earlier_cycle = True
@@ -214,15 +227,17 @@ class PipelineScheduler:
         """Run cycles until a stop is requested; a stop interrupts the idle wait immediately."""
         intervals = self._intervals
         logger.info(
-            "pipeline loop started: dbt run + test every %.0fs; predict every %.0fs, snapshot every "
-            "%.0fs, train every %.0fs (PREDICT/SNAPSHOT/TRAIN_INTERVAL_SECONDS=%.0f/%.0f/%.0f rounded up "
-            "to whole dbt cycles; training follows every dbt run while no production model exists); "
-            "a failed dbt test %s",
+            "pipeline loop started: dbt run + test every %.0fs; predict every %.0fs, reconcile every "
+            "%.0fs, snapshot every %.0fs, train every %.0fs (PREDICT/RECONCILE/SNAPSHOT/"
+            "TRAIN_INTERVAL_SECONDS=%.0f/%.0f/%.0f/%.0f rounded up to whole dbt cycles; training "
+            "follows every dbt run while no production model exists); a failed dbt test %s",
             intervals.dbt_seconds,
             self.effective_seconds(intervals.predict_seconds),
+            self.effective_seconds(intervals.reconcile_seconds),
             self.effective_seconds(intervals.snapshot_seconds),
             self.effective_seconds(intervals.train_seconds),
             intervals.predict_seconds,
+            intervals.reconcile_seconds,
             intervals.snapshot_seconds,
             intervals.train_seconds,
             "skips train and snapshot of its cycle"
@@ -237,9 +252,10 @@ class PipelineScheduler:
                 continue
             self.run_cycle()
         logger.info(
-            "pipeline loop stopped (%s) after %d cycle(s)",
+            "pipeline loop stopped (%s) after %d cycle(s), %.0fs after start-up",
             self._shutdown.reason or "stop requested",
             self.cycles_completed,
+            self._shutdown.elapsed_seconds,
         )
         self._publish("stopped")
 

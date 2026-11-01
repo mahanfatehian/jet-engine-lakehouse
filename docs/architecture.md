@@ -68,8 +68,9 @@ the CDC topics and three on the HF frame topic, each with its own checkpoint und
 
 A supervisor inside the driver keeps the two paths independent. The lake queries start as soon as
 Kafka and MinIO answer; `clickhouse_raw` starts once Kafka and ClickHouse (with its tables)
-answer. A failing query is restarted from its own checkpoint with backoff (2 s up to 60 s) while
-the others keep running, and the process exits only on invalid configuration, SIGTERM or a dead
+answer. A failing query is restarted from its own checkpoint with backoff (2 s doubling up to 60 s, each
+wait jittered between half and all of its step so that queries failed by one outage do not all
+restart in the same round) while the others keep running, and the process exits only on invalid configuration, SIGTERM or a dead
 driver. The supervisor rewrites `/tmp/streaming.heartbeat` (per-query state, last progress, last
 error) every few seconds; the container healthcheck turns unhealthy when it goes stale. Each HF
 query also checks its own prerequisites (the Avro schema file, the HF ClickHouse tables), so a
@@ -157,6 +158,7 @@ whose loss would stop the query on its next restart.
 | serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL | every prediction with its sensor readings |
 | serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree` | training-run registry |
 | serving | `v_engine_rul_latest` | view | – | latest prediction per engine |
+| ops | `ops_reconciliation` | `reconcile_lakehouse.py` | `MergeTree`, key `(run_at, layer, engine_id, event_hour)`, 30-day TTL | one row per reconciliation run, layer, engine and hour of event time: source pulses the layer must hold, pulses it holds, OK / MISSING / EXTRA |
 
 ```mermaid
 flowchart LR
@@ -209,12 +211,22 @@ flowchart LR
   recomputes the lifecycles that received frames, like the pulse features, and a dbt test
   proves that `int_ml_features` carries exactly the rows of `int_sensor_rolling_features`.
 
+- **Every layer is reconciled against the source.** Every `RECONCILE_INTERVAL_SECONDS` the
+  orchestrator task `reconcile` (`data_science/reconcile_lakehouse.py`) counts in one ClickHouse
+  query, per engine and hour of event time, the last 6 hours of pulses in four places: PostgreSQL
+  (`postgresql()`, the window pushed down), `raw_engine_telemetry FINAL`, `stg_engine_telemetry FINAL`
+  and the silver Parquet (`s3()`, newest image per `telemetry_id`), and records OK / MISSING / EXTRA
+  per cell in `ops_reconciliation`. Every layer applies the same filter, event time inside the window
+  and the source's insert time at least `RECONCILE_LAG_SECONDS` before the run, so in-flight data is
+  never a false alarm; staging is held to the pulses with finite readings, the ones it keeps by
+  design; HF frame coverage is reported but never fails the audit.
+
 ## 6. Failure and restart behaviour
 
 | Event | Behaviour |
 |---|---|
 | `docker compose down` → `up` | everything resumes within the 7-day Kafka retention: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry and the generation settings it stores per lifecycle in `simulator_lifecycle_params` (bit-identical wear trajectory; changed `SIM_SEED` / `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` apply from each engine's next lifecycle) |
-| ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (backoff 2–60 s) once ClickHouse answers; the six lake queries keep committing; the process stays up |
+| ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (jittered backoff of at most 2–60 s) once ClickHouse answers; the six lake queries keep committing; the process stays up |
 | MinIO down | the lake queries stall or fail and resume from their checkpoints once MinIO answers; `clickhouse_raw` keeps running |
 | Outage longer than the Kafka retention | queries whose unread records were deleted stop loudly (`KAFKA_FAIL_ON_DATA_LOSS=true`) with recovery steps in the log |
 | Postgres down | the simulator drops ticks with bounded reconnect backoff and re-takes its single-writer lock on reconnect; after 10 failed attempts it exits and Docker restarts it |
@@ -224,7 +236,10 @@ flowchart LR
 | A manual `make` job while the loop runs the same job | it waits for the per-job lock (shared volume) instead of colliding |
 | Debezium connector stopped, PAUSED or FAILED | the replication slot retains WAL (capped by `max_slot_wal_keep_size`, 4 GB); `make register-cdc` restarts or resumes it; `make cdc-status` exits 1 until it is RUNNING |
 | Driver loop of the streaming job wedged | `/tmp/streaming.heartbeat` goes stale and the container turns unhealthy |
-| Kafka slow or down for the HF producer | frames are produced from a background thread, so the 1 Hz Postgres tick never waits; frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB`; frames that do not fit, or that Kafka has not acknowledged within the producer's 5-minute delivery timeout, are dropped and counted |
+| Kafka slow or down for the HF producer | frames are produced from a background thread, so the 1 Hz Postgres tick never waits; frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB` that holds both queued and unacknowledged frames; the producer has no delivery timeout, so the buffer bounds an outage (about 37 minutes of the default fleet's frames), after which new frames are dropped and counted |
+| Simulator stopped before the first-boot HF backlog reached Kafka | the 1 Hz history is complete, but the HF frames of histories that had already committed are never re-created (a restart backfills only engines without telemetry): those pulses keep NULL spectral features; the shutdown log counts the discarded backfill frames (best effort, a deliberate trade-off) |
+| The reconciliation finds a layer that disagrees with the source | task `reconcile` exits 65, is logged as FAILED with the worst (layer, engine, hour) cells and backs off; every cell is in `ops_reconciliation`, on the Data Platform dashboard and in `make verify` (WARN) |
+| Nothing to reconcile yet (fresh stack, lake or staging not built, `ops_reconciliation` missing) | `reconcile` exits 3 (SKIPPED) and is retried after the next dbt run; on a fresh stack the first comparison follows about `RECONCILE_LAG_SECONDS` after the backfill |
 | HF backlog older than the 2-hour topic retention | the HF queries skip the deleted frames with a warning; those pulses keep NULL spectral features, which the models treat as missing |
 | HF disabled (`SIM_HF_ENABLED=false`) or lagging | the CDC path, dbt and scoring run unchanged; scoring carries spectral features forward for at most `SPECTRAL_MAX_LAG_SECONDS`, then the models' missing-value branches decide |
 | `make clean` | all volumes are deleted; the next `make up` rebuilds history from the backfill |
@@ -242,4 +257,5 @@ flowchart LR
 | Reduce at ingest, tier the raw | waveforms land once in cheap object storage and expire after a day; only per-frame features (~2 % of the bytes) reach ClickHouse and the model | waveforms older than the retention cannot be reprocessed with new features |
 | Lightweight scheduler instead of Airflow | one small container, zero extra infrastructure for a single-node stack | no UI or backfill semantics; the same tasks map one to one onto Airflow operators |
 | Community MinIO build (`pgsty/minio`) | the official images are no longer published | pinned by digest; override with `MINIO_IMAGE` |
+| Reconcile inside ClickHouse (`postgresql()`, `s3()` table functions) | one SQL statement compares every layer where the data already lives; nothing new to deploy, and only the window's source rows leave Postgres | ClickHouse must reach Postgres and MinIO by their compose names, and the window reaches Postgres as UTC literals (the database runs with TimeZone UTC, the image default) |
 | Ports bound to `127.0.0.1` by default | default credentials stay unreachable from the network | set `BIND_HOST` to expose the stack deliberately |

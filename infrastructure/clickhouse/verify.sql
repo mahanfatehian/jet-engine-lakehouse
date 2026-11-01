@@ -240,6 +240,32 @@ SELECT
 FROM v_engine_rul_latest
 ORDER BY engine_id;
 
+SELECT '\n== 10b. Reconciliation audit: latest run, source vs raw, staging and silver (hf_frames informational) ==' FORMAT TSVRaw;
+SELECT run_id, run_at, window_start, window_end
+FROM ops_reconciliation
+ORDER BY run_at DESC
+LIMIT 1;
+SELECT
+    layer,
+    uniqExact(engine_id) AS engines,
+    uniqExact(event_hour) AS hours,
+    sum(source_rows) AS source_pulses,
+    sum(layer_rows) AS layer_pulses,
+    countIf(status = 'MISSING') AS missing_cells,
+    countIf(status = 'EXTRA') AS extra_cells,
+    max(informational) AS is_informational
+FROM ops_reconciliation
+WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
+GROUP BY layer
+ORDER BY indexOf(['raw', 'staging', 'silver', 'hf_frames'], layer);
+SELECT '-- cells of the latest run that differ from the source (largest difference first)' FORMAT TSVRaw;
+SELECT layer, engine_id, event_hour, source_rows, layer_rows, difference, status
+FROM ops_reconciliation
+WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
+  AND status != 'OK'
+ORDER BY informational, abs(difference) DESC, layer, engine_id, event_hour
+LIMIT 20;
+
 SELECT '\n== 11. Summary (OK / WARN / FAIL; make verify fails on FAIL and on any error above) ==' FORMAT TSVRaw;
 -- One line per check, status first, so the Makefile can match `^FAIL ` exactly.
 SELECT concat(rightPad(status, 6, ' '), rightPad(check_name, 74, ' '), detail)
@@ -310,6 +336,19 @@ FROM
         if(maxOrNull(ingested_at) >= now64(3) - INTERVAL 5 MINUTE, 'OK', 'WARN'),
         concat('last frame ', ifNull(toString(maxOrNull(ingested_at)), 'never'))
     FROM raw_engine_hf_features
+    UNION ALL
+    -- The informational HF layer never counts; the first run follows ~RECONCILE_LAG_SECONDS
+    -- (600 s) after a fresh start, once the backfill is old enough to be compared.
+    SELECT
+        9,
+        'latest reconciliation found no gaps (source = raw = staging = silver)',
+        if(count() > 0 AND countIf(status != 'OK') = 0, 'OK', 'WARN'),
+        if(count() = 0, 'no reconciliation run yet',
+           concat('run ', toString(any(run_at)), ': ', toString(countIf(status != 'OK')), ' of ',
+                  toString(count()), ' (layer, engine, hour) cells differ from the source'))
+    FROM ops_reconciliation
+    WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
+      AND informational = 0
 )
 ORDER BY ord
 FORMAT TSVRaw;

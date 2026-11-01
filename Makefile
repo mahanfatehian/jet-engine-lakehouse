@@ -133,7 +133,7 @@ STREAMING_PYTEST = python -m pytest -p no:cacheprovider -rs --junitxml=/tmp/stre
 	echo "test-streaming: $$skipped test(s) skipped; every Spark test must run in this image" >&2; exit 1; fi
 
 .PHONY: help up down clean ps logs build urls register-cdc cdc-status stream dbt-run dbt-test \
-	snapshot train-ml predict-ml pipeline-once verify verify-postgres verify-minio \
+	snapshot train-ml predict-ml reconcile pipeline-once verify verify-postgres verify-minio \
 	verify-clickhouse ch-init psql ch-client test test-platform test-streaming test-simulator \
 	load-test lint
 
@@ -146,7 +146,7 @@ help: ## Show this help (default target)
 	@printf '  %-44s %s\n' \
 		'SERVICE=<name>' 'compose service for logs and build (default: all services)' \
 		'TAIL=$(TAIL)' 'log lines shown before following (logs, stream)' \
-		'ARGS="..."' 'extra arguments: dbt-run, dbt-test, snapshot, train-ml, predict-ml, register-cdc' \
+		'ARGS="..."' 'extra arguments: dbt-run, dbt-test, snapshot, train-ml, predict-ml, reconcile, register-cdc' \
 		'CONNECTOR=$(CONNECTOR)' 'Debezium connector name (cdc-status, urls)' \
 		'LAKEHOUSE_BUCKET=$(LAKEHOUSE_BUCKET)' 'bucket listed by verify-minio' \
 		'ML_ARTIFACT_PREFIX=$(ML_ARTIFACT_PREFIX)' 'model registry prefix read by verify-minio' \
@@ -223,6 +223,9 @@ train-ml: ## Train the RUL model now (promotion per MODEL_PROMOTION_POLICY)
 
 predict-ml: ## Score the latest telemetry of every engine with the production model
 	$(RUN_TASK) predict $(TASK_ARGS)
+
+reconcile: ## Audit raw, staging and silver against the Postgres source per engine and hour (exit 65 on gaps)
+	$(RUN_TASK) reconcile $(TASK_ARGS)
 
 pipeline-once: ## Run dbt -> snapshot -> train -> predict once (failed dbt tests skip snapshot+train)
 	$(COMPOSE) run --rm orchestrator python orchestration/pipeline_runner.py once

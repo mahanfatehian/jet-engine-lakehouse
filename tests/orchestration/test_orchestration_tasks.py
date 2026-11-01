@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
-from pipeline_config import RunnerSettings
+from pipeline_config import REPO_ROOT, RunnerSettings
 from pipeline_tasks import (
     CLI_TASK_CHOICES,
+    EXIT_DATA_MISMATCH,
     GATED_BY_DBT_TESTS,
     ONCE_SEQUENCE,
     TaskName,
@@ -15,6 +17,7 @@ from pipeline_tasks import (
     TaskStatus,
     build_task_spec,
     classify_exit_code,
+    describe_exit_code,
     expand_task,
     normalize_returncode,
     once_exit_code,
@@ -35,6 +38,8 @@ def _result(task: TaskName, exit_code: int) -> TaskResult:
         (3, TaskStatus.SKIPPED),
         (1, TaskStatus.FAILED),
         (2, TaskStatus.FAILED),
+        (65, TaskStatus.FAILED),
+        (75, TaskStatus.FAILED),
         (124, TaskStatus.FAILED),
         (127, TaskStatus.FAILED),
         (143, TaskStatus.FAILED),
@@ -42,6 +47,32 @@ def _result(task: TaskName, exit_code: int) -> TaskResult:
 )
 def test_exit_code_classification(exit_code: int, status: TaskStatus) -> None:
     assert classify_exit_code(exit_code) is status
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "description"),
+    [
+        (65, "exit code 65: a data layer disagrees with the source"),
+        (127, "exit code 127: the command could not be started"),
+        (1, "exit code 1"),
+        (2, "exit code 2"),
+    ],
+)
+def test_exit_codes_with_a_fixed_meaning_are_spelled_out(exit_code: int, description: str) -> None:
+    assert describe_exit_code(exit_code) == description
+
+
+def test_the_reconciliation_job_signals_mismatches_with_the_runners_exit_code() -> None:
+    script = REPO_ROOT / "data_science" / "reconcile_lakehouse.py"
+    tree = ast.parse(script.read_text(encoding="utf-8"))
+    constants = {
+        target.id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert constants["EXIT_DATA_MISMATCH"] == EXIT_DATA_MISMATCH == 65
 
 
 @pytest.mark.parametrize(("returncode", "expected"), [(0, 0), (2, 2), (3, 3), (-15, 143), (-9, 137)])
@@ -69,11 +100,14 @@ def test_python_tasks_run_the_data_science_scripts(settings: RunnerSettings, rep
     snapshot = build_task_spec(TaskName.SNAPSHOT, settings)
     train = build_task_spec(TaskName.TRAIN, settings)
     predict = build_task_spec(TaskName.PREDICT, settings)
+    reconcile = build_task_spec(TaskName.RECONCILE, settings)
 
     assert snapshot.argv == (PYTHON, str(scripts / "feature_pipeline.py"), "snapshot")
     assert train.argv == (PYTHON, str(scripts / "train_rul_model.py"))
     assert predict.argv == (PYTHON, str(scripts / "predict_rul.py"), "--mode", "batch")
-    for spec in (snapshot, train, predict):
+    assert reconcile.argv == (PYTHON, str(scripts / "reconcile_lakehouse.py"))
+    assert (REPO_ROOT / "data_science" / "reconcile_lakehouse.py").is_file()
+    for spec in (snapshot, train, predict, reconcile):
         assert spec.cwd == repo_root
         assert spec.env_defaults == ()
 
@@ -113,17 +147,28 @@ def test_loop_mode_only_adds_skip_if_unchanged_to_training(settings: RunnerSetti
         (TaskName.SNAPSHOT, 10),
         (TaskName.TRAIN, 30),
         (TaskName.PREDICT, 5),
+        (TaskName.RECONCILE, 10),
     ],
 )
 def test_task_timeouts(settings: RunnerSettings, task: TaskName, minutes: int) -> None:
     assert build_task_spec(task, settings).timeout_seconds == minutes * 60
 
 
-def test_cli_task_names_are_the_contract_ones_plus_dbt_build() -> None:
-    assert CLI_TASK_CHOICES == ("dbt", "dbt-run", "dbt-test", "dbt-build", "snapshot", "train", "predict")
+def test_cli_task_names_are_the_contract_ones_plus_dbt_build_and_reconcile() -> None:
+    assert CLI_TASK_CHOICES == (
+        "dbt",
+        "dbt-run",
+        "dbt-test",
+        "dbt-build",
+        "snapshot",
+        "train",
+        "predict",
+        "reconcile",
+    )
 
 
 def test_failed_dbt_tests_gate_training_and_snapshots_only() -> None:
+    # Not the reconciliation: it only reads the layers, so it also audits a cycle whose tests failed.
     assert set(GATED_BY_DBT_TESTS) == {TaskName.TRAIN, TaskName.SNAPSHOT}
 
 

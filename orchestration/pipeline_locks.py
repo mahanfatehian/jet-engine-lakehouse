@@ -3,7 +3,7 @@
 Every task holds an exclusive ``flock`` on ``<PIPELINE_LOCK_DIR>/pipeline-<group>.lock`` while it
 runs. dbt run, test and build share one lock (they rebuild the same relations, and
 dbt-clickhouse swaps ``table`` models in through fixed ``<model>__dbt_backup`` tables that two
-concurrent runs drop under each other); train, snapshot and predict have one lock each.
+concurrent runs drop under each other); train, snapshot, predict and reconcile have one lock each.
 Compose mounts one named volume at the lock directory in the orchestrator service and in every
 ``docker compose run orchestrator`` container, so the kernel arbitrates across containers too.
 The kernel drops a flock when the process holding it exits, so a crashed or killed run never
@@ -53,6 +53,7 @@ LOCK_GROUPS: dict[TaskName, str] = {
     TaskName.SNAPSHOT: "snapshot",
     TaskName.TRAIN: "train",
     TaskName.PREDICT: "predict",
+    TaskName.RECONCILE: "reconcile",
 }
 LOCK_POLL_SECONDS = 1.0
 WAIT_REPORT_SECONDS = 30.0

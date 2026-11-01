@@ -4,16 +4,18 @@ Run from the repository root, or from /app inside the data-platform image::
 
     python orchestration/pipeline_runner.py loop
     python orchestration/pipeline_runner.py once
-    python orchestration/pipeline_runner.py task {dbt,dbt-run,dbt-test,dbt-build,snapshot,train,predict}
+    python orchestration/pipeline_runner.py task TASK [-- ARG ...]
     python orchestration/pipeline_runner.py task train -- --promotion-policy always
 
-Every task is a subprocess. Exit code 3 from a task means "skipped: preconditions not met"
-and is logged as SKIPPED, not as a failure. Every mode holds a per-task lock while a task
+TASK is dbt, dbt-run, dbt-test, dbt-build, snapshot, train, predict or reconcile. Every task
+is a subprocess. Exit code 3 from a task means "skipped: preconditions not met" and is logged
+as SKIPPED, not as a failure; ``reconcile`` exits 65 when a data layer disagrees with the
+source, a failure the loop backs off from. Every mode holds a per-task lock while a task
 runs (see pipeline_locks), so manual runs and the loop never execute the same job at once.
 In ``loop`` and ``once``, a failed ``dbt test`` blocks training and the lake snapshot of
 that cycle (PIPELINE_GATE_ON_DBT_TESTS). Settings come from the environment variables of
 contract section 2 (DBT_*, *_INTERVAL_SECONDS, CLICKHOUSE_HOST/PORT, LOG_LEVEL) plus
-PIPELINE_LOCK_DIR and PIPELINE_GATE_ON_DBT_TESTS.
+PIPELINE_LOCK_DIR, PIPELINE_GATE_ON_DBT_TESTS and RECONCILE_INTERVAL_SECONDS.
 """
 
 from __future__ import annotations
@@ -85,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     task = modes.add_parser(
         "task",
-        help="run one task and exit with its exit code (3 = skipped)",
+        help="run one task and exit with its exit code (3 = skipped, 65 = reconcile found mismatches)",
         description="Run one task; arguments after `--` are appended to its command line.",
     )
     task.add_argument("task", choices=CLI_TASK_CHOICES, help="'dbt' runs dbt run, then dbt test")

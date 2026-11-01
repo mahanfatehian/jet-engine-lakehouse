@@ -55,7 +55,7 @@ class ShutdownFlag:
 
     @property
     def elapsed_seconds(self) -> float:
-        """Seconds since the flag was created (wall-clock-independent)."""
+        """Seconds since the flag was created, i.e. since the runner started (monotonic clock)."""
         return self._clock() - self._start
 
     def wait(self, timeout: float) -> bool:
@@ -63,8 +63,9 @@ class ShutdownFlag:
         return self._event.wait(timeout)
 
     def __repr__(self) -> str:
-        state = "requested" if self.requested else "running"
-        return f"ShutdownFlag({state}, elapsed={self.elapsed_seconds:.1f}s)"
+        state = "forced" if self.forced else "requested" if self.requested else "running"
+        reason = f", reason={self._reason}" if self._reason else ""
+        return f"ShutdownFlag({state}{reason}, elapsed={self.elapsed_seconds:.1f}s)"
 
 
 def install_signal_handlers(

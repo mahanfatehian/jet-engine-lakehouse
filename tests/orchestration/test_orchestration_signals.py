@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from pipeline_signals import HANDLED_SIGNALS, ShutdownFlag, install_signal_handlers
@@ -54,3 +55,28 @@ def test_signals_become_stop_requests(sig: signal.Signals) -> None:
 
     handler(sig, None)
     assert flag.forced
+
+
+def test_elapsed_seconds_follow_the_injected_clock(clock: Any) -> None:
+    flag = ShutdownFlag(clock=clock)
+    assert flag.elapsed_seconds == 0.0
+
+    clock.advance(12.25)
+    assert flag.elapsed_seconds == pytest.approx(12.25)
+
+    flag.request("SIGTERM")
+    clock.advance(1.0)
+    assert flag.elapsed_seconds == pytest.approx(13.25)  # keeps counting while the runner stops
+
+
+def test_repr_shows_the_state_the_reason_and_the_elapsed_time(clock: Any) -> None:
+    flag = ShutdownFlag(clock=clock)
+    clock.advance(3.04)
+    assert repr(flag) == "ShutdownFlag(running, elapsed=3.0s)"
+
+    flag.request("SIGTERM")
+    clock.advance(9.0)
+    assert repr(flag) == "ShutdownFlag(requested, reason=SIGTERM, elapsed=12.0s)"
+
+    flag.request("SIGINT")
+    assert repr(flag) == "ShutdownFlag(forced, reason=SIGTERM, elapsed=12.0s)"

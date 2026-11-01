@@ -254,3 +254,21 @@ def test_a_pipe_held_open_by_a_grandchild_does_not_block_the_runner(
 
     assert (result.status, result.output_tail) == (TaskStatus.SUCCESS, ("started worker",))
     assert any("output pipe is still open" in message for message in caplog.messages)
+
+
+def test_a_reconciliation_mismatch_fails_with_the_meaning_of_its_exit_code(
+    clock: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pipeline_process")
+    spec = TaskSpec(TaskName.RECONCILE, ("python", "reconcile_lakehouse.py"), Path("/app"), 600.0)
+    summary = "reconciliation: 1 of 126 cells differ from the source, worst: silver E1 MISSING 3"
+    popen = FakePopen(FakeProcess(clock, output=f"{summary}\n", returncode=65))
+
+    result = _runner(clock, popen).run(spec)
+
+    assert (result.status, result.exit_code) == (TaskStatus.FAILED, 65)
+    errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert errors[0].startswith("task reconcile FAILED in ")
+    assert "(exit code 65: a data layer disagrees with the source)" in errors[0]
+    assert errors[0].endswith(summary)

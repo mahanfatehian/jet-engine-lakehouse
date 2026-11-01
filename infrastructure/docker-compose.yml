@@ -31,6 +31,15 @@ x-s3-env: &s3-env
   AWS_REGION: ${AWS_REGION:-us-east-1}
   LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
 
+# How services reach the source database inside the compose network: always port 5432 (the
+# POSTGRES_PORT variable only moves the port published on the host).
+x-postgres-env: &postgres-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
+  POSTGRES_USER: ${POSTGRES_USER:-admin}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+
 services:
   # --------------------------------------------------------------- edge OLTP
   postgres:
@@ -293,11 +302,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
-      POSTGRES_USER: ${POSTGRES_USER:-admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      <<: *postgres-env
       SIM_ENGINE_IDS: ${SIM_ENGINE_IDS:-JT9D-001,JT9D-002,CFM56-104,CFM56-105,GE90-201,GE90-202}
       SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-1.0}
       SIM_PULSES_PER_CYCLE: ${SIM_PULSES_PER_CYCLE:-10}
@@ -390,6 +395,9 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+      # The reconciliation audit reads the source database (through ClickHouse).
+      postgres:
+        condition: service_healthy
     command: ["python", "orchestration/pipeline_runner.py", "loop"]
     # tini as PID 1 reaps grandchildren of the dbt/ML subprocesses.
     init: true
@@ -397,7 +405,9 @@ services:
     # a runaway job from starving Spark and ClickHouse on the same host.
     mem_limit: ${ORCHESTRATOR_MEM_LIMIT:-3g}
     environment:
-      <<: [*clickhouse-env, *s3-env]
+      # The reconciliation audit hands the POSTGRES_* and S3 settings to ClickHouse as query
+      # parameters: ClickHouse itself connects to postgres:5432 and minio:9000.
+      <<: [*clickhouse-env, *s3-env, *postgres-env]
       DBT_PROJECT_DIR: /app/analytics
       DBT_PROFILES_DIR: /app/analytics
       DBT_INTERVAL_SECONDS: ${DBT_INTERVAL_SECONDS:-120}
@@ -419,6 +429,10 @@ services:
       SPECTRAL_MAX_LAG_SECONDS: ${SPECTRAL_MAX_LAG_SECONDS:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PIPELINE_GATE_ON_DBT_TESTS: ${PIPELINE_GATE_ON_DBT_TESTS:-true}
+      # End-to-end reconciliation audit (task reconcile): the source against raw, staging and silver.
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-900}
+      RECONCILE_WINDOW_HOURS: ${RECONCILE_WINDOW_HOURS:-6}
+      RECONCILE_LAG_SECONDS: ${RECONCILE_LAG_SECONDS:-600}
       # Shared with every `docker compose run --rm orchestrator` container, so manual
       # make targets and the scheduled loop never run the same job concurrently.
       PIPELINE_LOCK_DIR: /locks

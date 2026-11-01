@@ -20,6 +20,7 @@ from pipeline_tasks import (
     TaskSpec,
     TaskStatus,
     classify_exit_code,
+    describe_exit_code,
     normalize_returncode,
 )
 
@@ -211,7 +212,7 @@ def _log_result(result: TaskResult) -> None:
     if result.status is TaskStatus.SKIPPED:
         logger.info("task %s SKIPPED in %.1fs (exit code 3: preconditions not met)", result.name, duration)
         return
-    cause = "timed out" if result.timed_out else f"exit code {result.exit_code}"
+    cause = "timed out" if result.timed_out else describe_exit_code(result.exit_code)
     if result.interrupted:
         cause += ", interrupted by shutdown"
     logger.error(

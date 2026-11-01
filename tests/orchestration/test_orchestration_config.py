@@ -26,7 +26,7 @@ def test_defaults_apply_without_any_environment(tmp_path: Path) -> None:
     assert settings.dbt_project_dir == tmp_path / "analytics"
     assert settings.dbt_profiles_dir == tmp_path / "analytics"
     assert settings.clickhouse_ping_url == "http://localhost:8123/ping"
-    assert settings.intervals == ScheduleIntervals(120.0, 60.0, 900.0, 1800.0)
+    assert settings.intervals == ScheduleIntervals(120.0, 60.0, 900.0, 1800.0, 900.0)
     assert settings.python_executable == PYTHON
     assert settings.lock_dir == Path(tempfile.gettempdir())
     assert settings.gate_on_dbt_tests is True
@@ -45,6 +45,7 @@ def test_environment_overrides_every_setting(tmp_path: Path) -> None:
         "PREDICT_INTERVAL_SECONDS": "15.5",
         "SNAPSHOT_INTERVAL_SECONDS": "600",
         "TRAIN_INTERVAL_SECONDS": "3600",
+        "RECONCILE_INTERVAL_SECONDS": "1200",
     }
 
     settings = load_settings(env, repo_root=tmp_path, python_executable=PYTHON)
@@ -52,7 +53,7 @@ def test_environment_overrides_every_setting(tmp_path: Path) -> None:
     assert settings.dbt_project_dir == project_dir
     assert settings.dbt_profiles_dir == tmp_path / "profiles"
     assert settings.clickhouse_ping_url == "http://clickhouse:18123/ping"
-    assert settings.intervals == ScheduleIntervals(30.0, 15.5, 600.0, 3600.0)
+    assert settings.intervals == ScheduleIntervals(30.0, 15.5, 600.0, 3600.0, 1200.0)
     assert settings.lock_dir == tmp_path / "locks"
     assert settings.gate_on_dbt_tests is False
 
@@ -98,9 +99,10 @@ def test_invalid_gate_flag_names_the_variable(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("value", ["abc", "0", "-5", "inf", "nan"])
-def test_invalid_interval_names_the_variable(tmp_path: Path, value: str) -> None:
-    with pytest.raises(ConfigError, match="TRAIN_INTERVAL_SECONDS"):
-        load_settings({"TRAIN_INTERVAL_SECONDS": value}, repo_root=tmp_path, python_executable=PYTHON)
+@pytest.mark.parametrize("name", ["TRAIN_INTERVAL_SECONDS", "RECONCILE_INTERVAL_SECONDS"])
+def test_invalid_interval_names_the_variable(tmp_path: Path, name: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=name):
+        load_settings({name: value}, repo_root=tmp_path, python_executable=PYTHON)
 
 
 @pytest.mark.parametrize("value", ["http", "0", "70000", "8123.5"])

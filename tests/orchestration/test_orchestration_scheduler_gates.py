@@ -1,4 +1,4 @@
-"""Loop gates: failed dbt tests block train and snapshot; snapshots wait for data."""
+"""Loop gates: failed dbt tests block train and snapshot; snapshots and the audit wait for data."""
 
 from __future__ import annotations
 
@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pipeline_config import ScheduleIntervals
 from pipeline_health import HeartbeatWriter
-from pipeline_tasks import TaskName
+from pipeline_tasks import EXIT_DATA_MISMATCH, TaskName, TaskStatus
 
 RUN, TEST = TaskName.DBT_RUN.value, TaskName.DBT_TEST.value
 TRAIN, PREDICT, SNAPSHOT = TaskName.TRAIN.value, TaskName.PREDICT.value, TaskName.SNAPSHOT.value
+RECONCILE = TaskName.RECONCILE.value
 
 
 def test_failed_dbt_test_skips_train_and_snapshot_but_still_predicts(
@@ -26,7 +28,7 @@ def test_failed_dbt_test_skips_train_and_snapshot_but_still_predicts(
 
     # Cycle 1 would snapshot (never done yet), but its dbt test failed.
     assert history == [
-        [RUN, TEST, TRAIN, PREDICT],
+        [RUN, TEST, TRAIN, PREDICT, RECONCILE],
         [RUN, TEST, PREDICT],
         [RUN, TEST, PREDICT, SNAPSHOT],
     ]
@@ -47,7 +49,8 @@ def test_failed_dbt_test_blocks_bootstrap_training(
 
     history = run_cycles(scheduler, executor, 3)
 
-    assert history == [[RUN, TEST, PREDICT]] * 3
+    # The reconciliation audit is not gated: it reads the layers, it never learns from them.
+    assert history == [[RUN, TEST, PREDICT, RECONCILE], [RUN, TEST, PREDICT], [RUN, TEST, PREDICT]]
     assert TaskName.TRAIN not in executor.calls
     assert not scheduler.model_available
 
@@ -62,7 +65,7 @@ def test_due_training_waits_for_passing_dbt_tests(
     history = run_cycles(scheduler, executor, 18)
 
     assert history[15] == [RUN, TEST, PREDICT]
-    assert history[16] == [RUN, TEST, PREDICT]
+    assert history[16] == [RUN, TEST, PREDICT, RECONCILE]
     assert history[17] == [RUN, TEST, PREDICT, TRAIN, SNAPSHOT]
 
 
@@ -89,7 +92,7 @@ def test_gate_can_be_disabled(
 
     history = run_cycles(scheduler, executor, 2)
 
-    assert history == [[RUN, TEST, TRAIN, PREDICT], [RUN, TEST, PREDICT, SNAPSHOT]]
+    assert history == [[RUN, TEST, TRAIN, PREDICT, RECONCILE], [RUN, TEST, PREDICT, SNAPSHOT]]
     assert not scheduler.dbt_tests_blocking
     assert any("PIPELINE_GATE_ON_DBT_TESTS=false" in message for message in caplog.messages)
 
@@ -117,7 +120,7 @@ def test_no_snapshot_in_the_cycle_of_the_first_successful_dbt_run(
     history = run_cycles(scheduler, executor, 4)
 
     assert [index for index, tasks in enumerate(history) if SNAPSHOT in tasks] == [3]
-    assert history[2] == [RUN, TEST, TRAIN, PREDICT]
+    assert history[2] == [RUN, TEST, TRAIN, PREDICT, RECONCILE]
     deferrals = [message for message in caplog.messages if message.startswith("snapshot deferred")]
     assert len(deferrals) == 1
 
@@ -144,3 +147,49 @@ def test_a_failed_snapshot_keeps_its_own_cadence_and_backoff(
     history = run_cycles(scheduler, executor, 10)
 
     assert [index for index, tasks in enumerate(history) if SNAPSHOT in tasks] == [1, 9]
+
+
+def test_a_skipped_reconciliation_is_retried_after_the_next_dbt_run(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    # Exit 3: on a fresh stack nothing was committed RECONCILE_LAG_SECONDS ago yet.
+    executor = scripted({TaskName.RECONCILE: [3, 3, 0]})
+    scheduler = make_scheduler(executor)
+
+    history = run_cycles(scheduler, executor, 12)
+
+    # Cycle 2 compares for the first time; the next comparison is 960 s (8 cycles) later.
+    assert [index for index, tasks in enumerate(history) if RECONCILE in tasks] == [0, 1, 2, 10]
+
+
+def test_mismatches_fail_the_reconciliation_and_back_it_off(
+    scripted: Any, make_scheduler: Any, run_cycles: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="pipeline_scheduler")
+    executor = scripted({TaskName.RECONCILE: [EXIT_DATA_MISMATCH]})
+    scheduler = make_scheduler(executor)
+
+    history = run_cycles(scheduler, executor, 24)
+
+    # The regular 960 s after the first failure, then the 1800 s cap (15 cycles).
+    assert [index for index, tasks in enumerate(history) if RECONCILE in tasks] == [0, 8, 23]
+    tracker = scheduler.tracker(TaskName.RECONCILE)
+    assert tracker.consecutive_failures == 3
+    assert tracker.last_result is not None and tracker.last_result.status is TaskStatus.FAILED
+    backoff = "task reconcile failed 2 times in a row: backing off, next attempt in about 1800s"
+    assert backoff in caplog.messages
+    assert all(PREDICT in tasks for tasks in history)
+
+
+def test_the_reconciliation_runs_on_its_own_cadence_right_after_predict(
+    scripted: Any, make_scheduler: Any, run_cycles: Any
+) -> None:
+    intervals = ScheduleIntervals(snapshot_seconds=120, train_seconds=240, reconcile_seconds=240)
+    executor = scripted()
+    scheduler = make_scheduler(executor, intervals)
+
+    history = run_cycles(scheduler, executor, 6)
+
+    assert [index for index, tasks in enumerate(history) if RECONCILE in tasks] == [0, 2, 4]
+    # It audits what this cycle's dbt run built before the slower training and export start.
+    assert history[2] == [RUN, TEST, PREDICT, RECONCILE, TRAIN, SNAPSHOT]

@@ -22,6 +22,7 @@ from pipeline_tasks import TaskName, TaskResult, TaskStatus, classify_exit_code
 
 RUN, TEST = TaskName.DBT_RUN.value, TaskName.DBT_TEST.value
 TRAIN, PREDICT, SNAPSHOT = TaskName.TRAIN.value, TaskName.PREDICT.value, TaskName.SNAPSHOT.value
+RECONCILE = TaskName.RECONCILE.value
 
 
 def test_bootstrap_trains_after_every_dbt_run_until_a_model_exists(
@@ -32,9 +33,10 @@ def test_bootstrap_trains_after_every_dbt_run_until_a_model_exists(
 
     history = run_cycles(scheduler, executor, 3)
 
-    # The snapshot waits for the second successful dbt run (see the snapshot tests).
+    # The snapshot waits for the second successful dbt run (see the snapshot tests); the
+    # reconciliation follows predict and is next due 960 s later.
     assert history == [
-        [RUN, TEST, TRAIN, PREDICT],
+        [RUN, TEST, TRAIN, PREDICT, RECONCILE],
         [RUN, TEST, TRAIN, PREDICT, SNAPSHOT],
         [RUN, TEST, TRAIN, PREDICT],
     ]
@@ -66,13 +68,16 @@ def test_steady_state_predicts_before_training_on_their_own_intervals(
 
     # Cycle i starts 120*i s after the first one. Training is due again 1800 s after cycle 0
     # (cycle 15). The first snapshot runs in cycle 1 and then every 900 s rounded up to whole
-    # cycles, i.e. 960 s (cycle 9). Predictions run in every cycle.
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
+    # cycles, i.e. 960 s (cycle 9); the reconciliation keeps the same cadence from cycle 0,
+    # right after predict. Predictions run in every cycle.
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT, RECONCILE]
     assert history[1] == [RUN, TEST, PREDICT, SNAPSHOT]
     assert history[2] == [RUN, TEST, PREDICT]
+    assert history[8] == [RUN, TEST, PREDICT, RECONCILE]
     assert history[15] == [RUN, TEST, PREDICT, TRAIN]
     assert [index for index, tasks in enumerate(history) if TRAIN in tasks] == [0, 15]
     assert [index for index, tasks in enumerate(history) if SNAPSHOT in tasks] == [1, 9]
+    assert [index for index, tasks in enumerate(history) if RECONCILE in tasks] == [0, 8, 16]
     assert all(PREDICT in tasks for tasks in history)
 
 
@@ -84,7 +89,7 @@ def test_predict_skip_without_model_restarts_bootstrap_in_the_same_cycle(
 
     history = run_cycles(scheduler, executor, 3)
 
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT, RECONCILE]
     # predict finds no production model: training is attempted right away, then goes first.
     assert history[1] == [RUN, TEST, PREDICT, TRAIN, SNAPSHOT]
     assert history[2] == [RUN, TEST, TRAIN, PREDICT]
@@ -113,7 +118,7 @@ def test_failed_dbt_run_skips_dependents_and_the_loop_carries_on(
 
     history = run_cycles(scheduler, executor, 3)
 
-    assert history == [[RUN], [RUN, TEST, TRAIN, PREDICT], [RUN, TEST, PREDICT, SNAPSHOT]]
+    assert history == [[RUN], [RUN, TEST, TRAIN, PREDICT, RECONCILE], [RUN, TEST, PREDICT, SNAPSHOT]]
     assert scheduler.tracker(TaskName.DBT_RUN).consecutive_failures == 0
 
 
@@ -144,7 +149,7 @@ def test_a_failing_task_backs_off_without_blocking_the_others(
 
     assert [index for index, tasks in enumerate(history) if PREDICT in tasks] == [0, 1, 3, 7]
     assert all(tasks[:2] == [RUN, TEST] for tasks in history)
-    assert history[0] == [RUN, TEST, TRAIN, PREDICT]
+    assert history[0] == [RUN, TEST, TRAIN, PREDICT, RECONCILE]
     assert scheduler.tracker(TaskName.PREDICT).consecutive_failures == 4
 
 
@@ -170,8 +175,9 @@ def test_an_exception_while_launching_a_task_counts_as_failure(
 
     results = scheduler.run_cycle()
 
-    assert results[-1].name is TaskName.PREDICT
-    assert (results[-1].status, results[-1].exit_code) == (TaskStatus.FAILED, 1)
+    predict = next(result for result in results if result.name is TaskName.PREDICT)
+    assert (predict.status, predict.exit_code) == (TaskStatus.FAILED, 1)
+    assert results[-1].name is TaskName.RECONCILE  # the cycle carried on after the broken launch
     assert "task predict could not be executed" in caplog.text
     assert scheduler.cycles_completed == 1
 
@@ -210,11 +216,11 @@ def test_idle_wait_is_chunked_and_interruptible(clock: Any, scripted: Any, make_
 
     make_scheduler(executor, shutdown=shutdown, sleep=sleep).run_forever()
 
-    # 116 s of idle time between the cycles (the first one ran 4 tasks of 1 s each), then
+    # 115 s of idle time between the cycles (the first one ran 5 tasks of 1 s each), then
     # one more chunk during which the stop arrives.
     assert executor.calls.count(TaskName.DBT_RUN) == 2
     assert max(sleeps) <= IDLE_POLL_SECONDS
-    assert sum(sleeps) == pytest.approx(116 + IDLE_POLL_SECONDS)
+    assert sum(sleeps) == pytest.approx(115 + IDLE_POLL_SECONDS)
 
 
 def test_heartbeat_reports_task_states(
@@ -236,8 +242,8 @@ def test_heartbeat_reports_task_states(
     assert payload["production_model_available"] is False
     assert payload["dbt_test_gate"] == {"enabled": True, "blocking": False}
     assert payload["current_task"] is None
-    assert payload["next_cycle_in_seconds"] == pytest.approx(116.0)
-    assert set(payload["tasks"]) == {RUN, TEST, SNAPSHOT, TRAIN, PREDICT}
+    assert payload["next_cycle_in_seconds"] == pytest.approx(115.0)
+    assert set(payload["tasks"]) == {RUN, TEST, SNAPSHOT, TRAIN, PREDICT, RECONCILE}
     assert payload["tasks"]["dbt-run"]["status"] == "SUCCESS"
     assert payload["tasks"]["snapshot"]["runs"] == 0
     assert payload["tasks"]["train"] == {
@@ -262,7 +268,7 @@ def test_running_task_is_visible_in_the_heartbeat(clock: Any, make_scheduler: An
     scheduler.run_cycle()
     scheduler.run_cycle()
 
-    assert seen == {task: task for task in (RUN, TEST, TRAIN, PREDICT, SNAPSHOT)}
+    assert seen == {task: task for task in (RUN, TEST, TRAIN, PREDICT, RECONCILE, SNAPSHOT)}
 
 
 @pytest.mark.parametrize(
@@ -301,8 +307,9 @@ def test_model_availability_transitions(task: TaskName, exit_code: int, before: 
 
 
 def test_dependent_task_order() -> None:
-    assert [task.value for task in dependent_tasks(bootstrap=True)] == [TEST, TRAIN, PREDICT, SNAPSHOT]
-    assert [task.value for task in dependent_tasks(bootstrap=False)] == [TEST, PREDICT, TRAIN, SNAPSHOT]
+    bootstrap, steady = dependent_tasks(bootstrap=True), dependent_tasks(bootstrap=False)
+    assert [task.value for task in bootstrap] == [TEST, TRAIN, PREDICT, RECONCILE, SNAPSHOT]
+    assert [task.value for task in steady] == [TEST, PREDICT, RECONCILE, TRAIN, SNAPSHOT]
 
 
 def test_backoff_warning_is_logged(
@@ -336,6 +343,19 @@ def test_startup_log_states_the_effective_cadences(
     make_scheduler(lambda task: None, shutdown=shutdown).run_forever()
 
     started = next(message for message in caplog.messages if message.startswith("pipeline loop started"))
-    assert "predict every 120s, snapshot every 960s, train every 1800s" in started
-    assert "=60/900/1800 rounded up to whole dbt cycles" in started
+    assert "predict every 120s, reconcile every 960s, snapshot every 960s, train every 1800s" in started
+    assert "PREDICT/RECONCILE/SNAPSHOT/TRAIN_INTERVAL_SECONDS=60/900/900/1800 rounded up" in started
     assert "a failed dbt test skips train and snapshot of its cycle" in started
+
+
+def test_the_stop_line_names_the_reason_and_the_uptime(
+    clock: Any, make_scheduler: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="pipeline_scheduler")
+    shutdown = ShutdownFlag(clock=clock)
+    clock.advance(4512.4)
+    shutdown.request("SIGTERM")
+
+    make_scheduler(lambda task: None, shutdown=shutdown).run_forever()
+
+    assert "pipeline loop stopped (SIGTERM) after 0 cycle(s), 4512s after start-up" in caplog.messages

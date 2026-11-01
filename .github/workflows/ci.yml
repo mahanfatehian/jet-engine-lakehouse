@@ -318,7 +318,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      SMOKE_TIMEOUT_MINUTES: 15
+      SMOKE_TIMEOUT_MINUTES: 20
       SMOKE_POLL_SECONDS: 30
     steps:
       - name: Check out the repository

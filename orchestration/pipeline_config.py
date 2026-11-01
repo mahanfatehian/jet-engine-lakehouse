@@ -1,10 +1,10 @@
 """Settings of the pipeline runner, read from environment variables (contract section 2).
 
 Paths default to locations relative to this file, so the runner works unchanged inside
-the data-platform image (repository root = /app) and from a checkout on a host. Two
+the data-platform image (repository root = /app) and from a checkout on a host. Three
 runner-only variables complement the contract: PIPELINE_LOCK_DIR (where the cross-process
-task locks live) and PIPELINE_GATE_ON_DBT_TESTS (whether failed dbt tests block training
-and lake snapshots).
+task locks live), PIPELINE_GATE_ON_DBT_TESTS (whether failed dbt tests block training
+and lake snapshots) and RECONCILE_INTERVAL_SECONDS (the cadence of the reconciliation audit).
 """
 
 from __future__ import annotations
@@ -34,12 +34,13 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class ScheduleIntervals:
-    """Loop cadences in seconds (DBT/PREDICT/SNAPSHOT/TRAIN_INTERVAL_SECONDS)."""
+    """Loop cadences in seconds (DBT/PREDICT/SNAPSHOT/TRAIN/RECONCILE_INTERVAL_SECONDS)."""
 
     dbt_seconds: float = 120.0
     predict_seconds: float = 60.0
     snapshot_seconds: float = 900.0
     train_seconds: float = 1800.0
+    reconcile_seconds: float = 900.0
 
 
 def default_lock_dir() -> Path:
@@ -84,6 +85,7 @@ def load_settings(
         predict_seconds=_positive_seconds(env, "PREDICT_INTERVAL_SECONDS", defaults.predict_seconds),
         snapshot_seconds=_positive_seconds(env, "SNAPSHOT_INTERVAL_SECONDS", defaults.snapshot_seconds),
         train_seconds=_positive_seconds(env, "TRAIN_INTERVAL_SECONDS", defaults.train_seconds),
+        reconcile_seconds=_positive_seconds(env, "RECONCILE_INTERVAL_SECONDS", defaults.reconcile_seconds),
     )
     analytics_dir = repo_root / "analytics"
     return RunnerSettings(

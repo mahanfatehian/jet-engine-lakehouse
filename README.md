@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 110 dbt data tests per run (a failure blocks training and lake snapshots), 878 unit tests (78 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 110 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,021 unit tests (84 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -160,11 +160,13 @@ that expires.
    little-endian float32, so serialization costs next to nothing; zstd) on
    `engine_hf.sensor_frames`, keyed by engine. The frame carries its pulse's `telemetry_id`
    (`INSERT … RETURNING`), so the two paths join exactly. Kafka trouble never stalls the 1 Hz path:
-   frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB`; frames that do not fit, or that Kafka has not
-   acknowledged within the producer's 5-minute delivery timeout, are dropped and counted, and
-   `frame_seq` gaps show exactly which. The first-boot backfill streams a frame for every historical pulse too
-   (best effort as well: if the simulator stops before that backlog has reached Kafka, those
-   pulses stay without spectral features).
+   frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB` that holds both the frames not yet handed to
+   Kafka and those Kafka has not acknowledged. The producer has no delivery timeout, so the buffer,
+   not a timer, bounds an outage: about 37 minutes of the default fleet's frames at 256 MiB. Frames
+   that do not fit are dropped and counted, and `frame_seq` gaps show exactly which. The first-boot
+   backfill streams a frame for every historical pulse too (best effort as well: if the simulator
+   stops before that backlog has reached Kafka, those pulses stay without spectral features for
+   good, because a restart backfills only engines that have no telemetry).
 2. **One contract.** [`engine_sensor_frame.avsc`](infrastructure/schemas/engine_sensor_frame.avsc)
    is the single source of truth: the producer registers it in Schema Registry (compatibility
    BACKWARD) and Spark's `from_avro` decodes with the same file.
@@ -412,6 +414,40 @@ SELECT engine_id, operational_status, round(fan_amp_bpfo_mean_5m, 2) AS bpfo_mm_
 FROM fct_engine_health_status ORDER BY engine_id;
 ```
 
+### Reconciliation audit: every layer holds exactly what the source committed
+
+Every 16 minutes (`RECONCILE_INTERVAL_SECONDS` 900, rounded up to whole dbt cycles, right after the
+cycle's predictions) the orchestrator proves that no pulse was lost or duplicated on its way through
+the platform. One ClickHouse query federates the three systems: the PostgreSQL source through the
+`postgresql()` table function (the time window is pushed down to Postgres), `raw_engine_telemetry`
+and `stg_engine_telemetry` read with `FINAL`, and the silver lake Parquet through `s3()`, where the
+newest image per `telemetry_id` (by `cdc_lsn`) counts unless it is a delete, so files left behind by
+an interrupted micro-batch never count twice. Per engine and hour of event time each layer must hold:
+
+| Layer | Must hold |
+|---|---|
+| `raw` | every pulse the source committed |
+| `staging` | every committed pulse whose six readings are finite (dbt retracts the others on purpose) |
+| `silver` | every pulse the source committed |
+| `hf_frames` | a frame per pulse; reported as coverage only, because the HF path is best effort |
+
+Each (layer, engine, hour) cell is `OK`, `MISSING` (the layer holds fewer pulses) or `EXTRA` (more).
+The window is the last `RECONCILE_WINDOW_HOURS` (6) of event time, and only pulses the source
+committed at least `RECONCILE_LAG_SECONDS` (600 s) ago count, so data still in flight, the first-boot
+backfill included, is never reported. Every cell lands in `ops_reconciliation` (30-day TTL), one log
+line sums the run up, and a run with gaps exits 65, so the scheduler logs it as FAILED and backs off.
+`make reconcile` runs the audit on demand (`ARGS="--window-hours 24 --lag-seconds 0"` widens it),
+`make verify` shows the latest run, and the Data Platform dashboard shows it per layer with every
+cell that differs. Credentials reach ClickHouse only as query parameters, which it hides in its logs.
+
+```sql
+SELECT layer, sum(source_rows) AS source_pulses, sum(layer_rows) AS layer_pulses,
+       countIf(status != 'OK') AS cells_differing
+FROM ops_reconciliation
+WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
+GROUP BY layer;
+```
+
 ## Dashboards
 
 Grafana (http://localhost:3000, `admin` / `admin`, anonymous access off) opens on the fleet board.
@@ -423,7 +459,7 @@ ClickHouse account that can only run queries, never write.
 |---|---|
 | **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, failures by mode |
 | **Vibration Analytics (HF Sensor Frames)** | bearing defect tone (BPFO), kurtosis, crest factor and core unbalance per engine, the oil system (quantity, filter ΔP, temperatures), the EGT A/B sensor split, HF frames per minute |
-| **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, and the HF path's throughput, micro-batch duration, frame lag and coverage per engine |
+| **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, and the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source |
 | **Model Operations & Live Backtest** | the production model, every training run with its promotion decision, calibration of the failure probability, live versus holdout performance against failures that happened later |
 
 ## Service endpoints
@@ -460,6 +496,8 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `LAKE_TRIGGER_SECONDS` / `CLICKHOUSE_TRIGGER_SECONDS` | `60` / `5` | micro-batch cadence of Path A / Path B |
 | `KAFKA_FAIL_ON_DATA_LOSS` | `true` | a CDC query fails loudly if Kafka retention deleted records it had not read |
 | `SIM_HF_ENABLED` | `true` | the high-frequency sensor frames; `false` runs the 1 Hz platform alone (no Kafka client is even loaded) |
+| `SIM_HF_QUEUE_MAX_MB` | `256` | the HF producer's buffer: frames queued plus frames Kafka has not acknowledged (no delivery timeout), about 37 minutes of the default fleet's frames during an outage; a value that cannot hold one frame stops the simulator at start-up (exit code 2) |
+| `RECONCILE_INTERVAL_SECONDS` / `RECONCILE_WINDOW_HOURS` / `RECONCILE_LAG_SECONDS` | `900` / `6` / `600` | cadence of the reconciliation audit (rounded up to whole dbt cycles), the hours of event time it compares, and how long a committed pulse counts as in flight |
 | `SIM_HF_SAMPLE_RATE_HZ` / `SIM_HF_VIB_CHANNELS` / `SIM_HF_PROCESS_RATE_HZ` | `2048` / `2` / `8` | frame fidelity of the live fleet; full fidelity (`25600` / `16`) is ~10 MB/s for 6 engines, so measure it with `make load-test`, or size the disks first: up to `HF_TOPIC_RETENTION_BYTES` × 6 partitions in Kafka and ~0.5 TB of bronze per day, kept 1–2 days at `HF_BRONZE_RETENTION_DAYS=1` |
 | `HF_TOPIC_RETENTION_BYTES` | `2147483648` | per-partition cap of the HF topic, so frames can never fill the broker disk the CDC topics share |
 | `HF_BRONZE_RETENTION_DAYS` / `HF_TOPIC_RETENTION_MS` | `1` / `7200000` | how long raw frames live in the lake (MinIO lifecycle rule) and in Kafka |
@@ -483,6 +521,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `make register-cdc ARGS=--dry-run` | show what registration would change, without changing it |
 | `make pipeline-once` | dbt → snapshot → train → predict once, outside the schedule |
 | `make snapshot` | export silver/gold feature tables to MinIO Parquet now |
+| `make reconcile`, `make reconcile ARGS="--window-hours 24"` | reconcile the source with raw, staging and silver now (exit 65 when a layer has gaps, 3 while there is nothing to compare yet) |
 | `make train-ml ARGS="--promotion-policy always"` | force-promote a freshly trained model |
 | `make dbt-run ARGS="--full-refresh"` | rebuild every dbt model from the raw CDC tables |
 | `make ch-init` | re-apply the idempotent ClickHouse schema (ClickHouse also does it on every start) |
@@ -497,8 +536,19 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 - **A port is already in use:** set the matching `*_PORT` variable in `infrastructure/.env`.
 - **`streaming` logs "query ... failed ... restarting it from its checkpoint":** a dependency of
   that query is down (ClickHouse for `clickhouse_raw`, MinIO for the lake queries). The supervisor
-  restarts it with backoff (2 s up to 60 s) while the other queries keep running.
-  `docker exec de_streaming cat /tmp/streaming.heartbeat` shows every query's state and last error.
+  restarts it with backoff (2 s doubling up to 60 s; each wait is jittered between half and all of
+  its step, so queries that failed together come back one by one) while the other queries keep
+  running. `docker exec de_streaming cat /tmp/streaming.heartbeat` shows every query's state and
+  last error, and the job's `uptime_s`; `docker exec de_streaming python spark_kafka_to_lakehouse.py
+  --check-dependencies` probes Kafka, MinIO and ClickHouse once and prints one line per dependency
+  that does not answer (exit 1; exit 0 when all answer).
+- **`task reconcile FAILED (exit code 65: a data layer disagrees with the source)`:** the log line
+  names the worst cells, e.g. `silver JT9D-001 2026-11-01T10:00:00Z MISSING 214 (layer 3386, source
+  3600)`; every cell of the run is in `ops_reconciliation` and on the Data Platform dashboard.
+  MISSING in one layer points at that hop: `raw` at the `clickhouse_raw` query or dead-lettered
+  records, `silver` at the lake queries, `staging` at a failing `dbt run`; EXTRA usually means a
+  source delete that has not propagated yet. A gap that heals by itself was a hop lagging more than
+  `RECONCILE_LAG_SECONDS`; `make reconcile` checks again at once.
 - **`streaming` stops a query "at a gap in the Kafka CDC log":** the job was down longer than the
   Kafka retention, so records it never read are gone. For `clickhouse_raw`, delete its checkpoint
   (`/opt/spark-checkpoints/clickhouse_raw`; the raw tables are idempotent); for a lake query, run
@@ -600,4 +650,11 @@ tables on an existing volume (`make ch-init` does the same by hand); the new dbt
 the next cycle; a production model trained without spectral features keeps scoring and is
 compared with the first challenger that has them; and the history from before the upgrade has no
 spectral features, so the spectral ablation reports "skipped" until lifecycles recorded with HF
-frames complete.
+frames complete. The reconciliation audit needs the `ops_reconciliation` table: after pulling it into
+a running stack, run `make ch-init` once (or restart ClickHouse, which re-applies its schema); until
+then the reconcile task skips with that hint.
+
+## License
+
+MIT, see [LICENSE](LICENSE). How to contribute: [CONTRIBUTING.md](CONTRIBUTING.md); security
+reports: [SECURITY.md](SECURITY.md).
