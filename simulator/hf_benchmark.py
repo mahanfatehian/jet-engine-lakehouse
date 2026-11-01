@@ -3,14 +3,22 @@ means for the "30 TB per 30 minutes" scale of full-fidelity engine data.
 
 Synthetic engines BENCH-0001.. (no PostgreSQL, no pacing) cycle through the engine types, failure modes and
 a spread of wear levels; their frames go to HF_BENCHMARK_TOPIC (engine_hf.benchmark: ten minutes of
-retention, no consumer) with the live producer's settings. Measured over --benchmark-seconds (MB = 10^6 B):
+retention, no consumer) with the live producer's settings but a finite delivery timeout (below). Measured
+over --benchmark-seconds (MB = 10^6 B):
 
     frames/s, samples/s       frames built, serialized and handed to the Kafka client per second
     serialized MB/s           Confluent wire-format bytes per second
     delivered MB/s            bytes Kafka acknowledged (delivery reports) per second, the final flush included
     wire MB/s                 bytes the client sent to the brokers after compression (client statistics)
     build+serialize p50/p99   per-frame waveform synthesis plus Avro serialization time
-    producer errors           failed produce calls and deliveries, frames unacknowledged after the flush
+    producer errors           failed produce calls and deliveries, frames unacknowledged after the flush,
+                              and the frame a stop request abandoned while it waited for the client queue
+
+When Kafka is the bottleneck the client queue is full most of the time and each frame waits for room, at
+the end of the run too, so a clean run loses nothing. A stop request (Ctrl-C, SIGTERM) gives up the frame
+that is waiting, counted as an error, and the run ends within the FLUSH_SECONDS flush. Unlike the live
+path, the client keeps a finite delivery timeout (DELIVERY_TIMEOUT_MS): the frames of a broker that died
+mid-run fail after 5 minutes, which frees the queue, so the wait for room also ends without a stop request.
 
 Projection: one engine at full fidelity (25.6 kHz x 16 vibration channels plus 1000 process channels at
 16 Hz, float32) streams 1.70 MB/s of samples, and 30 TB per 30 min is 16.7 GB/s, about 9,800 such engines.
@@ -55,7 +63,9 @@ BENCHMARK_READY_SECONDS = 60.0
 FLUSH_SECONDS = 30.0
 STATISTICS_SETTLE_SECONDS = 1.5
 BUFFER_RETRY_SECONDS = 0.01
+STOP_GRACE_RETRIES = 50  # after a stop request, ~0.5 s of polls for room before a waiting frame is given up
 CLIENT_ID = "engine-simulator-hf-benchmark"
+DELIVERY_TIMEOUT_MS = 300_000  # finite, unlike the live path's (module doc)
 
 
 @dataclass(frozen=True)
@@ -219,9 +229,8 @@ def measure(
         result.latencies_s.append(clock() - began)
         result.frames += 1
         result.serialized_bytes += len(value)
-        _produce(
-            sink, request.engine_id.encode(), value, functools.partial(result.delivered, len(value)), result
-        )
+        callback = functools.partial(result.delivered, len(value))
+        _produce(sink, request.engine_id.encode(), value, callback, result, stop)
         sink.poll(0)
     result.produce_seconds = clock() - start
     result.errors += sink.flush(FLUSH_SECONDS)
@@ -233,12 +242,30 @@ def measure(
     return result
 
 
-def _produce(sink: FrameSink, key: bytes, value: bytes, callback: Any, result: Measurement) -> None:
+def _produce(
+    sink: FrameSink, key: bytes, value: bytes, callback: Any, result: Measurement, stop: threading.Event
+) -> None:
+    """Hand one frame (already counted in ``result.frames``) to the client, waiting while its queue is full.
+
+    A failed produce call counts the frame as an error. After a stop request the wait gets a short grace of
+    STOP_GRACE_RETRIES polls: a healthy broker that is merely the bottleneck frees room within it, so a
+    Ctrl-C keeps a clean run clean, while a dead broker's frame is given up and counted as an error instead
+    of holding the shutdown for up to DELIVERY_TIMEOUT_MS.
+    """
+    grace = STOP_GRACE_RETRIES
     while True:
         try:
             sink.produce(key, value, callback)
             return
         except BufferError:
+            if stop.is_set():
+                if grace <= 0:
+                    result.errors += 1
+                    logger.warning(
+                        "Stop requested while the Kafka client queue was full: one frame abandoned"
+                    )
+                    return
+                grace -= 1
             sink.poll(BUFFER_RETRY_SECONDS)  # the client's queue is full: the load test runs at its limit
         except Exception as exc:
             result.errors += 1
@@ -386,4 +413,6 @@ def run_benchmark(
 
 
 def _kafka_sink(config: HfConfig, topic: str) -> BenchmarkSink:
-    return open_kafka_sink(config, topic, client_id=CLIENT_ID, statistics=True)
+    return open_kafka_sink(
+        config, topic, client_id=CLIENT_ID, delivery_timeout_ms=DELIVERY_TIMEOUT_MS, statistics=True
+    )

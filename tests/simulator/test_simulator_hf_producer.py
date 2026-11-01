@@ -61,6 +61,7 @@ class FakeSink:
         self.buffer_errors = 0
         self.closed = False
         self.check_gate: threading.Event | None = None
+        self.flush_timeouts: list[float] = []
 
     @property
     def fatal_error(self) -> str | None:
@@ -92,13 +93,14 @@ class FakeSink:
         served, self.pending = self.pending, []
         for key, value, callback in served:
             if self.fail_deliveries:
-                callback("KafkaError{code=_MSG_TIMED_OUT}", None)
+                callback("KafkaError{code=MSG_SIZE_TOO_LARGE}", None)
             else:
                 self.delivered.append((key, value))
                 callback(None, None)
         return len(served)
 
     def flush(self, timeout: float) -> int:
+        self.flush_timeouts.append(timeout)
         self.poll(0)
         return len(self.pending)
 
@@ -167,8 +169,29 @@ def test_kafka_down_fills_the_budget_then_drops_are_counted_until_it_recovers(
     pump_all(publisher)
     assert sink.labels()[-2:] == ["JT9D-001#16", "JT9D-001#17"], "production resumes after the outage"
     assert caplog.text.count("HF buffer full (1 MiB") == 1, "one warning per episode"
+    assert (
+        "HF buffer full (1 MiB: 0.0 MiB queued, 1.0 MiB unacknowledged by Kafka): dropping new frames until "
+        "it has room"
+    ) in caplog.text
     assert "HF buffer has room again" in caplog.text
     assert publisher.stats.snapshot().dropped == 5
+
+
+def test_the_buffer_full_warning_names_what_holds_the_budget(caplog: pytest.LogCaptureFixture) -> None:
+    sink = FakeSink()
+    publisher = publisher_with(sink)
+    with caplog.at_level(logging.INFO, logger="hf_producer"):
+        publisher.submit(frames("GE90-201", 1, 12))  # room for ten, and Kafka is not checked yet
+        assert publisher.wait_until_ready()
+        pump_all(publisher)
+        publisher.submit(frames("GE90-201", 13, 1))
+        pump_all(publisher)
+        publisher.submit(frames("GE90-201", 14, 12))  # Kafka keeps up, but one tick outgrows the budget
+    queued = "HF buffer full (1 MiB: 1.0 MiB queued, 0.0 MiB unacknowledged by Kafka"
+    assert f"{queued}; waiting for: the first readiness check): dropping new frames" in caplog.text
+    assert f"{queued}): dropping new frames until it has room" in caplog.text
+    assert "acknowledgements" not in caplog.text and "catches up" not in caplog.text
+    assert publisher.stats.snapshot().dropped == 4 and publisher.queue.depth() == (10, 0)
 
 
 def test_the_tick_thread_never_waits_for_kafka_or_the_worker() -> None:
@@ -254,6 +277,22 @@ def test_close_produces_queued_live_frames_and_discards_unsent_backfill(
     assert (
         "HF publisher stopped: 5 frames produced (0.5 MB), 0 dropped, 0 failed, 50 discarded" in caplog.text
     )
+
+
+def test_close_during_an_outage_flushes_only_until_its_deadline(caplog: pytest.LogCaptureFixture) -> None:
+    sink = FakeSink(up=False)  # Kafka went away after the readiness check; no frame ever times out
+    publisher = publisher_with(sink)
+    publisher.start()
+    publisher.submit(frames("CFM56-104", 1, 12))
+    wait_for(lambda: len(sink.pending) == 10)
+    started = time.perf_counter()
+    with caplog.at_level(logging.WARNING, logger="hf_producer"):
+        publisher.close(timeout=0.3)
+    assert time.perf_counter() - started < 1.0
+    assert sink.flush_timeouts and max(sink.flush_timeouts) <= 0.3, "no flush outlasts the close deadline"
+    totals = publisher.stats.snapshot()
+    assert (totals.produced, totals.dropped, totals.failed, totals.discarded) == (0, 2, 0, 10)
+    assert "Shutdown: 0 queued and 10 unacknowledged frames discarded" in caplog.text and sink.closed
 
 
 def test_close_while_kafka_stays_unreachable_returns_promptly(monkeypatch: pytest.MonkeyPatch) -> None:

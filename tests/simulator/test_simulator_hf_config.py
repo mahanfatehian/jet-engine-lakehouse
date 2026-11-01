@@ -9,19 +9,27 @@ import re
 import subprocess
 import sys
 import time
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import engine_generator as eg
+import hf_benchmark
 import hf_kafka
+import hf_runtime
 import pytest
 from fleet_config import SimulatorConfig
 from hf_config import DEFAULT_SCHEMA_PATH, HfConfig, boolean
 from hf_runtime import HfPath, load_hf_config, open_hf_path
 
 REPO = Path(__file__).resolve().parents[2]
+FULL_FIDELITY = {
+    "SIM_HF_SAMPLE_RATE_HZ": "25600",
+    "SIM_HF_VIB_CHANNELS": "16",
+    "SIM_HF_PROCESS_RATE_HZ": "16",
+}
 COMPOSE_ENV = {
     "KAFKA_BOOTSTRAP_SERVERS": "kafka:29092",
     "SCHEMA_REGISTRY_URL": "http://schema-registry:8081",
@@ -124,8 +132,44 @@ def test_load_hf_config_applies_the_load_test_overrides_and_checks_the_message_l
         )
 
 
+def test_a_live_buffer_that_cannot_hold_one_frame_is_a_configuration_error() -> None:
+    fleet = SimpleNamespace(benchmark=False, benchmark_sample_rate=None, benchmark_vib_channels=None)
+    with pytest.raises(ValueError) as refused:
+        load_hf_config(fleet, FULL_FIDELITY | {"SIM_HF_QUEUE_MAX_MB": "1"})
+    assert str(refused.value) == (
+        "SIM_HF_QUEUE_MAX_MB=1 cannot hold one HF frame of 1,645,147 B: raise it to at least 2 or lower "
+        "SIM_HF_SAMPLE_RATE_HZ, SIM_HF_VIB_CHANNELS or SIM_HF_FRAME_MS"
+    )
+    assert load_hf_config(fleet, FULL_FIDELITY | {"SIM_HF_QUEUE_MAX_MB": "2"}).queue_max_mb == 2
+    just_over = {"SIM_HF_SAMPLE_RATE_HZ": "32768", "SIM_HF_VIB_CHANNELS": "8", "SIM_HF_QUEUE_MAX_MB": "1"}
+    with pytest.raises(ValueError, match=r"frame of 1,0\d\d,\d{3} B: raise it to at least 2 "):
+        load_hf_config(fleet, just_over)  # just over 1 MiB: the size is never rounded down to "1.00 MiB"
+    assert load_hf_config(fleet, {"SIM_HF_QUEUE_MAX_MB": "1"}).queue_max_mb == 1, "a 20 KB frame fits 1 MiB"
+    disabled = FULL_FIDELITY | {"SIM_HF_QUEUE_MAX_MB": "1", "SIM_HF_ENABLED": "false"}
+    assert not load_hf_config(fleet, disabled).enabled, "no live frames, no buffer"
+    bench = SimpleNamespace(benchmark=True, benchmark_sample_rate=25_600, benchmark_vib_channels=16)
+    assert load_hf_config(bench, {"SIM_HF_QUEUE_MAX_MB": "1"}).sample_rate_hz == 25_600, (
+        "the load test sizes only its client queue with it, one maximum-size message larger"
+    )
+
+
+def test_the_simulator_exits_2_on_such_a_buffer_before_touching_postgresql(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setitem(sys.modules, "fleet_db", types.ModuleType("fleet_db"))  # any use would raise
+    for name, value in (FULL_FIDELITY | {"SIM_HF_ENABLED": "true", "SIM_HF_QUEUE_MAX_MB": "1"}).items():
+        monkeypatch.setenv(name, value)
+    with caplog.at_level(logging.ERROR, logger="engine_generator"):
+        assert eg.main([]) == 2
+    assert (
+        "Invalid configuration: SIM_HF_QUEUE_MAX_MB=1 cannot hold one HF frame of 1,645,147 B" in caplog.text
+    )
+
+
 def test_producer_is_idempotent_compressed_batched_and_never_creates_topics() -> None:
-    settings = hf_kafka.producer_config(HfConfig.from_env(COMPOSE_ENV), "engine-simulator-hf")
+    settings = hf_kafka.producer_config(
+        HfConfig.from_env(COMPOSE_ENV), "engine-simulator-hf", delivery_timeout_ms=0
+    )
     assert settings["bootstrap.servers"] == "kafka:29092" and settings["client.id"] == "engine-simulator-hf"
     assert (settings["acks"], settings["enable.idempotence"], settings["compression.type"]) == (
         "all",
@@ -137,8 +181,10 @@ def test_producer_is_idempotent_compressed_batched_and_never_creates_topics() ->
     assert settings["message.max.bytes"] == 8 * 2**20 == 8_388_608, "the HF topics' max.message.bytes"
     assert settings["allow.auto.create.topics"] is False and settings["partitioner"] == "murmur2_random"
     assert settings["queue.buffering.max.kbytes"] == 64 * 1024 + 8 * 1024
+    assert settings["message.timeout.ms"] == 0, "librdkafka's 0: a frame never times out"
     assert settings["statistics.interval.ms"] == 0
-    assert hf_kafka.producer_config(HfConfig(), "x", statistics=True)["statistics.interval.ms"] == 1000
+    with_statistics = hf_kafka.producer_config(HfConfig(), "x", delivery_timeout_ms=1, statistics=True)
+    assert (with_statistics["statistics.interval.ms"], with_statistics["message.timeout.ms"]) == (1000, 1)
 
 
 def test_the_schema_file_is_read_and_bad_files_are_named(tmp_path: Path) -> None:
@@ -286,6 +332,56 @@ def test_kafka_sink_readiness_names_the_missing_piece_and_delegates_to_the_clien
     assert (sink.fatal_error, sink.wire_bytes) == (None, None)
     sink.close()
     assert registry.closed
+
+
+@pytest.fixture
+def created_producers(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """confluent_kafka stand-in for open_kafka_sink (no client library needed): records the settings of
+    every Producer it is asked to create."""
+    created: list[dict[str, Any]] = []
+
+    class Producer:
+        def __init__(self, settings: dict[str, Any]) -> None:
+            created.append(settings)
+
+    modules = {
+        "confluent_kafka": {"Producer": Producer},
+        "confluent_kafka.schema_registry": {
+            "Schema": lambda text, kind: (kind, text),
+            "SchemaRegistryClient": lambda conf: FakeRegistry(),
+            "topic_subject_name_strategy": lambda context, record_name: f"{context.topic}-value",
+        },
+        "confluent_kafka.schema_registry.avro": {"AvroSerializer": lambda registry, schema, conf: None},
+        "confluent_kafka.serialization": {
+            "MessageField": SimpleNamespace(VALUE="value"),
+            "SerializationContext": lambda topic, field: SimpleNamespace(topic=topic, field=field),
+        },
+    }
+    for name, attributes in modules.items():
+        module = types.ModuleType(name)
+        vars(module).update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    return created
+
+
+def test_only_the_load_test_sink_times_out_frames_kafka_has_not_acknowledged(
+    created_producers: list[dict[str, Any]],
+) -> None:
+    config = HfConfig()
+    live = hf_runtime.kafka_sink_factory(config, config.topic)()
+    bench = hf_benchmark._kafka_sink(config, config.benchmark_topic)
+    assert (live.subject, bench.subject) == ("engine_hf.sensor_frames-value", "engine_hf.benchmark-value")
+    live_settings, bench_settings = created_producers
+    assert live_settings["message.timeout.ms"] == 0, "none: in an outage the budget binds, not a timer"
+    assert bench_settings["message.timeout.ms"] == 300_000, "a dead broker's frames fail and free the queue"
+    differing = {
+        name for name in live_settings | bench_settings if live_settings.get(name) != bench_settings.get(name)
+    }
+    assert differing == {"client.id", "message.timeout.ms", "statistics.interval.ms", "error_cb", "stats_cb"}
+    assert (live_settings["client.id"], bench_settings["client.id"]) == (
+        "engine-simulator-hf",
+        "engine-simulator-hf-benchmark",
+    )
 
 
 def test_a_disabled_path_loads_neither_the_publisher_nor_the_kafka_client() -> None:

@@ -67,6 +67,22 @@ def test_a_frame_larger_than_the_budget_still_moves_when_nothing_is_in_flight() 
     assert queue.take() is not None
 
 
+def test_an_unused_budget_admits_one_live_frame_of_any_size() -> None:
+    queue = FrameQueue(budget_bytes=FRAME, frame_bytes=3 * FRAME)
+    queue.extend_backfill(["history"])
+    assert queue.offer(["a", "b"]) == 1, "queued backfill holds no budget: the first frame is admitted"
+    head = queue.take()
+    assert head is not None and head.request == "history"
+    queue.in_flight(3 * FRAME)
+    assert queue.take() is None and queue.offer(["c"]) == 1, "budget in use: nothing more fits"
+    queue.settled(3 * FRAME)
+    head = queue.take()
+    assert head is not None and head.request == "a"
+    queue.in_flight(3 * FRAME)
+    queue.settled(3 * FRAME)
+    assert queue.offer(["d", "e"]) == 1 and queue.depth() == (1, 0), "Kafka keeps up: one frame at a time"
+
+
 def test_shutdown_helpers_discard_backfill_clear_and_reset() -> None:
     queue = FrameQueue(budget_bytes=10 * FRAME, frame_bytes=FRAME)
     queue.extend_backfill(range(3))

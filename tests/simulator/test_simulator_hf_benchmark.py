@@ -182,6 +182,166 @@ def test_a_stop_request_ends_the_measurement_early(monkeypatch: pytest.MonkeyPat
     assert result.frames == 0 and result.produce_seconds < 1.0
 
 
+class DeadBrokerSink(FakeBenchmarkSink):
+    """The broker died mid-run: nothing is acknowledged, the client queue holds ``capacity`` frames, and the
+    signal handler sets ``stop`` at the ``signal_at``-th refusal while the load test waits for room."""
+
+    def __init__(self, capacity: int, stop: threading.Event, signal_at: int) -> None:
+        super().__init__()
+        self.capacity, self.stop, self.signal_at = capacity, stop, signal_at
+        self.refusals = 0
+
+    def produce(self, key: bytes, value: bytes, on_delivery: Any) -> None:
+        if len(self.pending) < self.capacity:
+            self.pending.append((key, value, on_delivery))
+            return
+        self.refusals += 1
+        if self.refusals == self.signal_at:
+            self.stop.set()
+        if self.refusals > self.signal_at + 100:
+            raise RuntimeError("still waiting for room long after the stop request")
+        raise BufferError("Local: Queue full")
+
+    def poll(self, timeout: float) -> int:
+        return 0
+
+    def flush(self, timeout: float) -> int:
+        return len(self.pending)
+
+
+def test_a_stop_request_abandons_the_frame_waiting_for_a_full_client_queue(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(hb, "STATISTICS_SETTLE_SECONDS", 0.0)
+    stop = threading.Event()
+    sink = DeadBrokerSink(capacity=3, stop=stop, signal_at=5)
+    with caplog.at_level(logging.WARNING, logger="hf_benchmark"):
+        code = hb.run_benchmark(
+            HfConfig(), options(benchmark_seconds=600.0), 42, NOMINAL, stop, lambda topic: sink
+        )
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["hf_benchmark"]
+    assert sink.refusals == 5 + hb.STOP_GRACE_RETRIES, "a bounded grace after the stop request, then give up"
+    assert code == 1 and (result["frames"], result["delivered_frames"], result["errors"]) == (4, 0, 4), (
+        "three frames unacknowledged at the flush plus the abandoned one: every frame accounted for once"
+    )
+    assert "Stop requested while the Kafka client queue was full: one frame abandoned" in caplog.text
+    assert "produce failed" not in caplog.text
+
+
+class BottleneckBrokerSink(FakeBenchmarkSink):
+    """A healthy broker that is the bottleneck: the client queue holds two frames and room frees up only at
+    every third poll; the signal handler sets ``stop`` at the first refusal."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__()
+        self.stop = stop
+        self.polls = 0
+
+    def produce(self, key: bytes, value: bytes, on_delivery: Any) -> None:
+        if len(self.pending) >= 2:
+            self.stop.set()
+            raise BufferError("Local: Queue full")
+        super().produce(key, value, on_delivery)
+
+    def poll(self, timeout: float) -> int:
+        self.polls += 1
+        return super().poll(timeout) if self.polls % 3 == 0 else 0
+
+    def flush(self, timeout: float) -> int:
+        super().poll(timeout)  # healthy: the final flush acknowledges every frame still in flight
+        return 0
+
+
+def test_a_stop_request_while_a_healthy_broker_is_the_bottleneck_keeps_a_clean_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(hb, "STATISTICS_SETTLE_SECONDS", 0.0)
+    stop = threading.Event()
+    sink = BottleneckBrokerSink(stop)
+    with caplog.at_level(logging.WARNING, logger="hf_benchmark"):
+        code = hb.run_benchmark(
+            HfConfig(), options(benchmark_seconds=600.0), 42, NOMINAL, stop, lambda topic: sink
+        )
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["hf_benchmark"]
+    assert code == 0 and result["errors"] == 0 and result["frames"] == result["delivered_frames"] == 3, (
+        "the waiting frame gets the room the broker frees within the grace: Ctrl-C keeps a clean run clean"
+    )
+    assert "one frame abandoned" not in caplog.text
+
+
+class SignalDuringBuildSink(FakeBenchmarkSink):
+    """A healthy broker; the signal handler sets ``stop`` while the first frame is serialized."""
+
+    def __init__(self, stop: threading.Event) -> None:
+        super().__init__()
+        self.stop = stop
+
+    def serialize(self, record: dict[str, Any]) -> bytes:
+        self.stop.set()
+        return super().serialize(record)
+
+
+def test_a_stop_request_with_room_in_the_client_queue_still_hands_the_frame_over(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(hb, "STATISTICS_SETTLE_SECONDS", 0.0)
+    stop = threading.Event()
+    sink = SignalDuringBuildSink(stop)
+    code = hb.run_benchmark(
+        HfConfig(), options(benchmark_seconds=600.0), 42, NOMINAL, stop, lambda topic: sink
+    )
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["hf_benchmark"]
+    assert code == 0 and (result["frames"], result["delivered_frames"], result["errors"]) == (1, 1, 0), (
+        "a clean Ctrl-C keeps a clean run: only a frame the full queue refuses is given up"
+    )
+
+
+class SlowBrokerSink(FakeBenchmarkSink):
+    """Kafka is the bottleneck: the client queue holds two frames, every wait for room takes 0.4 s of the load
+    test's clock, and the broker acknowledges the oldest frame at every third wait."""
+
+    def __init__(self, clock: list[float]) -> None:
+        super().__init__()
+        self.clock = clock
+        self.waits = 0
+        self.handed_at: list[float] = []
+
+    def produce(self, key: bytes, value: bytes, on_delivery: Any) -> None:
+        if len(self.pending) == 2:
+            raise BufferError("Local: Queue full")
+        self.handed_at.append(self.clock[0])
+        super().produce(key, value, on_delivery)
+
+    def poll(self, timeout: float) -> int:
+        if timeout == 0:
+            return 0
+        self.clock[0] += 0.4
+        self.waits += 1
+        if self.waits % 3:
+            return 0
+        key, _, on_delivery = self.pending.pop(0)
+        self.keys.append(key)
+        on_delivery(None, None)
+        return 1
+
+    def flush(self, timeout: float) -> int:
+        super().poll(0)  # the broker catches up within the flush
+        return 0
+
+
+def test_a_full_client_queue_at_the_deadline_delays_the_last_frame_but_never_loses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hb, "STATISTICS_SETTLE_SECONDS", 0.0)
+    now = [0.0]
+    sink = SlowBrokerSink(now)
+    fleet = hb.SyntheticFleet(2, NOMINAL, 1000, START)
+    result = hb.measure(sink, hb.FrameBuilder(HfConfig(), 1), fleet, 1.0, threading.Event(), lambda: now[0])
+    assert sink.handed_at == [0.0, 0.0, pytest.approx(1.2)], "the third frame waited past the 1 s deadline"
+    assert (result.frames, result.delivered_frames, result.errors) == (3, 3, 0)
+    assert result.produce_seconds == pytest.approx(1.2)
+
+
 def test_synthetic_fleet_cycles_engines_types_modes_and_wear() -> None:
     fleet = hb.SyntheticFleet(8, NOMINAL, 500, START)
     first, second = [fleet.next() for _ in range(8)], [fleet.next() for _ in range(8)]

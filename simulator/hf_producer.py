@@ -8,13 +8,22 @@ for Kafka, the Schema Registry or the frame synthesis:
                  topic auto-creation is disabled), then: take -> FrameBuilder.build -> Avro serializer ->
                  produce -> poll (delivery reports); one metrics line every 60 s
     shutdown     close(): queued live frames are produced and flushed for up to SHUTDOWN_SECONDS; queued
-                 backfill frames and whatever Kafka has not acknowledged by then are counted as discarded
+                 backfill frames and whatever Kafka has not acknowledged by then are counted as discarded.
+                 The live producer never times out a frame (hf_runtime), so this deadline bounds the stop
 
-Losses are counted, never hidden: ``dropped`` (budget full: Kafka, the registry or the topic unavailable),
-``failed`` (build, serialization or delivery error), ``discarded`` (queued or unacknowledged at shutdown).
-The frame_seq of a lost frame is never reused, so consumers see each loss as a gap. A fatal producer error
-(the idempotent producer cannot continue) replaces the client through the sink factory, so a broken client
-never silences the path for good.
+Losses are counted, never hidden: ``dropped`` (budget full: Kafka, the registry or the topic unavailable,
+or the worker behind the ticks), ``failed`` (build or serialization error, a produce call the client
+refused, or a delivery error; with the live producer never a timeout), ``discarded`` (queued or
+unacknowledged at shutdown). The frame_seq of a lost frame is never reused, so consumers see each loss as a
+gap. A fatal producer error (the idempotent producer cannot continue) replaces the client through the sink
+factory, so a broken client never silences the path for good.
+
+The first-boot backfill is best effort too, and a loss there is final. fleet_bootstrap backfills an engine
+only while it has no telemetry, and the requests for its history's frames live only in this process, so
+backfill frames that are still queued or unacknowledged at shutdown, or discarded with a client a fatal
+error replaced, are never re-created: those pulses keep no HF features for good (the 1 Hz history is
+complete either way). Resuming them would need a per-engine marker
+in PostgreSQL, cleared once Kafka has acknowledged every frame of the engine's history.
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ BUFFER_RETRY_SECONDS = 0.05
 BUFFER_RETRIES = 200
 BACKOFF_BASE_SECONDS, BACKOFF_CAP_SECONDS = 1.0, 30.0
 FAILURE_LOG_INTERVAL_SECONDS = 60.0
+MIB = 1024 * 1024
 
 
 def backoff_delay(attempt: int) -> float:
@@ -162,16 +172,24 @@ class FramePublisher:
         self._thread.start()
 
     def submit(self, requests: Sequence[FrameRequest]) -> None:
-        """Queue the frames of a live tick; frames beyond the budget are dropped and counted (tick thread)."""
+        """Queue the frames of a live tick; frames beyond the budget are dropped and counted (tick thread).
+
+        The first drop of an episode logs what holds the budget: live frames queued for the worker (Kafka not
+        ready yet, or the worker behind the ticks) or frames Kafka has not acknowledged (Kafka slow or down).
+        """
         dropped = self._queue.offer(requests)
         if dropped:
             self.stats.add(dropped=dropped)
             if not self._dropping:
                 self._dropping = True
+                live, _ = self._queue.depth()
                 logger.warning(
-                    "HF buffer full (%d MiB, waiting for: %s): dropping new frames until Kafka catches up",
+                    "HF buffer full (%d MiB: %.1f MiB queued, %.1f MiB unacknowledged by Kafka%s): dropping "
+                    "new frames until it has room",
                     self._config.queue_max_mb,
-                    self.waiting_for or "acknowledgements",
+                    live * self._queue.frame_bytes / MIB,
+                    self._queue.in_flight_bytes / MIB,
+                    f"; waiting for: {self.waiting_for}" if self.waiting_for else "",
                 )
         elif self._dropping and requests:
             self._dropping = False
@@ -182,7 +200,11 @@ class FramePublisher:
         self._queue.extend_backfill(requests)
 
     def close(self, timeout: float = SHUTDOWN_SECONDS) -> None:
-        """Stop the worker: flush queued live frames for up to ``timeout`` seconds, then log the totals."""
+        """Stop the worker: flush queued live frames for up to ``timeout`` seconds, then log the totals.
+
+        Frames Kafka has not acknowledged by then are discarded, not waited for: the live producer has no
+        delivery timeout, so this deadline is what keeps a stop during an outage short.
+        """
         self._close_deadline = self._clock() + timeout
         self._closing.set()
         if self._thread.is_alive():
@@ -332,7 +354,8 @@ class FramePublisher:
         backfill = self._queue.discard_backfill()
         if backfill:
             logger.warning(
-                "Shutdown: %d queued backfill frames discarded; those pulses stay without HF features",
+                "Shutdown: %d queued backfill frames discarded; those historical pulses stay without HF "
+                "features for good (a restart backfills only engines without telemetry)",
                 backfill,
             )
         self.stats.add(discarded=backfill)

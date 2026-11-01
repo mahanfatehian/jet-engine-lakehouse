@@ -11,7 +11,9 @@ Backfill works per engine: every configured engine without any telemetry gets it
 transaction, so an interrupted first boot completes on the next start and an engine added to
 SIM_ENGINE_IDS later gets history too; an engine with telemetry is never backfilled again. Once an
 engine's history has committed, the optional commit hook receives it (high-frequency frames for every
-backfilled pulse, with backdated timestamps).
+backfilled pulse, with backdated timestamps). That is the history's only pass through the hook: HF frames
+of it that never reach Kafka (the simulator stopped first) are not re-created on a later start, so those
+pulses keep no HF features; the HF path is best effort (hf_producer).
 
 Like fleet_runtime, this module never imports engine_generator at runtime: engines are built by the
 factory that ``engine_generator.main`` hands in and are persisted through the fleet_db store.

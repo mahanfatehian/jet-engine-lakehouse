@@ -10,7 +10,11 @@ Producer settings (:func:`producer_config`):
     compression.type                 SIM_HF_COMPRESSION (zstd) on whole batches of frames
     linger.ms=50, batch.size=1 MiB   batching: the frames of a tick travel in a few requests
     message.max.bytes=8 MiB          the HF topics' max.message.bytes (a full-fidelity frame is ~1.7 MB)
-    message.timeout.ms=300000        a frame Kafka has not acknowledged within 5 minutes is reported failed
+    message.timeout.ms               the caller's delivery timeout. Live path 0, none: while Kafka is down
+                                     its frames wait in the client and the SIM_HF_QUEUE_MAX_MB budget
+                                     (hf_queue), not a timer, decides when new frames are dropped. Load
+                                     test 300000: frames a dead broker holds fail after 5 minutes, which
+                                     frees the full client queue the test waits on
     allow.auto.create.topics=false   topics are code (infrastructure/kafka/create-topics.sh)
     queue.buffering.max.kbytes       SIM_HF_QUEUE_MAX_MB plus one frame: hf_queue's budget binds first
 
@@ -43,7 +47,6 @@ CLIENT_LOGGER_NAME = "hf_kafka.librdkafka"
 
 LINGER_MS = 50
 BATCH_BYTES = 1024 * 1024
-DELIVERY_TIMEOUT_MS = 300_000
 QUEUE_MAX_MESSAGES = 1_000_000  # the byte budget binds first
 STATISTICS_INTERVAL_MS = 1000
 REGISTRY_TIMEOUT_SECONDS = 5.0
@@ -53,8 +56,11 @@ DeliveryCallback = Callable[[Any, Any], None]
 """confluent-kafka delivery report: (KafkaError or None, Message)."""
 
 
-def producer_config(config: HfConfig, client_id: str, *, statistics: bool = False) -> dict[str, Any]:
-    """librdkafka settings of the HF producer (module doc); ``statistics`` adds 1 s client statistics."""
+def producer_config(
+    config: HfConfig, client_id: str, *, delivery_timeout_ms: int, statistics: bool = False
+) -> dict[str, Any]:
+    """librdkafka settings of the HF producer (module doc): ``delivery_timeout_ms`` is message.timeout.ms
+    (0: frames never time out), ``statistics`` adds 1 s client statistics."""
     return {
         "bootstrap.servers": config.bootstrap_servers,
         "client.id": client_id,
@@ -66,7 +72,7 @@ def producer_config(config: HfConfig, client_id: str, *, statistics: bool = Fals
         "linger.ms": LINGER_MS,
         "batch.size": BATCH_BYTES,
         "message.max.bytes": TOPIC_MAX_MESSAGE_BYTES,
-        "message.timeout.ms": DELIVERY_TIMEOUT_MS,
+        "message.timeout.ms": delivery_timeout_ms,
         "allow.auto.create.topics": False,
         "queue.buffering.max.kbytes": (config.queue_max_bytes + TOPIC_MAX_MESSAGE_BYTES) // 1024,
         "queue.buffering.max.messages": QUEUE_MAX_MESSAGES,
@@ -245,10 +251,13 @@ class KafkaSink:
         self._registry.close()
 
 
-def open_kafka_sink(config: HfConfig, topic: str, *, client_id: str, statistics: bool = False) -> KafkaSink:
+def open_kafka_sink(
+    config: HfConfig, topic: str, *, client_id: str, delivery_timeout_ms: int, statistics: bool = False
+) -> KafkaSink:
     """Producer, Schema Registry client and Avro serializer for ``topic``; no network traffic yet.
 
-    Raises ValueError for an unreadable schema file and the client's exceptions for invalid settings.
+    ``delivery_timeout_ms`` and ``statistics`` as in :func:`producer_config`. Raises ValueError for an
+    unreadable schema file and the client's exceptions for invalid settings.
     """
     from confluent_kafka import Producer
     from confluent_kafka.schema_registry import Schema, SchemaRegistryClient, topic_subject_name_strategy
@@ -268,7 +277,9 @@ def open_kafka_sink(config: HfConfig, topic: str, *, client_id: str, statistics:
     )
     context = SerializationContext(topic, MessageField.VALUE)
     events = ClientEvents()
-    settings = producer_config(config, client_id, statistics=statistics) | events.callbacks(statistics)
+    settings = producer_config(
+        config, client_id, delivery_timeout_ms=delivery_timeout_ms, statistics=statistics
+    ) | events.callbacks(statistics)
     producer = Producer(settings | {"logger": client_logger()})
     return KafkaSink(
         topic,

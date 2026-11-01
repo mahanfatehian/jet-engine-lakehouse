@@ -5,12 +5,20 @@ one byte budget (SIM_HF_QUEUE_MAX_MB) bounds the memory of the whole path: it co
 here, at their estimated serialized size, plus every frame handed to Kafka and not yet acknowledged, at its
 real size. Kafka down means acknowledgements stop, the in-flight bytes reach the budget, the worker stops
 taking frames and new live frames no longer fit: they are dropped and counted, while the tick only ever
-takes a lock for a few list operations.
+takes a lock for a few list operations. The live producer has no delivery timeout (hf_runtime), so an
+unacknowledged frame holds its bytes until its delivery report arrives or its client is discarded: the
+budget alone decides how long an outage is buffered (SIM_HF_QUEUE_MAX_MB over the fleet's frame bytes per
+second) before new frames are dropped.
+
+An unused budget admits one frame of any size, into the queue (offer) and on to Kafka (take), so even a
+frame larger than the whole budget moves; hf_runtime rejects such a SIM_HF_QUEUE_MAX_MB at start-up anyway.
 
 Backfill requests always queue: they are a few hundred bytes each until built, and losing history to a full
 buffer would leave whole lifecycles without spectral features. The worker releases them to Kafka only while
 the in-flight bytes stay below BACKFILL_SHARE of the budget, so live frames queued behind a replay of history
-always keep the other part of the budget.
+always keep the other part of the budget. The budget never drops backfill: queued backfill is discarded
+only at shutdown, and then for good (hf_producer); once handed to Kafka it can still fail, or be discarded
+with its client, like any frame.
 """
 
 from __future__ import annotations
@@ -48,11 +56,16 @@ class FrameQueue:
         self._backfill = 0
 
     def offer(self, requests: Iterable[Any]) -> int:
-        """Queue live frame requests that fit the budget; returns how many were dropped."""
+        """Queue live frame requests that fit the budget; returns how many were dropped.
+
+        A frame needs room for its estimated size, except that an unused budget (no live frame queued,
+        nothing in flight) admits any frame, as :meth:`take` does.
+        """
         dropped = 0
         with self._lock:
             for request in requests:
-                if self._queued_live_bytes + self._in_flight_bytes + self.frame_bytes > self.budget_bytes:
+                used = self._queued_live_bytes + self._in_flight_bytes
+                if used and used + self.frame_bytes > self.budget_bytes:
                     dropped += 1
                     continue
                 self._frames.append(QueuedFrame(request, self.frame_bytes, backfill=False))
