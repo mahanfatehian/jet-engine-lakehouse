@@ -154,6 +154,11 @@ whose loss would stop the query on its next restart.
 | gold | `mart_rul_training_features` | dbt, table | `ReplacingMergeTree` | features + RUL labels of completed lifecycles |
 | gold | `fct_engine_health_status` | dbt, table | `ReplacingMergeTree` | one row per engine: state, KPIs, calibrated anomaly flags, latest prediction aged to the current cycle |
 | gold | `fct_rul_prediction_backtest` | dbt, table | `ReplacingMergeTree` | first scoring of every pre-failure pulse of a failed lifecycle, scored against the truth |
+| silver | `int_engine_status_history` | dbt, table | `ReplacingMergeTree`, key `(engine_id, valid_from)` | SCD Type 2 status history: one row per engine and status interval, rebuilt from the registry's CDC log every run |
+| gold | `fct_engine_failures` | dbt, table | `ReplacingMergeTree` | one row per failure: time to repair, time and cycles in service since the previous return to service, failure mode |
+| gold | `fct_engine_lifecycle_status_time` | dbt, table | `ReplacingMergeTree` | time in each status per engine lifecycle, availability, failures |
+| gold | `rpt_fleet_reliability_daily` | dbt, table | `ReplacingMergeTree` | availability, failures, MTBF (time and cycles), MTTR per UTC day and engine, plus the fleet (`ALL`) |
+| gold | `rpt_failure_mode_pareto` | dbt, table | `ReplacingMergeTree` | work orders per failure mode, ranked with cumulative shares, per engine and fleet |
 | gold | `rpt_model_live_performance` | dbt, table | `ReplacingMergeTree` | live RMSE, MAE, bias, NASA score, horizon precision/recall/F1 and warning lead time per model version |
 | serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL | every prediction with its sensor readings |
 | serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree` | training-run registry |
@@ -184,6 +189,14 @@ flowchart LR
     P --> BT[fct_rul_prediction_backtest]
     LC --> BT
     BT --> RPT[rpt_model_live_performance]
+    STR --> SCD[int_engine_status_history]
+    SCD --> FAIL[fct_engine_failures]
+    STM --> FAIL
+    SCD --> LST[fct_engine_lifecycle_status_time]
+    FAIL --> LST
+    SCD --> DAY[rpt_fleet_reliability_daily]
+    FAIL --> DAY
+    STM --> PAR[rpt_failure_mode_pareto]
 ```
 
 ## 5. Correctness and idempotency, end to end
@@ -210,6 +223,14 @@ flowchart LR
   collapses into one row and raw and staging keep the same copy. `int_vibration_features`
   recomputes the lifecycles that received frames, like the pulse features, and a dbt test
   proves that `int_ml_features` carries exactly the rows of `int_sensor_rolling_features`.
+  Each frame's noise is keyed by `SIM_SEED` and its `telemetry_id`, so a frame rebuilt by a resumed
+  backfill is byte-identical to the original and either copy yields the same feature row.
+- **The status history is rebuilt from the change log.** `int_engine_status_history` orders the
+  registry's versions by `cdc_lsn` (replays and late versions change nothing), closes an interval at
+  a delete and makes the event time monotonic per engine, so history backfilled behind a
+  registration tiles correctly; dbt tests prove that intervals never overlap and tile time, and that
+  the open interval is the registry's current state. Staging keeps the first copy of a replayed
+  version, the one an incremental run published, so a full refresh reproduces `stg_*` exactly.
 
 - **Every layer is reconciled against the source.** Every `RECONCILE_INTERVAL_SECONDS` the
   orchestrator task `reconcile` (`data_science/reconcile_lakehouse.py`) counts in one ClickHouse
@@ -225,23 +246,24 @@ flowchart LR
 
 | Event | Behaviour |
 |---|---|
-| `docker compose down` → `up` | everything resumes within the 7-day Kafka retention: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry and the generation settings it stores per lifecycle in `simulator_lifecycle_params` (bit-identical wear trajectory; changed `SIM_SEED` / `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` apply from each engine's next lifecycle) |
+| `docker compose down` → `up` | everything resumes within the 7-day Kafka retention: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry and the generation settings it stores per lifecycle in `simulator_lifecycle_params`, plus the HF frames a backfilled history still owes from `simulator_hf_backfill` (bit-identical wear trajectory; changed `SIM_SEED` / `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` apply from each engine's next lifecycle) |
 | ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (jittered backoff of at most 2–60 s) once ClickHouse answers; the six lake queries keep committing; the process stays up |
 | MinIO down | the lake queries stall or fail and resume from their checkpoints once MinIO answers; `clickhouse_raw` keeps running |
 | Outage longer than the Kafka retention | queries whose unread records were deleted stop loudly (`KAFKA_FAIL_ON_DATA_LOSS=true`) with recovery steps in the log |
 | Postgres down | the simulator drops ticks with bounded reconnect backoff and re-takes its single-writer lock on reconnect; after 10 failed attempts it exits and Docker restarts it |
 | A second simulator against the same database | refused: every session takes the advisory lock `jet-engine-simulator`; the newcomer waits up to 60 s, then exits 2 while the first keeps writing |
-| Simulator killed during the first-boot backfill | each engine's history is one transaction; the next start backfills exactly the engines that still have no telemetry |
+| Simulator killed during the first-boot backfill | each engine's history is one transaction; the next start backfills exactly the engines that still have no telemetry; the engine's HF backfill row commits in the same transaction |
 | A task fails in the orchestrator | logged as FAILED with its output tail; the loop continues; repeated failures back off exponentially; a failed dbt test skips that cycle's training and snapshot |
 | A manual `make` job while the loop runs the same job | it waits for the per-job lock (shared volume) instead of colliding |
 | Debezium connector stopped, PAUSED or FAILED | the replication slot retains WAL (capped by `max_slot_wal_keep_size`, 4 GB); `make register-cdc` restarts or resumes it; `make cdc-status` exits 1 until it is RUNNING |
 | Driver loop of the streaming job wedged | `/tmp/streaming.heartbeat` goes stale and the container turns unhealthy |
 | Kafka slow or down for the HF producer | frames are produced from a background thread, so the 1 Hz Postgres tick never waits; frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB` that holds both queued and unacknowledged frames; the producer has no delivery timeout, so the buffer bounds an outage (about 37 minutes of the default fleet's frames), after which new frames are dropped and counted |
-| Simulator stopped before the first-boot HF backlog reached Kafka | the 1 Hz history is complete, but the HF frames of histories that had already committed are never re-created (a restart backfills only engines without telemetry): those pulses keep NULL spectral features; the shutdown log counts the discarded backfill frames (best effort, a deliberate trade-off) |
+| Simulator stopped before the first-boot HF backlog reached Kafka (`make down`, a crash, Kafka never up) | each engine's history transaction also writes its row in `simulator_hf_backfill` (frames owed, last event time); the row is deleted only after Kafka has acknowledged every backfill frame of that engine. The next start rebuilds the owed frames from the stored pulses and `simulator_lifecycle_params` (same `telemetry_id`, `frame_seq` and physics; byte-identical under an unchanged `SIM_SEED`) and queues them as backfill again, while live frames keep flowing; frames sent twice collapse in `raw_engine_hf_features`. A history the recorded settings cannot reproduce is logged and its row dropped |
+| ClickHouse volume lost, a raw table dropped or truncated, rows deleted by mistake | `make ch-init` (or a ClickHouse restart) recreates the schema and the streaming job resumes with new changes; `make restore-raw` rebuilds the history of every raw table from the silver lake (only the rows raw lacks, so it is safe on a live stack and idempotent) and reconciles the restored range; the next dbt run publishes the restored rows |
 | The reconciliation finds a layer that disagrees with the source | task `reconcile` exits 65, is logged as FAILED with the worst (layer, engine, hour) cells and backs off; every cell is in `ops_reconciliation`, on the Data Platform dashboard and in `make verify` (WARN) |
 | Nothing to reconcile yet (fresh stack, lake or staging not built, `ops_reconciliation` missing) | `reconcile` exits 3 (SKIPPED) and is retried after the next dbt run; on a fresh stack the first comparison follows about `RECONCILE_LAG_SECONDS` after the backfill |
 | HF backlog older than the 2-hour topic retention | the HF queries skip the deleted frames with a warning; those pulses keep NULL spectral features, which the models treat as missing |
-| HF disabled (`SIM_HF_ENABLED=false`) or lagging | the CDC path, dbt and scoring run unchanged; scoring carries spectral features forward for at most `SPECTRAL_MAX_LAG_SECONDS`, then the models' missing-value branches decide |
+| HF disabled (`SIM_HF_ENABLED=false`) or lagging | the CDC path, dbt and scoring run unchanged; scoring carries spectral features forward for at most `SPECTRAL_MAX_LAG_SECONDS`, then the models' missing-value branches decide; no HF backfill rows are written, and rows left by an earlier run wait for the next start with HF enabled |
 | `make clean` | all volumes are deleted; the next `make up` rebuilds history from the backfill |
 
 ## 7. Design decisions
@@ -257,5 +279,8 @@ flowchart LR
 | Reduce at ingest, tier the raw | waveforms land once in cheap object storage and expire after a day; only per-frame features (~2 % of the bytes) reach ClickHouse and the model | waveforms older than the retention cannot be reprocessed with new features |
 | Lightweight scheduler instead of Airflow | one small container, zero extra infrastructure for a single-node stack | no UI or backfill semantics; the same tasks map one to one onto Airflow operators |
 | Community MinIO build (`pgsty/minio`) | the official images are no longer published | pinned by digest; override with `MINIO_IMAGE` |
+| Rebuild raw from the silver lake inside ClickHouse (`INSERT ... SELECT ... FROM s3()`, one statement per table and day) | the lake is the system of record: silver holds every raw column but `ingested_at` under the same key and `cdc_lsn`, so a restored row collapses with any copy the streaming job writes; no row passes through Python | `ingested_at` becomes the restore time (lag panels spike once); for an event Debezium delivered twice the restore keeps the later copy where raw may hold the first (only `kafka_offset` and `cdc_emitted_ts` differ); restored HF frames are republished to staging once |
+| SCD2 status history derived from the CDC log, rebuilt every run (no dbt snapshot) | the log already holds every version; a rebuild equals a full refresh, and one late or backdated version can move intervals anywhere in an engine's history | reads one registry version per engine and cycle (~52k a day for 6 engines) every dbt cycle |
+| One HF backfill row per engine, cleared after every frame of it is acknowledged | a stop or a Kafka outage during the first-boot drain no longer leaves history without spectral features | an interrupted drain re-sends that engine's whole backfill (harmless duplicates) |
 | Reconcile inside ClickHouse (`postgresql()`, `s3()` table functions) | one SQL statement compares every layer where the data already lives; nothing new to deploy, and only the window's source rows leave Postgres | ClickHouse must reach Postgres and MinIO by their compose names, and the window reaches Postgres as UTC literals (the database runs with TimeZone UTC, the image default) |
 | Ports bound to `127.0.0.1` by default | default credentials stay unreachable from the network | set `BIND_HOST` to expose the stack deliberately |

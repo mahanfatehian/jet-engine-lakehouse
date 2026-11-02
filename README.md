@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 110 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,021 unit tests (84 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,021 unit tests (84 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -97,7 +97,7 @@ flowchart LR
         INFER["Batch / live inference"]
     end
     ORCH(["Orchestrator<br/>pipeline_runner.py"])
-    GRAF["Grafana<br/>4 dashboards"]
+    GRAF["Grafana<br/>5 dashboards"]
 
     SIM -- "INSERT + UPDATE" --> PG
     PG -- "WAL · pgoutput" --> DBZ
@@ -134,7 +134,7 @@ flowchart LR
 | Lakehouse | `minio` + `minio-init` | `pgsty/minio`, `pgsty/mc` | S3 bucket `lakehouse` with `bronze/ silver/ gold/ ml-artifacts/`; raw HF frames expire after a day |
 | OLAP | `clickhouse` | `clickhouse/clickhouse-server:26.8` | raw CDC and HF feature tables, dbt models, predictions |
 | Jobs | `orchestrator` | built from [`data_science/Dockerfile`](data_science/Dockerfile) | schedules dbt, snapshots, training and inference |
-| Dashboards | `grafana` | built from [`infrastructure/grafana/`](infrastructure/grafana) | 4 provisioned dashboards on a read-only ClickHouse account |
+| Dashboards | `grafana` | built from [`infrastructure/grafana/`](infrastructure/grafana) | 5 provisioned dashboards on a read-only ClickHouse account |
 
 The deep dive into each hop, the CDC event semantics and the data model is in
 **[docs/architecture.md](docs/architecture.md)**. The engine physics, features, labels and the
@@ -164,9 +164,12 @@ that expires.
    Kafka and those Kafka has not acknowledged. The producer has no delivery timeout, so the buffer,
    not a timer, bounds an outage: about 37 minutes of the default fleet's frames at 256 MiB. Frames
    that do not fit are dropped and counted, and `frame_seq` gaps show exactly which. The first-boot
-   backfill streams a frame for every historical pulse too (best effort as well: if the simulator
-   stops before that backlog has reached Kafka, those pulses stay without spectral features for
-   good, because a restart backfills only engines that have no telemetry).
+   backfill streams a frame for every historical pulse too, and that backlog survives a stop: each
+   engine's history transaction also records the frames it owes (`simulator_hf_backfill`), the
+   record is deleted only once Kafka has acknowledged every one of them, and a start that finds one
+   rebuilds those frames from the stored pulses and the per-lifecycle settings (same
+   `telemetry_id`, `frame_seq` and physics, byte-identical under an unchanged `SIM_SEED`) and queues
+   them again; a frame that arrives twice collapses into one row of `raw_engine_hf_features`.
 2. **One contract.** [`engine_sensor_frame.avsc`](infrastructure/schemas/engine_sensor_frame.avsc)
    is the single source of truth: the producer registers it in Schema Registry (compatibility
    BACKWARD) and Spark's `from_avro` decodes with the same file.
@@ -229,7 +232,7 @@ make up            # build 4 images and start 13 services; the CDC connector reg
 make ps            # wait until services are healthy and the init jobs exited with 0
 make register-cdc  # registers or updates the connector, restarts a FAILED task, waits for RUNNING
 make stream        # follow Spark: "clickhouse batch N: engine_telemetry=30 ..." every 5 s
-make dbt-run       # dbt build: 12 models + 110 data tests
+make dbt-run       # dbt build: 17 models + 163 data tests
 make train-ml      # train, evaluate and promote the RUL model; artifacts land in MinIO
 make predict-ml    # score every engine; predictions land in ClickHouse
 make verify        # end-to-end report across Postgres, Debezium, MinIO and ClickHouse
@@ -448,10 +451,93 @@ WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
 GROUP BY layer;
 ```
 
+### Disaster recovery: rebuild ClickHouse from the lake
+
+The lake is the system of record; ClickHouse can always be rebuilt from it. `make restore-raw` puts
+the silver Parquet back into `raw_engine_telemetry`, `raw_engine_status_registry`,
+`raw_maintenance_log` and `raw_engine_hf_features`, with one `INSERT ... SELECT ... FROM s3()` per
+table and day of event time that ClickHouse runs itself (the credentials travel as masked query
+parameters, as in the audit). Per key it takes the lake's newest image (highest `cdc_lsn`; copies an
+interrupted micro-batch left behind collapse) and inserts it only where raw lacks it or holds an
+older version: a restore on a complete table writes nothing, a second run finds nothing to add, and
+a row the streaming job writes at the same time collapses with it under `FINAL`. Every column holds
+the value the streaming job writes, except `ingested_at`, which becomes the time of the restore: the
+lake does not record when a row first reached ClickHouse, and the fresh stamp is what makes the next
+dbt run publish the restored rows. A run reads the lake as of its start, counts again after its
+inserts and ends with the reconciliation audit over the restored range (at most its last 168
+hours): exit 65 when raw still disagrees with the source, 3 when a raw table or the lake is missing.
+
+    make restore-raw ARGS="--dry-run"    # per table and day: lake rows, raw rows, rows to restore
+    make restore-raw ARGS="--from 2026-11-01 --tables raw_engine_telemetry raw_engine_hf_features"
+    make restore-raw                     # everything the lake holds
+
+After losing ClickHouse: `make ch-init` (or restart ClickHouse) recreates the schema and the
+streaming job resumes with new changes; `make restore-raw` brings back the history; the next dbt
+run (or `make dbt-run`) publishes it, and `make reconcile ARGS="--window-hours 168"` confirms.
+In a drill against the live lake, an empty ClickHouse was rebuilt in 16 s (908,418 rows); all but
+15 of the 474,201 CDC rows were identical to the live raw tables in every column but `ingested_at`
+(the 15 are change events Debezium delivered twice, which differ only in `kafka_offset` and
+`cdc_emitted_ts`), and the audit matched the source in all 396 cells of the week. Not restored from
+silver: `raw_cdc_dead_letter` (replay from Kafka or bronze), `hf_ingest_batches`, and the
+prediction, model-run and audit tables (the next predict, train and reconcile runs refill them).
+
+### Fleet reliability: availability, MTBF and MTTR from the status history
+
+Every status change of `engine_status_registry` is a CDC update, so ClickHouse holds the registry's
+complete history, and dbt turns it into a **SCD Type 2** dimension without a dbt snapshot:
+`int_engine_status_history` has one row per engine and status interval (`valid_from`, `valid_to`
+NULL while current, `is_current`, lifecycle and cycle at entry, duration). Versions are read in
+`cdc_lsn` order, so replays and late, out-of-order versions change nothing; a delete of the
+registry row closes the open interval (`closed_by_delete`); and the event time `status_changed_ts`
+is made monotonic per engine, so history the first-boot backfill writes behind a registration row
+tiles correctly. Every engine writes a registry version per cycle, so the model is rebuilt every
+dbt cycle: incremental equals full refresh by construction. HEALTHY, WARNING and CRITICAL count as
+in service; FAILURE (under repair) and MAINTENANCE_RESET (repaired, not flown yet) do not.
+
+| Model | Grain | Answers |
+|---|---|---|
+| `fct_engine_failures` | one row per failure | time to repair (to the first pulse of the next lifecycle), time and cycles in service since the previous return to service, failure mode of the work order |
+| `fct_engine_lifecycle_status_time` | engine × lifecycle | time in each status, availability, failures |
+| `rpt_fleet_reliability_daily` | UTC day × engine, plus the fleet (`ALL`) | availability, failures, MTBF (time and cycles), MTTR |
+| `rpt_failure_mode_pareto` | engine × failure mode, plus the fleet (`ALL`) | work orders per mode, ranked, with cumulative share |
+
+dbt tests prove that an engine's intervals never overlap and tile its history, that the open
+interval is the registry's current state, that every failure is a failed lifecycle of
+`int_engine_lifecycles` at the same cycle and instant, and that the daily and Pareto reports add up;
+the integration harness checks every value against an independent Python reference.
+
+```sql
+-- The status of every engine at an instant (SCD2 "as of" query)
+SELECT engine_id, operational_status, lifecycle_id, valid_from, valid_to
+FROM int_engine_status_history FINAL
+WHERE valid_from <= '2026-11-01 18:00:00' AND (valid_to > '2026-11-01 18:00:00' OR valid_to IS NULL);
+
+-- MTTR and MTBF per engine
+SELECT engine_id, count() AS failures, round(avg(repair_seconds), 1) AS mttr_s,
+       round(avg(operating_cycles)) AS mtbf_cycles, round(median(operating_seconds) / 60, 1) AS median_tbf_min
+FROM fct_engine_failures FINAL GROUP BY engine_id ORDER BY engine_id;
+```
+
+```text
+┌─engine_id─┬─failures─┬─mttr_s─┬─mtbf_cycles─┬─median_tbf_min─┐
+│ CFM56-104 │       36 │   21.9 │         183 │           30.8 │
+│ CFM56-105 │       36 │   21.8 │         183 │           30.3 │
+│ GE90-201  │       36 │   21.9 │         180 │           29.6 │
+│ GE90-202  │       37 │   21.8 │         175 │           29.2 │
+│ JT9D-001  │       35 │   21.9 │         188 │           32.1 │
+│ JT9D-002  │       36 │   21.8 │         181 │           29.9 │
+└───────────┴──────────┴────────┴─────────────┴────────────────┘
+```
+
+MTTR is the 20 s repair plus the tick until the next lifecycle's first pulse, and MTBF in cycles
+tracks `SIM_MEAN_LIFE_CYCLES` (180). The history is wall-clock: while the stack is stopped every
+engine stays in its last status, so a day the stack did not run reads as fully available, and a
+lifecycle that spans a stop has a long time in service. Cycles are not affected.
+
 ## Dashboards
 
 Grafana (http://localhost:3000, `admin` / `admin`, anonymous access off) opens on the fleet board.
-The ClickHouse datasource and the four dashboards are provisioned from
+The ClickHouse datasource and the five dashboards are provisioned from
 [`infrastructure/grafana/`](infrastructure/grafana), and Grafana reads through a dedicated
 ClickHouse account that can only run queries, never write.
 
@@ -460,6 +546,7 @@ ClickHouse account that can only run queries, never write.
 | **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, failures by mode |
 | **Vibration Analytics (HF Sensor Frames)** | bearing defect tone (BPFO), kurtosis, crest factor and core unbalance per engine, the oil system (quantity, filter ΔP, temperatures), the EGT A/B sensor split, HF frames per minute |
 | **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, and the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source |
+| **Fleet Reliability** | availability, failures, MTBF (time and cycles) and MTTR per engine and per day, time in each status per day, engine and lifecycle, the failure-mode Pareto, the SCD2 status timeline and every failure with its repair |
 | **Model Operations & Live Backtest** | the production model, every training run with its promotion decision, calibration of the failure probability, live versus holdout performance against failures that happened later |
 
 ## Service endpoints
@@ -521,6 +608,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `make register-cdc ARGS=--dry-run` | show what registration would change, without changing it |
 | `make pipeline-once` | dbt → snapshot → train → predict once, outside the schedule |
 | `make snapshot` | export silver/gold feature tables to MinIO Parquet now |
+| `make restore-raw ARGS="--dry-run"`, `make restore-raw ARGS="--from 2026-11-01"` | rebuild the raw tables from the silver lake (only the rows raw lacks, idempotent), then reconcile the restored range; `--dry-run` reports per table and day what a restore would add (exit 65 when raw still differs, 3 when a table or the lake is missing) |
 | `make reconcile`, `make reconcile ARGS="--window-hours 24"` | reconcile the source with raw, staging and silver now (exit 65 when a layer has gaps, 3 while there is nothing to compare yet) |
 | `make train-ml ARGS="--promotion-policy always"` | force-promote a freshly trained model |
 | `make dbt-run ARGS="--full-refresh"` | rebuild every dbt model from the raw CDC tables |
@@ -569,7 +657,8 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
   never blocks the 1 Hz path. `make logs SERVICE=simulator` shows "HF frames waiting for Kafka"
   while the topic or the registry is not up yet, and a metrics line every minute (produced,
   dropped, MB/s, queue depth). Spectral features stay NULL for pulses without a frame; the models
-  treat them as missing.
+  treat them as missing. After a stop during the first-boot drain, the next start logs "Resumed the
+  HF backfill of ..." and sends the history's frames again.
 - **Connector not RUNNING:** `make cdc-status`, then `make register-cdc` (it restarts a FAILED task
   and resumes a PAUSED connector).
 - **A manual `make dbt-run` or `make train-ml` seems to hang:** it is waiting for the scheduled run
@@ -594,7 +683,7 @@ jet-engine-lakehouse/
 │   ├── schemas/engine_sensor_frame.avsc  # Avro contract of the HF sensor frames
 │   ├── minio/init-buckets.sh       # lakehouse bucket, medallion zones, raw-frame expiry
 │   ├── clickhouse/                 # raw/serving DDL (init-db.sql), read-only Grafana user, verify.sql
-│   └── grafana/                    # image with the ClickHouse plugin, datasource, 4 dashboards
+│   └── grafana/                    # image with the ClickHouse plugin, datasource, 5 dashboards
 ├── simulator/                      # fleet physics, Postgres writer, HF frame producer, load test
 ├── streaming/                      # Spark Structured Streaming: Kafka -> MinIO + ClickHouse, FFT features
 ├── analytics/                      # dbt-clickhouse project: silver + gold models and tests
@@ -623,7 +712,10 @@ jet-engine-lakehouse/
   ClickHouse with synthetic CDC (duplicates, updates, deletes, late rows) and the matching
   high-frequency frame features (dropped frames, NaN features, absent process keys, redelivered,
   late and corrected copies, a bearing spall), checks every spectral feature against an
-  independent Python reference and proves that the incremental models equal a full refresh.
+  independent Python reference, rebuilds the SCD2 status history and every reliability KPI in
+  Python and compares them value by value (failures and repairs, an out-of-order and a replayed
+  registry version, a deregistration, history written behind its registration), and proves that
+  the incremental models equal a full refresh.
 - **Lint:** `make lint` (ruff check + format check).
 
 ## Production hardening notes
