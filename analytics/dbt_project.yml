@@ -1,10 +1,14 @@
 # dbt-clickhouse project of the jet-engine lakehouse.
 #
 #   silver: stg_* (deduplicated CDC images and HF frame features), int_* (lifecycles, rolling
-#           sensor features, rolling spectral features of the HF frames) and int_ml_features
-#           (the ML feature vector: sensor + spectral features of every pulse)
+#           sensor features, rolling spectral features of the HF frames, the SCD Type 2 status
+#           history of every engine) and int_ml_features (the ML feature vector: sensor +
+#           spectral features of every pulse)
 #   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs),
-#           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest)
+#           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest),
+#           fct_engine_failures, fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily +
+#           rpt_failure_mode_pareto (reliability: availability, MTBF, MTTR, failure modes)
+#   exposures (models/exposures.yml): the Grafana dashboards and the RUL model
 #
 # Every table model is a ReplacingMergeTree so that consumers can always read it with FINAL;
 # incremental models rely on FINAL for correctness. int_ml_features is a view over FINAL reads

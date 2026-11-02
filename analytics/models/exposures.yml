@@ -1,0 +1,123 @@
+version: 2
+
+# Consumers of the dbt project outside dbt: the five provisioned Grafana dashboards
+# (infrastructure/grafana/dashboards/*.json, read through the read-only ClickHouse datasource) and
+# the RUL model (data_science/). depends_on lists every model and source their queries read, so
+# `dbt ls --select +exposure:<name>` and the docs lineage graph show what a change upstream
+# breaks. Keep a dashboard's list in step with its JSON when a panel starts reading another table.
+
+exposures:
+  - name: fleet_health_dashboard
+    label: Fleet Health & Remaining Useful Life
+    type: dashboard
+    maturity: high
+    url: http://localhost:3000/d/jet-engine-fleet-health
+    description: >
+      Operations board (infrastructure/grafana/dashboards/fleet-health-rul.json): status, health
+      score, the calibrated anomaly flags and the RUL prediction aged to the current cycle of every
+      engine, live 1 Hz sensors, the status timeline, work orders and failures by mode.
+    depends_on:
+      - ref('fct_engine_health_status')
+      - source('engine_raw', 'gold_engine_rul_predictions')
+      - source('engine_raw', 'ml_model_runs')
+      - source('engine_raw', 'raw_engine_status_registry')
+      - source('engine_raw', 'raw_engine_telemetry')
+      - source('engine_raw', 'raw_maintenance_log')
+    owner:
+      name: Jet Engine Lakehouse maintainers
+
+  - name: fleet_reliability_dashboard
+    label: Fleet Reliability
+    type: dashboard
+    maturity: medium
+    url: http://localhost:3000/d/jet-engine-fleet-reliability
+    description: >
+      Maintenance-engineering board (infrastructure/grafana/dashboards/fleet-reliability.json):
+      availability, failures, MTBF and MTTR per engine and per day, time in each status, the
+      failure-mode Pareto and the SCD2 status timeline.
+    depends_on:
+      - ref('int_engine_status_history')
+      - ref('fct_engine_failures')
+      - ref('fct_engine_lifecycle_status_time')
+      - ref('rpt_fleet_reliability_daily')
+      - ref('rpt_failure_mode_pareto')
+      - source('engine_raw', 'raw_engine_status_registry')
+    owner:
+      name: Jet Engine Lakehouse maintainers
+
+  - name: vibration_analytics_dashboard
+    label: Vibration Analytics (HF Sensor Frames)
+    type: dashboard
+    maturity: high
+    url: http://localhost:3000/d/jet-engine-vibration
+    description: >
+      High-frequency board (infrastructure/grafana/dashboards/vibration-analytics.json): bearing
+      defect tone, kurtosis, crest factor and core unbalance per engine, the oil system and the
+      EGT sensor split, read from the HF frame features as they land.
+    depends_on:
+      - source('engine_raw', 'raw_engine_hf_features')
+      - source('engine_raw', 'raw_engine_status_registry')
+    owner:
+      name: Jet Engine Lakehouse maintainers
+
+  - name: data_platform_dashboard
+    label: Data Platform & CDC Pipeline
+    type: dashboard
+    maturity: high
+    url: http://localhost:3000/d/jet-engine-data-platform
+    description: >
+      Platform board (infrastructure/grafana/dashboards/data-platform.json): CDC ingest rate and
+      latency, dead letters, freshness of every stage, the HF path's throughput and coverage, and
+      the reconciliation audit. Its storage panel also reads system.parts, which is not modelled.
+    depends_on:
+      - ref('stg_engine_telemetry')
+      - ref('int_sensor_rolling_features')
+      - ref('fct_engine_health_status')
+      - ref('rpt_model_live_performance')
+      - source('engine_raw', 'raw_engine_telemetry')
+      - source('engine_raw', 'raw_engine_status_registry')
+      - source('engine_raw', 'raw_maintenance_log')
+      - source('engine_raw', 'raw_cdc_dead_letter')
+      - source('engine_raw', 'raw_engine_hf_features')
+      - source('engine_raw', 'hf_ingest_batches')
+      - source('engine_raw', 'gold_engine_rul_predictions')
+      - source('engine_raw', 'ml_model_runs')
+      - source('engine_raw', 'ops_reconciliation')
+    owner:
+      name: Jet Engine Lakehouse maintainers
+
+  - name: model_operations_dashboard
+    label: Model Operations & Live Backtest
+    type: dashboard
+    maturity: high
+    url: http://localhost:3000/d/jet-engine-model-ops
+    description: >
+      MLOps board (infrastructure/grafana/dashboards/model-operations.json): the production model,
+      every training run with its promotion decision, calibration, and live versus holdout
+      performance against failures that happened later.
+    depends_on:
+      - ref('fct_rul_prediction_backtest')
+      - ref('rpt_model_live_performance')
+      - source('engine_raw', 'gold_engine_rul_predictions')
+      - source('engine_raw', 'ml_model_runs')
+    owner:
+      name: Jet Engine Lakehouse maintainers
+
+  - name: rul_model
+    label: RUL model (XGBoost regressor + failure classifier)
+    type: ml
+    maturity: high
+    description: >
+      Remaining-useful-life model of data_science/. train_rul_model.py trains on
+      mart_rul_training_features (or its gold snapshot in the lake), records every run in
+      ml_model_runs and promotes a champion; predict_rul.py scores the newest int_ml_features row
+      of every engine's current lifecycle (int_engine_lifecycles), with the registry's status,
+      and appends to gold_engine_rul_predictions, which fct_engine_health_status and the live
+      backtest (fct_rul_prediction_backtest) read back.
+    depends_on:
+      - ref('mart_rul_training_features')
+      - ref('int_ml_features')
+      - ref('int_engine_lifecycles')
+      - source('engine_raw', 'raw_engine_status_registry')
+    owner:
+      name: Jet Engine Lakehouse maintainers

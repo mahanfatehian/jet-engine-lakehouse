@@ -9,7 +9,10 @@ sources:
       is_deleted, kafka_partition, kafka_offset and the server-assigned ingested_at.
       raw_engine_hf_features and hf_ingest_batches are written by the same job from the Avro
       high-frequency (HF) sensor frames (CONTRACT_V2.md); they carry no CDC metadata.
-      gold_engine_rul_predictions is written by data_science/predict_rul.py.
+      gold_engine_rul_predictions is written by data_science/predict_rul.py, ml_model_runs by
+      data_science/train_rul_model.py and ops_reconciliation by data_science/reconcile_lakehouse.py;
+      raw_cdc_dead_letter, ml_model_runs and ops_reconciliation are read by no model, only by the
+      dashboards (models/exposures.yml), and are declared here for the lineage.
     schema: "{{ env_var('CLICKHOUSE_DB', 'iot_engine') }}"
     loader: spark-structured-streaming
     tables:
@@ -296,3 +299,52 @@ sources:
             description: Processing time of the batch (ms).
           - name: ingested_at
             description: Server time the batch row landed in ClickHouse.
+
+      - name: raw_cdc_dead_letter
+        description: >
+          CDC records and HF frames the Spark job could not parse, with the reason (MergeTree, TTL
+          30 days). Read by the Data Platform dashboard only.
+        columns:
+          - name: kafka_topic
+            description: Topic of the record.
+          - name: kafka_partition
+            description: Kafka partition of the record.
+          - name: kafka_offset
+            description: Kafka offset of the record.
+          - name: error
+            description: Why the record could not be parsed.
+          - name: ingested_at
+            description: Server time the row landed in ClickHouse.
+
+      - name: ml_model_runs
+        description: >
+          One row per training run of the RUL model (MergeTree), written by
+          data_science/train_rul_model.py: holdout metrics, data volume and the promotion decision.
+          Read by the Fleet Health, Model Operations and Data Platform dashboards.
+        columns:
+          - name: model_version
+            description: rul-YYYYMMDDTHHMMSSZ of the run.
+          - name: trained_at
+            description: Training time (UTC).
+          - name: rmse
+            description: Holdout RMSE of the RUL regressor (cycles).
+          - name: promoted
+            description: 1 when the run became the production model.
+
+      - name: ops_reconciliation
+        description: >
+          Reconciliation audit (MergeTree, TTL 30 days), written by
+          data_science/reconcile_lakehouse.py: per run, layer, engine and hour of event time the
+          pulses the PostgreSQL source committed and the pulses the layer holds (OK, MISSING or
+          EXTRA). Read by the Data Platform dashboard.
+        columns:
+          - name: run_at
+            description: Time of the reconciliation run (UTC); the latest run has the highest run_at.
+          - name: layer
+            description: raw, staging, silver or hf_frames.
+          - name: engine_id
+            description: Engine of the cell.
+          - name: event_hour
+            description: Hour of event time of the cell.
+          - name: status
+            description: OK, MISSING or EXTRA.

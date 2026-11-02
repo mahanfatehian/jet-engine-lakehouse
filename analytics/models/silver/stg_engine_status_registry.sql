@@ -51,10 +51,11 @@ with source_versions as (
 
 deduplicated as (
 
-    -- the same change can be delivered more than once (at-least-once streaming)
+    -- the same change can be delivered more than once (at-least-once streaming); the first copy
+    -- to land is kept, the one an incremental run published, so a full refresh reproduces it
     select *
     from source_versions
-    order by engine_id, cdc_lsn, ingested_at desc
+    order by engine_id, cdc_lsn, ingested_at
     limit 1 by engine_id, cdc_lsn
 
 )

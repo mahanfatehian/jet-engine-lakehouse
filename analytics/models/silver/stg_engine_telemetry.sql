@@ -58,10 +58,12 @@ with source_versions as (
 
 latest_versions as (
 
-    -- replays and successive updates of one pulse can land in the same batch
+    -- replays and successive updates of one pulse can land in the same batch: the newest version
+    -- wins, in its first copy to land (an incremental run skips later replays of a published
+    -- version, so a full refresh keeps the same copy)
     select *
     from source_versions
-    order by engine_id, telemetry_id, cdc_lsn desc, ingested_at desc
+    order by engine_id, telemetry_id, cdc_lsn desc, ingested_at
     limit 1 by engine_id, telemetry_id
 
 ){% if is_incremental() %},

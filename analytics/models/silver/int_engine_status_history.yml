@@ -1,0 +1,120 @@
+version: 2
+
+models:
+  - name: int_engine_status_history
+    description: >
+      SCD Type 2 status history of every engine, built from the CDC change log of
+      engine_status_registry (stg_engine_status_registry keeps every version, so no dbt snapshot
+      is needed): one row per engine and status interval [valid_from, valid_to), valid_to NULL
+      while the interval is open (is_current = 1). Versions are read in log order (cdc_lsn) under
+      FINAL, so replays and out-of-order arrival change nothing; the progress updates of one
+      status fold into its interval. A delete of the registry row (the engine was deregistered)
+      closes the open interval at its commit time (closed_by_delete = 1) and the engine has no
+      interval until it is registered again. valid_from is the source's status_changed_ts (event
+      time), made monotonic per engine: a change the source backdated before earlier ones (the
+      first-boot backfill writes its history behind the registration row) supersedes them, so an
+      engine's intervals never overlap and, apart from deregistrations, tile its history without
+      gaps; intervals left without duration are dropped. Engine history before the CDC connector
+      existed is not in the log: it starts at the connector's initial snapshot (entry_cdc_op = 'r').
+      Table (rebuilt every run: every engine writes a registry version per cycle, so an
+      incremental model keyed by engine would recompute every engine on every run anyway, and a
+      late or backdated version can move intervals anywhere in an engine's history; the rebuild
+      equals a full refresh by construction) on ReplacingMergeTree ordered by (engine_id,
+      valid_from); rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["reliability"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'valid_from']
+      - expression_is_true:
+          name: int_engine_status_history_intervals_consistent
+          arguments:
+            expression: >
+              (is_current = 1) = isNull(valid_to)
+              and isNull(valid_to) = isNull(duration_seconds)
+              and (isNull(valid_to) or (valid_to > valid_from and duration_seconds > 0))
+              and not (is_current = 1 and closed_by_delete = 1)
+              and is_available = (operational_status in ('HEALTHY', 'WARNING', 'CRITICAL'))
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model of the registry version that opened the interval.
+      - name: operational_status
+        data_type: LowCardinality(String)
+        description: Registry status during the interval.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HEALTHY', 'WARNING', 'CRITICAL', 'FAILURE', 'MAINTENANCE_RESET']
+      - name: is_available
+        data_type: UInt8
+        description: >
+          1 when the engine is in service in this status (HEALTHY, WARNING, CRITICAL), 0 when it
+          is not (FAILURE: under repair; MAINTENANCE_RESET: repaired and reset into its next
+          lifecycle, not flown yet). The numerator of availability.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: lifecycle_id
+        data_type: UInt32
+        description: >
+          Registry lifecycle when the interval began (current_lifecycle_id): FAILURE belongs to
+          the lifecycle that failed, MAINTENANCE_RESET to the one the repair starts.
+      - name: cycle_at_entry
+        data_type: UInt32
+        description: >
+          Registry cycle (current_cycle) of the version that opened the interval: the cycle at
+          which the status was entered, except for an interval opened by the connector's initial
+          snapshot (entry_cdc_op = 'r'), where it is the cycle at the snapshot.
+      - name: valid_from
+        data_type: "DateTime64(6, 'UTC')"
+        description: >
+          Start of the interval: status_changed_ts of the version that opened it (event time),
+          or an earlier boundary's time when a later change was backdated before it.
+        data_tests:
+          - not_null
+      - name: valid_to
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: >
+          End of the interval (exclusive): valid_from of the next interval, or the commit time
+          of the delete that deregistered the engine; NULL while the interval is open.
+      - name: is_current
+        data_type: UInt8
+        description: 1 for the open interval, the engine's current status; at most one per engine, none once deregistered.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: duration_seconds
+        data_type: Nullable(Float64)
+        description: valid_to - valid_from in seconds; NULL while the interval is open.
+        data_tests:
+          - non_negative
+      - name: closed_by_delete
+        data_type: UInt8
+        description: >
+          1 when a delete of the registry row ended the interval (the engine was deregistered):
+          the next interval, if any, starts when the engine is registered again.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: entry_cdc_op
+        data_type: LowCardinality(String)
+        description: >
+          Debezium operation of the version that opened the interval: c (registration), u
+          (status change) or r (the connector's initial snapshot; what preceded it is unknown).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['c', 'u', 'r']
+      - name: entry_cdc_lsn
+        data_type: UInt64
+        description: Log sequence number of the version that opened the interval.
