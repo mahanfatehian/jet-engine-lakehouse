@@ -9,9 +9,9 @@ pyspark==3.5.9
 clickhouse-connect==1.11.0
 # mapInPandas feature extraction of the high-frequency frames: the latest releases that
 # PySpark 3.5 supports (it predates pandas 3 and numpy 2).
-pandas==2.2.3
-numpy==1.26.4
-pyarrow==17.0.0
+pandas==3.1.0
+numpy==2.5.4
+pyarrow==26.0.0
 
 # Transitive runtime dependencies
 backports-zstd==1.8.0  # clickhouse-connect (Python < 3.14)
