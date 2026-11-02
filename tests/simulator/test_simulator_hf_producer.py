@@ -15,7 +15,7 @@ import hf_producer
 import pytest
 from hf_config import HfConfig
 from hf_producer import Counters, FramePublisher, backoff_delay, metrics_line
-from hf_queue import FrameQueue
+from hf_queue import BACKFILL_SHARE, FrameQueue
 
 FRAME_BYTES = 100_000
 CONFIG = HfConfig(queue_max_mb=1)  # a 1 MiB budget holds ten 100 kB frames
@@ -273,7 +273,9 @@ def test_close_produces_queued_live_frames_and_discards_unsent_backfill(
     totals = publisher.stats.snapshot()
     assert sink.labels() == [f"CFM56-105#{seq}" for seq in range(1, 6)] and sink.closed
     assert (totals.produced, totals.discarded) == (5, 50)
-    assert "Shutdown: 50 queued backfill frames discarded" in caplog.text
+    assert "Shutdown: 50 queued backfill frames discarded; the next start queues them again" in caplog.text
+    assert "HF backfill frames Kafka has not acknowledged (the next start queues these" in caplog.text
+    assert "again): GE90-202 50" in caplog.text and publisher.ledger.take_paid() == []
     assert (
         "HF publisher stopped: 5 frames produced (0.5 MB), 0 dropped, 0 failed, 50 discarded" in caplog.text
     )
@@ -388,3 +390,64 @@ def test_an_unexpected_worker_error_never_reaches_the_tick_thread(
     publisher.close(timeout=0.1)
     assert "HF publisher stopped by an unexpected error" in caplog.text
     assert publisher.stats.snapshot().dropped == 2, "frames queue up to the budget, then drop"
+
+
+def test_a_backfill_is_paid_only_once_kafka_acknowledged_every_frame_of_its_engine() -> None:
+    sink = FakeSink(up=False)  # the client takes every frame, Kafka acknowledges none yet
+    publisher = publisher_with(sink)
+    assert publisher.wait_until_ready()
+    publisher.submit_backfill(frames("JT9D-001", 1, 3) + frames("GE90-201", 1, 2))
+    publisher.submit(frames("CFM56-104", 1, 2))
+    pump_all(publisher)
+    assert len(sink.pending) == 7 and publisher.ledger.take_paid() == [], "handed to the client is not paid"
+    assert publisher.ledger.owed() == {"GE90-201": 2, "JT9D-001": 3}, "live frames owe nothing"
+    sink.up = True
+    publisher.pump()  # serves the delivery reports
+    assert publisher.ledger.take_paid() == ["JT9D-001", "GE90-201"] and publisher.ledger.owed() == {}
+    assert publisher.ledger.take_paid() == [], "each engine is reported once"
+    assert publisher.ledger.queued("JT9D-001") and not publisher.ledger.queued("CFM56-104")
+
+
+def test_a_failed_backfill_frame_keeps_its_engine_owed_for_the_next_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(hf_producer, "BUFFER_RETRIES", 2)
+    monkeypatch.setattr(hf_producer, "BUFFER_RETRY_SECONDS", 0.0)
+    sink = FakeSink()
+    publisher = publisher_with(sink, FakeBuilder(fail_on=frozenset({2})))
+    assert publisher.wait_until_ready()
+    publisher.submit_backfill(frames("JT9D-001", 1, 3) + frames("GE90-201", 3, 2))  # JT9D-001#2 cannot build
+    pump_all(publisher)
+    sink.buffer_errors = 99  # the client refuses CFM56-104's frame for good
+    publisher.submit_backfill(frames("CFM56-104", 3, 1))
+    pump_all(publisher)
+    sink.buffer_errors, sink.fail_deliveries = 0, True  # Kafka rejects GE90-202's frame
+    publisher.submit_backfill(frames("GE90-202", 3, 1))
+    pump_all(publisher)
+    assert publisher.ledger.take_paid() == ["GE90-201"]
+    assert publisher.ledger.owed() == {"CFM56-104": 1, "GE90-202": 1, "JT9D-001": 1}
+    with caplog.at_level(logging.WARNING, logger="hf_producer"):
+        publisher.close(timeout=0.1)
+    assert "these backfills again): CFM56-104 1, GE90-202 1, JT9D-001 1" in caplog.text
+
+
+def test_live_frames_keep_flowing_while_a_resumed_backfill_drains() -> None:
+    sink = FakeSink(up=False)
+    publisher = publisher_with(sink)
+    assert publisher.wait_until_ready()
+    publisher.submit_backfill(frames("JT9D-001", 1, 40))  # a resumed history: four budgets' worth
+    peak_in_flight = 0
+    for second in range(1, 31):  # one live frame per tick; Kafka acknowledges once per tick
+        publisher.submit(frames("CFM56-104", second, 1))
+        pump_all(publisher)
+        if publisher.queue.depth()[1]:
+            peak_in_flight = max(peak_in_flight, publisher.queue.in_flight_bytes)
+        sink.up = True
+        publisher.pump()
+        sink.up = False
+    assert publisher.stats.snapshot().dropped == 0, "the backfill never takes the live frames' budget"
+    assert peak_in_flight <= BACKFILL_SHARE * publisher.queue.budget_bytes
+    labels = sink.labels()
+    assert labels[:40] == [f"JT9D-001#{seq}" for seq in range(1, 41)], "commit order"
+    assert labels[40:] == [f"CFM56-104#{seq}" for seq in range(1, 31)]
+    assert publisher.ledger.take_paid() == ["JT9D-001"]

@@ -2,10 +2,11 @@
 
 Every connection first takes the single-writer lease (fleet_lease), so a second simulator never writes
 next to this one. Writes arrive as ordered (operation, payload) lists that fleet_writer executes in
-exactly ONE transaction. The simulator also owns ``simulator_lifecycle_params`` (created here at start-up,
-so existing volumes migrate on their own): the SIM_* values each lifecycle was generated with, which
-let a restart re-derive an in-progress lifecycle exactly. Debezium does not capture it: the publication
-and the connector's table.include.list name the three CDC tables explicitly.
+exactly ONE transaction. The simulator also owns two tables (created here at start-up, so existing
+volumes migrate on their own): ``simulator_lifecycle_params``, the SIM_* values each lifecycle was
+generated with, which let a restart re-derive an in-progress lifecycle exactly, and
+``simulator_hf_backfill``, the HF frames a backfilled history still owes (hf_backfill). Debezium captures
+neither: the publication and the connector's table.include.list name the three CDC tables explicitly.
 """
 
 from __future__ import annotations
@@ -16,11 +17,12 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import psycopg2
 from fleet_config import GenerationSettings
 from fleet_lease import WriterLease
+from fleet_runtime import HfBackfillMarker
 from fleet_writer import FleetStateError, FleetWriter
 from psycopg2.extras import execute_values
 
@@ -53,6 +55,17 @@ COMMENT ON TABLE simulator_lifecycle_params IS
     'Simulator-owned (not captured by CDC): SIM_SEED, SIM_MEAN_LIFE_CYCLES and SIM_PULSES_PER_CYCLE each '
     'engine lifecycle was generated with, so a restart re-derives it exactly after those settings change.'"""
 
+HF_BACKFILL_DDL = """
+CREATE TABLE IF NOT EXISTS simulator_hf_backfill (
+    engine_id      VARCHAR(32) PRIMARY KEY REFERENCES engine_status_registry (engine_id),
+    frames         INTEGER     NOT NULL CHECK (frames >= 1),
+    last_event_ts  TIMESTAMPTZ NOT NULL,
+    created_ts     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE simulator_hf_backfill IS
+    'Simulator-owned (not captured by CDC): the HF frames a backfilled engine history still owes, one per '
+    'telemetry row up to last_event_ts; deleted once Kafka has acknowledged every one of them.'"""
+
 REGISTER_ENGINES_SQL = """
 INSERT INTO engine_status_registry
     (engine_id, engine_model, operational_status, current_lifecycle_id, current_cycle, wear_factor)
@@ -77,6 +90,14 @@ SELECT r.operational_status, r.current_lifecycle_id, r.current_cycle, r.cycles_s
 
 TELEMETRY_COUNTS_SQL = """
 SELECT engine_id, count(*) FROM engine_telemetry WHERE engine_id = ANY(%s) GROUP BY engine_id"""
+
+HF_BACKFILL_MARKERS_SQL = """
+SELECT engine_id, frames, last_event_ts FROM simulator_hf_backfill ORDER BY engine_id"""
+
+ENGINE_SETTINGS_SQL = """
+SELECT lifecycle_id, seed, mean_life_cycles, pulses_per_cycle
+  FROM simulator_lifecycle_params
+ WHERE engine_id = %s"""
 
 
 class DatabaseConnectionError(RuntimeError):
@@ -142,6 +163,39 @@ class EngineSnapshot:
     last_event_ts: datetime | None
     settings: GenerationSettings | None
     work_order: WorkOrder | None
+
+
+class StoredPulse(NamedTuple):
+    """One engine_telemetry row as the HF backfill resume reads it."""
+
+    telemetry_id: int
+    lifecycle_id: int
+    cycle_number: int
+    event_ts: datetime
+    rpm: float
+    core_temp_c: float
+    egt_c: float
+    vibration_mm_s: float
+    fuel_flow_kg_h: float
+    oil_pressure_psi: float
+    wear_factor: float
+    status: str
+
+
+BACKFILLED_ROWS_SQL = f"""
+SELECT {", ".join(StoredPulse._fields)}
+  FROM engine_telemetry
+ WHERE engine_id = %s AND event_ts <= %s
+ ORDER BY event_ts"""
+
+
+@dataclass(frozen=True)
+class BackfilledHistory:
+    """The telemetry rows a marker covers, in event order, and the recorded settings of the engine's
+    lifecycles by lifecycle_id."""
+
+    rows: list[StoredPulse]
+    settings: dict[int, GenerationSettings]
 
 
 def backoff_delay(attempt: int) -> float:
@@ -260,6 +314,7 @@ class FleetDatabase:
 
         def work(cur: cursor) -> None:
             cur.execute(LIFECYCLE_PARAMS_DDL)
+            cur.execute(HF_BACKFILL_DDL)
 
         self._with_retry(work, "schema check")
 
@@ -314,3 +369,39 @@ class FleetDatabase:
             settings=settings,
             work_order=WorkOrder(*order) if order[0] is not None else None,
         )
+
+    def hf_backfill_markers(self) -> list[HfBackfillMarker]:
+        """Every engine whose backfilled history still owes HF frames."""
+
+        def work(cur: cursor) -> list[tuple[Any, ...]]:
+            cur.execute(HF_BACKFILL_MARKERS_SQL)
+            return cur.fetchall()
+
+        rows = self._with_retry(work, "HF backfill markers")
+        return [HfBackfillMarker(engine_id, int(frames), last_ts) for engine_id, frames, last_ts in rows]
+
+    def backfilled_history(self, marker: HfBackfillMarker) -> BackfilledHistory:
+        """The engine's telemetry rows up to the marker's last event and its recorded lifecycle settings."""
+
+        def work(cur: cursor) -> BackfilledHistory:
+            cur.execute(BACKFILLED_ROWS_SQL, (marker.engine_id, marker.last_event_ts))
+            rows = [StoredPulse(*row) for row in cur.fetchall()]
+            cur.execute(ENGINE_SETTINGS_SQL, (marker.engine_id,))
+            settings = {
+                lifecycle_id: GenerationSettings(int(seed), float(mean_life), pulses_per_cycle)
+                for lifecycle_id, seed, mean_life, pulses_per_cycle in cur.fetchall()
+            }
+            return BackfilledHistory(rows, settings)
+
+        return self._with_retry(work, f"backfilled history of {marker.engine_id}")
+
+    def clear_hf_backfill(self, engine_ids: Sequence[str]) -> bool:
+        """Delete the markers of ``engine_ids`` in one transaction on the open connection.
+
+        Never connects: without an open connection, or after a transient error, it returns False and the
+        caller tries again later, so neither a tick nor a shutdown waits for PostgreSQL here. A marker left
+        behind only makes the next start send those frames once more.
+        """
+        if self._conn is None or self._conn.closed:
+            return False
+        return self.execute([("clear_hf_backfill", list(engine_ids))]) is not None

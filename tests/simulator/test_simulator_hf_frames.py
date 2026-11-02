@@ -8,6 +8,7 @@ import io
 import json
 import sys
 import types
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,17 @@ def test_waveforms_and_process_channels_are_packed_little_endian_float32() -> No
         == np.array([1.5, -2.25], dtype="<f4").tobytes()
         == pack_samples([1.5, -2.25])
     )
+
+
+def test_a_frame_is_a_function_of_its_request_so_a_rebuild_is_byte_identical() -> None:
+    first, failing = request(), request(mode="BEARING_DEGRADATION", wear=0.9)
+    neighbour = replace(first, telemetry_id=first.telemetry_id + 1, frame_seq=first.frame_seq + 1)
+    built = [FrameBuilder(CONFIG, seed=42).build(r) for r in (first, failing, neighbour)]
+    rebuilder = FrameBuilder(CONFIG, seed=42)
+    rebuilt = [rebuilder.build(r) for r in (neighbour, failing, first)]  # another order, other frames first
+    assert rebuilt == built[::-1], "a resumed backfill rebuilds the very same bytes"
+    assert built[2]["vibration"] != built[0]["vibration"], "every pulse draws its own noise"
+    assert FrameBuilder(CONFIG, seed=43).build(first)["process"] != built[0]["process"]
 
 
 def test_frame_start_is_the_exact_event_time_in_epoch_microseconds() -> None:

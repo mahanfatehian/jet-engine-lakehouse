@@ -18,12 +18,12 @@ unacknowledged at shutdown). The frame_seq of a lost frame is never reused, so c
 gap. A fatal producer error (the idempotent producer cannot continue) replaces the client through the sink
 factory, so a broken client never silences the path for good.
 
-The first-boot backfill is best effort too, and a loss there is final. fleet_bootstrap backfills an engine
-only while it has no telemetry, and the requests for its history's frames live only in this process, so
-backfill frames that are still queued or unacknowledged at shutdown, or discarded with a client a fatal
-error replaced, are never re-created: those pulses keep no HF features for good (the 1 Hz history is
-complete either way). Resuming them would need a per-engine marker
-in PostgreSQL, cleared once Kafka has acknowledged every frame of the engine's history.
+Losses of backfilled history are not final. Each engine's backfill transaction records the frames its
+history owes in simulator_hf_backfill; ``ledger`` (hf_backfill.BackfillLedger) counts the successful delivery
+reports of every engine's backfill frames, and once all of an engine's have arrived the main thread deletes
+its marker. Backfill frames still queued or unacknowledged at shutdown, failed, or discarded with a client
+a fatal error replaced leave the marker in place, and the next start rebuilds them from PostgreSQL with
+their original frame_seq, which closes those gaps.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Protocol
 
+from hf_backfill import BackfillLedger
 from hf_queue import FrameQueue
 
 if TYPE_CHECKING:
@@ -146,6 +147,7 @@ class FramePublisher:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.stats = PublisherStats()
+        self.ledger = BackfillLedger()
         self.waiting_for: str | None = "the first readiness check"
         self._config = config
         self._builder = builder
@@ -196,7 +198,9 @@ class FramePublisher:
             logger.info("HF buffer has room again: frames are queued again")
 
     def submit_backfill(self, requests: Sequence[FrameRequest]) -> None:
-        """Queue the frames of a backfilled history (never dropped for a full budget)."""
+        """Queue the frames of a backfilled history (never dropped for a full budget); the ledger then
+        expects a delivery report for each."""
+        self.ledger.expect(request.engine_id for request in requests)
         self._queue.extend_backfill(requests)
 
     def close(self, timeout: float = SHUTDOWN_SECONDS) -> None:
@@ -211,6 +215,13 @@ class FramePublisher:
             self._thread.join(timeout + READY_TIMEOUT_SECONDS + JOIN_MARGIN_SECONDS)
             if self._thread.is_alive():
                 logger.warning("HF publisher did not stop in time; exiting without it")
+        owed = self.ledger.owed()
+        if owed:
+            logger.warning(
+                "HF backfill frames Kafka has not acknowledged (the next start queues these backfills "
+                "again): %s",
+                ", ".join(f"{engine_id} {frames}" for engine_id, frames in owed.items()),
+            )
         totals = self.stats.snapshot()
         logger.info(
             "HF publisher stopped: %d frames produced (%.1f MB), %d dropped, %d failed, %d discarded",
@@ -285,11 +296,11 @@ class FramePublisher:
         if item is None:
             self._sink.poll(IDLE_POLL_SECONDS)
             return False
-        self._send(self._sink, item.request)
+        self._send(self._sink, item.request, item.backfill)
         self._sink.poll(0)
         return True
 
-    def _send(self, sink: FrameSink, request: FrameRequest) -> None:
+    def _send(self, sink: FrameSink, request: FrameRequest, backfill: bool = False) -> None:
         try:
             value = sink.serialize(self._builder.build(request))
         except Exception as exc:
@@ -298,7 +309,7 @@ class FramePublisher:
         size = len(value)
         self.stats.add(serialized=1, serialized_bytes=size)
         self._queue.in_flight(size)
-        callback = functools.partial(self._delivered, size)
+        callback = functools.partial(self._delivered, size, request.engine_id if backfill else None)
         for _ in range(BUFFER_RETRIES):
             try:
                 sink.produce(request.engine_id.encode(), value, callback)
@@ -312,12 +323,14 @@ class FramePublisher:
         self._queue.settled(size)
         self._failed(f"the Kafka client queue stayed full; a frame of {request.engine_id} was lost")
 
-    def _delivered(self, size: int, error: Any, _message: Any) -> None:
+    def _delivered(self, size: int, backfill_engine: str | None, error: Any, _message: Any) -> None:
         self._queue.settled(size)
-        if error is None:
-            self.stats.add(produced=1, produced_bytes=size)
-        else:
+        if error is not None:
             self._failed(f"frame delivery failed: {error}")
+            return
+        self.stats.add(produced=1, produced_bytes=size)
+        if backfill_engine is not None:
+            self.ledger.acknowledged(backfill_engine)
 
     def _failed(self, message: str) -> None:
         self.stats.add(failed=1)
@@ -354,8 +367,8 @@ class FramePublisher:
         backfill = self._queue.discard_backfill()
         if backfill:
             logger.warning(
-                "Shutdown: %d queued backfill frames discarded; those historical pulses stay without HF "
-                "features for good (a restart backfills only engines without telemetry)",
+                "Shutdown: %d queued backfill frames discarded; the next start queues them again from "
+                "PostgreSQL",
                 backfill,
             )
         self.stats.add(discarded=backfill)
@@ -380,7 +393,7 @@ class FramePublisher:
             if item is None:
                 sink.poll(IDLE_POLL_SECONDS)
             else:
-                self._send(sink, item.request)
+                self._send(sink, item.request, item.backfill)
                 sink.poll(0)
 
 

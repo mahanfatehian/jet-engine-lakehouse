@@ -390,7 +390,8 @@ def test_a_disabled_path_loads_neither_the_publisher_nor_the_kafka_client() -> N
         "import engine_generator, hf_runtime\n"
         "from hf_config import HfConfig\n"
         "path = hf_runtime.open_hf_path(HfConfig(enabled=False), 42, None, {'JT9D-001': 'JT9D-7R4'})\n"
-        "assert path.live is None and path.backfill is None\n"
+        "assert path.live is None and path.backfill is None and not path.marks_backfill\n"
+        "path.resume_backfill(None, None)  # never reads the store: its markers wait for an enabled start\n"
         "path.close()\n"
         "loaded = {name.split('.')[0] for name in sys.modules}\n"
         "print(sorted(loaded & {'confluent_kafka', 'fastavro'}))\n"
@@ -477,7 +478,8 @@ def test_a_kafka_client_that_cannot_be_set_up_disables_only_the_hf_path(
 
     with caplog.at_level(logging.ERROR, logger="hf_runtime"):
         path = open_hf_path(HfConfig(), 42, CountingStore({}), {"JT9D-001": "JT9D-7R4"}, sink_factory=broken)
-    assert path == HfPath() and path.live is None
+    # Frames are still owed: a backfill records them, and a start with a working client sends them.
+    assert path == HfPath(marks_backfill=True) and path.live is None and path.backfill is None
     assert (
         "HF sensor frames disabled, the Kafka client cannot be set up: cannot read the HF frame schema"
         in caplog.text

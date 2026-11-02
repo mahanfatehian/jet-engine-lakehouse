@@ -17,8 +17,8 @@ Backfill requests always queue: they are a few hundred bytes each until built, a
 buffer would leave whole lifecycles without spectral features. The worker releases them to Kafka only while
 the in-flight bytes stay below BACKFILL_SHARE of the budget, so live frames queued behind a replay of history
 always keep the other part of the budget. The budget never drops backfill: queued backfill is discarded
-only at shutdown, and then for good (hf_producer); once handed to Kafka it can still fail, or be discarded
-with its client, like any frame.
+only at shutdown; once handed to Kafka it can still fail, or be discarded with its client, like any frame.
+Either way the frames stay owed in PostgreSQL and the next start queues them again (hf_backfill).
 """
 
 from __future__ import annotations

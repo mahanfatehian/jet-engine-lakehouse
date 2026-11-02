@@ -11,9 +11,10 @@ Backfill works per engine: every configured engine without any telemetry gets it
 transaction, so an interrupted first boot completes on the next start and an engine added to
 SIM_ENGINE_IDS later gets history too; an engine with telemetry is never backfilled again. Once an
 engine's history has committed, the optional commit hook receives it (high-frequency frames for every
-backfilled pulse, with backdated timestamps). That is the history's only pass through the hook: HF frames
-of it that never reach Kafka (the simulator stopped first) are not re-created on a later start, so those
-pulses keep no HF features; the HF path is best effort (hf_producer).
+backfilled pulse, with backdated timestamps). That is the history's only pass through the hook, so with
+the HF path enabled the same transaction also records the frames the history owes (simulator_hf_backfill):
+frames that have not reached Kafka when the simulator stops are rebuilt from the stored rows on a later
+start (hf_backfill), and the history never ends up without HF features because of an early stop.
 
 Like fleet_runtime, this module never imports engine_generator at runtime: engines are built by the
 factory that ``engine_generator.main`` hands in and are persisted through the fleet_db store.
@@ -31,6 +32,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from fleet_runtime import (
     CommitHook,
+    HfBackfillMarker,
     WriteOp,
     completion_at,
     failure_event,
@@ -238,6 +240,13 @@ def engine_history(engine: EngineSimulator, config: SimulatorConfig) -> list[tup
     return history
 
 
+def hf_backfill_marker(engine_id: str, writes: Sequence[WriteOp]) -> HfBackfillMarker | None:
+    """The HF frames a history owes: one per pulse it writes (None for a history without pulses)."""
+    stamps = [pulse.event_ts for name, payload in writes if name == "insert_pulses" for pulse in payload]
+    stamps += [payload.pulse.event_ts for name, payload in writes if name == "record_failure"]
+    return HfBackfillMarker(engine_id, len(stamps), max(stamps)) if stamps else None
+
+
 def _log_backfilled(engine_id: str, lifecycle_id: int, ops: Sequence[WriteOp]) -> None:
     rows = sum(len(payload) for name, payload in ops if name == "insert_pulses")
     failure = next((payload for name, payload in ops if name == "record_failure"), None)
@@ -260,13 +269,16 @@ def backfill_fleet(
     config: SimulatorConfig,
     stop_event: threading.Event,
     on_commit: CommitHook | None = None,
+    *,
+    mark_hf_backfill: bool = False,
 ) -> None:
     """Write the history of every engine in ``engines`` (engines without any telemetry).
 
     History looks exactly like an earlier live run: pulses one tick apart, repairs SIM_MAINTENANCE_SECONDS
     long, the same writes as the live loop. Each engine's history is ONE transaction, so an engine has
     either all of it or no telemetry at all; a shutdown request stops between engines and the next start
-    backfills the engines still without telemetry. ``on_commit`` receives each committed history.
+    backfills the engines still without telemetry. ``on_commit`` receives each committed history; with
+    ``mark_hf_backfill`` its transaction also records the HF frames it owes (module doc).
     """
     names = [engine.engine_id for engine in engines]
     logger.info(
@@ -282,6 +294,8 @@ def backfill_fleet(
             return
         history = engine_history(engine, config)
         writes = [op for _, ops in history for op in ops]
+        if mark_hf_backfill and (marker := hf_backfill_marker(engine.engine_id, writes)) is not None:
+            writes.append(("mark_hf_backfill", marker))
         results = store.execute_with_retry(writes)
         for lifecycle_id, ops in history:
             _log_backfilled(engine.engine_id, lifecycle_id, ops)
@@ -299,9 +313,10 @@ def bootstrap_fleet(
     allow_backfill: bool,
     stop_event: threading.Event,
     on_commit: CommitHook | None = None,
+    mark_hf_backfill: bool = False,
 ) -> list[EngineSimulator]:
     """Register the fleet, rebuild every twin from the database and backfill engines without telemetry
-    (``on_commit`` receives each committed engine history)."""
+    (``on_commit`` receives each committed engine history; ``mark_hf_backfill`` as in backfill_fleet)."""
     store.ensure_schema()
     created = store.register_engines(engine_models)
     logger.info("Engine registry ready: %d engines, %d newly registered", len(engine_models), created)
@@ -312,5 +327,5 @@ def bootstrap_fleet(
     if resumed:
         logger.info("Resuming fleet: %s", " | ".join(engine.describe() for engine in resumed))
     if backfilled:
-        backfill_fleet(backfilled, store, config, stop_event, on_commit)
+        backfill_fleet(backfilled, store, config, stop_event, on_commit, mark_hf_backfill=mark_hf_backfill)
     return [engine for engine, _ in restored]

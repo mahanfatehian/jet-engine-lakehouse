@@ -432,8 +432,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         hf = open_hf_path(hf_config, config.seed, store, models)
         engines = bootstrap_fleet(
-            store, config, factory, models, allow_backfill=backfill, stop_event=stop, on_commit=hf.backfill
+            store,
+            config,
+            factory,
+            models,
+            allow_backfill=backfill,
+            stop_event=stop,
+            on_commit=hf.backfill,
+            mark_hf_backfill=hf.marks_backfill,
         )
+        hf.resume_backfill(factory, stop)
         FleetRunner(engines, store, config, stop, hf.live).run(args.max_ticks)
     except (WriterLockError, ResumeMismatchError) as exc:
         logger.error("Refusing to write: %s", exc)

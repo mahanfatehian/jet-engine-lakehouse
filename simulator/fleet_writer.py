@@ -5,6 +5,7 @@
     engine_telemetry            every pulse                   maintenance_id stamped on WARNING..FAILURE rows
     maintenance_log             work order opened at failure  flagged-row count, repair completion
     simulator_lifecycle_params  settings of a new lifecycle   (simulator-owned, not captured by CDC)
+    simulator_hf_backfill       HF frames a history owes      DELETE once Kafka acknowledged them (ditto)
 
 Writes arrive as ordered (operation, payload) lists and each list runs in exactly ONE transaction, so a
 failure (telemetry row, work order, flags, registry) or a repair is never half visible downstream.
@@ -24,7 +25,13 @@ from fleet_runtime import RecordedFailure
 
 if TYPE_CHECKING:
     from engine_generator import Pulse
-    from fleet_runtime import FailureEvent, LifecycleSettings, MaintenanceCompletion, RegistryUpdate
+    from fleet_runtime import (
+        FailureEvent,
+        HfBackfillMarker,
+        LifecycleSettings,
+        MaintenanceCompletion,
+        RegistryUpdate,
+    )
     from psycopg2.extensions import cursor
 
 INSERT_PAGE_SIZE = 1000
@@ -100,6 +107,16 @@ ON CONFLICT (engine_id, lifecycle_id) DO UPDATE
    SET seed = EXCLUDED.seed, mean_life_cycles = EXCLUDED.mean_life_cycles,
        pulses_per_cycle = EXCLUDED.pulses_per_cycle, created_ts = now()"""
 
+# Written with an engine's backfilled history; a leftover marker can only belong to an engine whose
+# telemetry was deleted by hand (it would not be backfilled otherwise), so it owes nothing and is replaced.
+MARK_HF_BACKFILL_SQL = """
+INSERT INTO simulator_hf_backfill (engine_id, frames, last_event_ts)
+VALUES (%(engine_id)s, %(frames)s, %(last_event_ts)s)
+ON CONFLICT (engine_id) DO UPDATE
+   SET frames = EXCLUDED.frames, last_event_ts = EXCLUDED.last_event_ts, created_ts = now()"""
+
+CLEAR_HF_BACKFILL_SQL = "DELETE FROM simulator_hf_backfill WHERE engine_id = ANY(%s)"
+
 
 class FleetStateError(RuntimeError):
     """A write did not touch exactly the row it targets: database and simulator state disagree."""
@@ -138,6 +155,8 @@ class FleetWriter:
             "record_failure": self.record_failure,
             "update_registry": self.update_registry,
             "complete_maintenance": self.complete_maintenance,
+            "mark_hf_backfill": self.mark_hf_backfill,
+            "clear_hf_backfill": self.clear_hf_backfill,
         }
         return [handlers[name](payload) for name, payload in ops]
 
@@ -220,3 +239,14 @@ class FleetWriter:
         )
         self._cur.execute(REGISTRY_RESET_SQL, params)
         _require_one_row(self._cur, f"registry reset of {completion.engine_id}")
+
+    def mark_hf_backfill(self, marker: HfBackfillMarker) -> None:
+        """Record the HF frames an engine's backfilled history owes (in the history's own transaction)."""
+        self._cur.execute(
+            MARK_HF_BACKFILL_SQL,
+            {"engine_id": marker.engine_id, "frames": marker.frames, "last_event_ts": marker.last_event_ts},
+        )
+
+    def clear_hf_backfill(self, engine_ids: Sequence[str]) -> None:
+        """Delete the markers of engines whose backfill frames Kafka has all acknowledged."""
+        self._cur.execute(CLEAR_HF_BACKFILL_SQL, (list(engine_ids),))

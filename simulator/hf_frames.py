@@ -14,6 +14,11 @@ core_trf_vel first, then the A and B sensor of every process parameter).
 frame_seq is the 1-based ordinal of the pulse among its engine's telemetry rows: FrameSequencer starts at
 the engine's row count at start-up and advances for every committed pulse, also when the frame is later
 dropped, so consumers see exactly the lost frames as gaps, across restarts too.
+
+A frame's random parts (N1 noise, tone phases, bearing impacts, sensor noise) come from a stream of its own,
+keyed by SIM_SEED and its telemetry_id, never from one shared by all frames: a frame is a function of its
+request, whatever was built before it. So a frame rebuilt later (a resumed backfill, hf_backfill) is
+byte-identical to the original, and a frame that reaches Kafka twice yields the same feature row twice.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ SAMPLE_DTYPE = "<f4"
 TOPIC_MAX_MESSAGE_BYTES = 8 * 1024 * 1024  # max.message.bytes of the HF topics (infrastructure/kafka)
 FRAME_SIZE_HEADROOM = 64 * 1024  # record-batch and wire-format framing around one frame
 HEADER_BYTES = 128  # upper bound of the fixed fields: ids, timestamps, rates, spool speeds
+FRAME_STREAM = zlib.crc32(b"hf-frames")
 
 
 def epoch_micros(ts: datetime) -> int:
@@ -141,23 +147,24 @@ class FrameBuilder:
     def __init__(self, config: HfConfig, seed: int) -> None:
         self.config = config
         self.frame_bytes = check_frame_size(config)
-        self._rng = np.random.default_rng([seed % 2**64, zlib.crc32(b"hf-frames")])
+        self._seed = seed % 2**64
         self._sensors = ProcessSensors(seed)
         self._vibration = [channel.name for channel in VIBRATION_CHANNELS[: config.vibration_channels]]
 
     def build(self, request: FrameRequest) -> dict[str, Any]:
         """The EngineSensorFrame record (a dict in schema field order) of ``request``."""
         config = self.config
-        state = frame_state(request, request.engine_model, self._rng)
+        rng = np.random.default_rng([self._seed, FRAME_STREAM, request.telemetry_id])  # module doc
+        state = frame_state(request, request.engine_model, rng)
         vibration = synthesize_vibration(
-            state, config.sample_rate_hz, config.vibration_samples, config.vibration_channels, self._rng
+            state, config.sample_rate_hz, config.vibration_samples, config.vibration_channels, rng
         )
         process = self._sensors.sample(
             request.engine_id,
             parameter_means(state, vibration),
             egt_split(state),
             config.process_samples,
-            self._rng,
+            rng,
         )
         return {
             "schema_version": SCHEMA_VERSION,

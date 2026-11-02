@@ -77,6 +77,16 @@ class RecordedFailure(NamedTuple):
     telemetry_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class HfBackfillMarker:
+    """HF frames a backfilled engine history owes (simulator_hf_backfill, see hf_backfill): one per pulse
+    up to ``last_event_ts``, which are the engine's first ``frames`` telemetry rows (frame_seq 1..frames)."""
+
+    engine_id: str
+    frames: int
+    last_event_ts: datetime
+
+
 def committed_pulses(ops: Sequence[WriteOp], results: Sequence[Any]) -> list[tuple[Pulse, int]]:
     """Every pulse written by a committed transaction with its telemetry_id, in write (= event) order.
 

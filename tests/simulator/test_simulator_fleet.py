@@ -15,6 +15,7 @@ from fleet_bootstrap import backfill_fleet, bootstrap_fleet, restore_engine
 from fleet_config import GenerationSettings, SimulatorConfig
 from fleet_runtime import (
     FleetRunner,
+    HfBackfillMarker,
     LifecycleSettings,
     RecordedFailure,
     build_tick_ops,
@@ -308,6 +309,34 @@ def test_backfill_stops_between_engines_on_a_shutdown_request() -> None:
     backfill_fleet(engines, store, SMALL, stop)
     assert {p.engine_id for p in store.pulses()} == {"JT9D-001"}, "the running transaction completes"
     assert [engine.lifecycle_id for engine in engines] == [3, 1, 1]
+
+
+def test_each_history_records_the_hf_frames_it_owes_in_its_own_transaction() -> None:
+    models = {engine_id: eg.build_profile(engine_id).engine_model for engine_id in SMALL.engine_ids}
+    store = FakeStore()
+    bootstrap_fleet(
+        store,
+        SMALL,
+        factory,
+        models,
+        allow_backfill=True,
+        stop_event=threading.Event(),
+        mark_hf_backfill=True,
+    )
+    assert len(store.transactions) == len(SMALL.engine_ids)
+    for ops, engine_id in zip(store.transactions, SMALL.engine_ids, strict=True):
+        pulses = [p for name, batch in ops if name == "insert_pulses" for p in batch]
+        pulses += [event.pulse for name, event in ops if name == "record_failure"]
+        last = max(p.event_ts for p in pulses)
+        assert ops[-1] == ("mark_hf_backfill", HfBackfillMarker(engine_id, len(pulses), last))
+        assert [name for name, _ in ops].count("mark_hf_backfill") == 1
+    stop = threading.Event()
+    interrupted = StopDuringWriteStore(stop)  # SIGTERM while the first history commits
+    backfill_fleet([factory(e) for e in SMALL.engine_ids], interrupted, SMALL, stop, mark_hf_backfill=True)
+    assert [marker.engine_id for marker in interrupted.ops("mark_hf_backfill")] == ["JT9D-001"]
+    unmarked = FakeStore()  # SIM_HF_ENABLED=false
+    bootstrap_fleet(unmarked, SMALL, factory, models, allow_backfill=True, stop_event=threading.Event())
+    assert unmarked.ops("insert_pulses") and not unmarked.ops("mark_hf_backfill")
 
 
 def test_bootstrap_backfills_exactly_the_engines_without_telemetry() -> None:
