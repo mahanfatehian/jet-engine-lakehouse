@@ -7,13 +7,17 @@ Run from the repository root, or from /app inside the data-platform image::
     python orchestration/pipeline_runner.py task TASK [-- ARG ...]
     python orchestration/pipeline_runner.py task train -- --promotion-policy always
     python orchestration/pipeline_runner.py task restore-raw -- --from 2026-11-01 --dry-run
+    python orchestration/pipeline_runner.py task evaluate-spectral -- --splits 5 --stride 4
 
-TASK is dbt, dbt-run, dbt-test, dbt-build, snapshot, train, predict, reconcile or restore-raw.
+TASK is dbt, dbt-run, dbt-test, dbt-build, snapshot, train, predict, reconcile, restore-raw or
+evaluate-spectral.
 Every task is a subprocess. Exit code 3 from a task means "skipped: preconditions not met" and
 is logged as SKIPPED, not as a failure; ``reconcile`` exits 65 when a data layer disagrees with
 the source, a failure the loop backs off from. ``restore-raw`` rebuilds the ClickHouse raw tables
 from the silver lake and runs on demand only (exit 65: rows still missing after the restore, or
-its reconciliation found mismatches). Every mode holds a per-task lock while a task
+its reconciliation found mismatches); ``evaluate-spectral`` compares the models with and
+without the spectral features over several lifecycle splits, on demand only as well. Every
+mode holds a per-task lock while a task
 runs (see pipeline_locks), so manual runs and the loop never execute the same job at once.
 In ``loop`` and ``once``, a failed ``dbt test`` blocks training and the lake snapshot of
 that cycle (PIPELINE_GATE_ON_DBT_TESTS). Settings come from the environment variables of

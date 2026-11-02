@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 
 TaskExecutor = Callable[[TaskName], TaskResult]
 
-# restore-raw is absent on purpose: rebuilding raw from the lake is disaster recovery, run on demand.
+# restore-raw and evaluate-spectral are absent on purpose: rebuilding raw from the lake is disaster
+# recovery and the spectral evaluation costs four model fits per split; both run on demand.
 SCHEDULED_TASKS: tuple[TaskName, ...] = (
     TaskName.DBT_RUN,
     TaskName.DBT_TEST,

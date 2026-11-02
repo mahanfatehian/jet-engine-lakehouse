@@ -2,8 +2,10 @@
 
 Every task runs as a separate process, so a crash, memory leak or hung query in dbt or in
 the data-science scripts can never take the scheduler down with it. ``restore-raw``, the
-rebuild of the ClickHouse raw tables from the silver lake, is a disaster-recovery job: it runs
-on demand only (``task restore-raw``), never in ``loop`` or ``once``.
+rebuild of the ClickHouse raw tables from the silver lake, is a disaster-recovery job, and
+``evaluate-spectral``, the comparison of the RUL models with and without the spectral features
+over several lifecycle splits, is evidence that costs four model fits per split: both run on
+demand only (``task restore-raw``, ``task evaluate-spectral``), never in ``loop`` or ``once``.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ class TaskName(StrEnum):
     PREDICT = "predict"
     RECONCILE = "reconcile"
     RESTORE_RAW = "restore-raw"
+    EVALUATE_SPECTRAL = "evaluate-spectral"
 
 
 class TaskStatus(StrEnum):
@@ -83,6 +86,8 @@ TASK_TIMEOUT_SECONDS: dict[TaskName, float] = {
     # Every day of every raw table at most once; a rerun after a timeout continues where it
     # stopped, because the restore only adds the rows raw still lacks.
     TaskName.RESTORE_RAW: 60 * 60,
+    # Four fits per split; five splits at TRAINING_MAX_ROWS take about 20 minutes.
+    TaskName.EVALUATE_SPECTRAL: 90 * 60,
 }
 
 # Applied with setdefault, so an operator can still override them: ANSI colour codes only
@@ -179,6 +184,8 @@ def build_task_spec(
         argv = _data_science_command(settings, "reconcile_lakehouse.py", *extra_args)
     elif task is TaskName.RESTORE_RAW:
         argv = _data_science_command(settings, "restore_from_lake.py", *extra_args)
+    elif task is TaskName.EVALUATE_SPECTRAL:
+        argv = _data_science_command(settings, "evaluate_spectral.py", *extra_args)
     else:
         argv = _data_science_command(settings, "predict_rul.py", "--mode", "batch", *extra_args)
     return TaskSpec(task, argv, settings.repo_root, timeout)

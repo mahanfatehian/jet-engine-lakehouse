@@ -339,6 +339,12 @@ class FrameSource:
         return TrainingFrame(apply_window(self._frame, window), self.name, "memory:synthetic")
 
 
+@pytest.fixture(scope="session")
+def frame_source() -> type[FrameSource]:
+    """The in-memory TrainingDataSource, for tests that drive a job's loader directly."""
+    return FrameSource
+
+
 class MemoryRunRegistry:
     """RunRegistry kept in a list; ``history`` stands in for rows written by earlier runs."""
 

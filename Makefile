@@ -133,7 +133,7 @@ STREAMING_PYTEST = python -m pytest -p no:cacheprovider -rs --junitxml=/tmp/stre
 	echo "test-streaming: $$skipped test(s) skipped; every Spark test must run in this image" >&2; exit 1; fi
 
 .PHONY: help up down clean ps logs build urls register-cdc cdc-status stream dbt-run dbt-test \
-	snapshot train-ml predict-ml reconcile restore-raw pipeline-once verify verify-postgres verify-minio \
+	snapshot train-ml predict-ml reconcile restore-raw evaluate-spectral pipeline-once verify verify-postgres verify-minio \
 	verify-clickhouse ch-init psql ch-client test test-platform test-streaming test-simulator \
 	load-test lint
 
@@ -146,7 +146,7 @@ help: ## Show this help (default target)
 	@printf '  %-44s %s\n' \
 		'SERVICE=<name>' 'compose service for logs and build (default: all services)' \
 		'TAIL=$(TAIL)' 'log lines shown before following (logs, stream)' \
-		'ARGS="..."' 'extra arguments: dbt-run, dbt-test, snapshot, train-ml, predict-ml, reconcile, restore-raw, register-cdc' \
+		'ARGS="..."' 'extra arguments: dbt-run, dbt-test, snapshot, train-ml, predict-ml, reconcile, restore-raw, evaluate-spectral, register-cdc' \
 		'CONNECTOR=$(CONNECTOR)' 'Debezium connector name (cdc-status, urls)' \
 		'LAKEHOUSE_BUCKET=$(LAKEHOUSE_BUCKET)' 'bucket listed by verify-minio' \
 		'ML_ARTIFACT_PREFIX=$(ML_ARTIFACT_PREFIX)' 'model registry prefix read by verify-minio' \
@@ -229,6 +229,9 @@ reconcile: ## Audit raw, staging and silver against the Postgres source per engi
 
 restore-raw: ## Rebuild the raw tables from the silver lake, then reconcile (ARGS="--from 2026-11-01 --dry-run")
 	$(RUN_TASK) restore-raw $(TASK_ARGS)
+
+evaluate-spectral: ## RUL models with vs without the spectral features over several splits (ARGS="--splits 5 --stride 4")
+	$(RUN_TASK) evaluate-spectral $(TASK_ARGS)
 
 pipeline-once: ## Run dbt -> snapshot -> train -> predict once (failed dbt tests skip snapshot+train)
 	$(COMPOSE) run --rm orchestrator python orchestration/pipeline_runner.py once

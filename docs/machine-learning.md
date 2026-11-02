@@ -180,13 +180,19 @@ engine whose HF frames do not land. It is stored as `holdout_spectral_masked` in
    fired in every bearing-degradation and oil-leak lifecycle and in none of the 14 hot-section or
    compressor failures.
 
-   With more history the picture changes a little. On the live mart with 230 lifecycles the
-   spectral features lowered the holdout RMSE in each of three lifecycle splits (seeds 42, 1, 3:
-   12.70 / 12.78 / 11.31 cycles with them, 13.05 / 13.24 / 11.92 for the pulse-only model, before
-   spectral dropout), and the production run on 258 lifecycles logged 12.94 vs 13.42 cycles
-   (late-life RMSE 14.48 vs 14.95, F1 0.887 vs 0.879) with spectral dropout on. A modest gain, but a
-   consistent one: the failure-mode signatures help most late in life, where the bearing tone and
-   the oil-system channels separate the modes.
+   With more history the picture changes a little. `make evaluate-spectral`
+   ([`evaluate_spectral.py`](../data_science/evaluate_spectral.py)) repeats the comparison over
+   several lifecycle splits of the training data and scores each holdout three ways: the
+   production procedure, the same models with every spectral value masked, and models fitted on
+   the 46 pulse features only. On the live mart with 276 lifecycles (5 splits, seeds 42 to 46,
+   56 to 73 holdout lifecycles each, every 4th pulse) the spectral features lowered the holdout
+   RMSE in all 5 splits, by 0.28 cycles on average (11.70 vs 11.97), the late-life RMSE in all 5
+   (13.12 vs 13.40) and raised R² in all 5 (0.921 vs 0.917); F1 (0.893 vs 0.891, better in 3 of 5)
+   and the Brier score (0.0214 vs 0.0216) barely moved. A modest gain, but a consistent one: the
+   failure-mode signatures help most late in life, where the bearing tone and the oil-system
+   channels separate the modes. With every spectral value masked the same models scored 12.19,
+   between the two: the price of a copy weight of 0.1 instead of 1.0, which would have matched the
+   pulse-only model when frames are missing and lost the gain when they land.
 
 ## 5. Promotion, artifacts and the registry
 

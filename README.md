@@ -211,12 +211,21 @@ ahead), in none of the 14 hot-section or compressor failures, and on no pulse wi
 cycles of life left, which tells the shop which part to have on the shelf. For the RUL estimate the
 spectral features add little, and only once there is enough history, because the 1 Hz summary
 already tracks the wear: on a fresh stack's 24 lifecycles they did not help (over 8 lifecycle
-splits the holdout RMSE was 12.0 cycles with them and 11.4 without), while on 230 to 258 lifecycles
-they lowered it in every split measured, by 0.25 to 0.6 cycles (12.94 vs 13.42 in the latest
-production run). Every training run logs this with-and-without comparison
-([ML deep dive](docs/machine-learning.md)), so the evidence grows with the fleet's history; and
-because training fits the missing-spectral case too (spectral dropout), an engine whose frames do
-not land scores almost as well as one whose frames do (RMSE 13.57 vs 12.94 in that run).
+splits the holdout RMSE was 12.0 cycles with them and 11.4 without). `make evaluate-spectral`
+repeats the comparison over several lifecycle splits of the training data; on the live stack with
+276 lifecycles (5 splits of 56 to 73 holdout lifecycles, every 4th pulse) the spectral features
+lowered the holdout RMSE in every split, by 0.28 cycles on average (11.70 vs 11.97; late-life
+RMSE 13.12 vs 13.40), while the classifier's F1 barely moved (0.893 vs 0.891). Every training run
+logs the same with-and-without comparison on its own holdout ([ML deep dive](docs/machine-learning.md)),
+so the evidence grows with the fleet's history. Because training fits the missing-spectral case
+too (spectral dropout), an engine whose frames do not land scores almost as well: 12.19 cycles
+with every spectral value masked, against 25 before spectral dropout.
+
+| Holdout scoring, 5 splits of 276 lifecycles | RMSE | late-life RMSE | R² | F1 |
+|---|---|---|---|---|
+| with the spectral features | 11.70 | 13.12 | 0.921 | 0.893 |
+| same models, every spectral value masked | 12.19 | 13.72 | 0.914 | 0.888 |
+| pulse features only | 11.97 | 13.40 | 0.917 | 0.891 |
 
 ## Quickstart
 
@@ -611,6 +620,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `make register-cdc ARGS=--dry-run` | show what registration would change, without changing it |
 | `make pipeline-once` | dbt → snapshot → train → predict once, outside the schedule |
 | `make snapshot` | export silver/gold feature tables to MinIO Parquet now |
+| `make evaluate-spectral ARGS="--splits 5 --stride 4"` | fit the RUL models with and without the spectral features on several lifecycle splits and report RMSE, late-life RMSE, R², F1 and Brier per split and on average (evidence only; about 9 minutes for these arguments) |
 | `make restore-raw ARGS="--dry-run"`, `make restore-raw ARGS="--from 2026-11-01"` | rebuild the raw tables from the silver lake (only the rows raw lacks, idempotent), then reconcile the restored range; `--dry-run` reports per table and day what a restore would add (exit 65 when raw still differs, 3 when a table or the lake is missing) |
 | `make reconcile`, `make reconcile ARGS="--window-hours 24"` | reconcile the source with raw, staging and silver now (exit 65 when a layer has gaps, 3 while there is nothing to compare yet) |
 | `make train-ml ARGS="--promotion-policy always"` | force-promote a freshly trained model |

@@ -91,22 +91,25 @@ def test_the_restore_job_reuses_the_reconciliations_exit_codes() -> None:
     assert ("ds_runtime", "run_cli") in imported
 
 
-def test_restore_raw_runs_on_demand_only() -> None:
-    restore = TaskName.RESTORE_RAW
+@pytest.mark.parametrize("on_demand", [TaskName.RESTORE_RAW, TaskName.EVALUATE_SPECTRAL])
+def test_disaster_recovery_and_the_spectral_evaluation_run_on_demand_only(on_demand: TaskName) -> None:
+    assert on_demand not in SCHEDULED_TASKS
+    assert on_demand not in ONCE_SEQUENCE
+    assert on_demand not in dependent_tasks(bootstrap=True)
+    assert on_demand not in dependent_tasks(bootstrap=False)
+    assert on_demand not in GATED_BY_DBT_TESTS
 
-    assert restore not in SCHEDULED_TASKS
-    assert restore not in ONCE_SEQUENCE
-    assert restore not in dependent_tasks(bootstrap=True) and restore not in dependent_tasks(bootstrap=False)
-    assert restore not in GATED_BY_DBT_TESTS
 
-
-def test_make_restore_raw_runs_the_task_in_a_one_off_orchestrator_with_its_arguments() -> None:
+@pytest.mark.parametrize("target", ["restore-raw", "evaluate-spectral"])
+def test_make_targets_run_the_on_demand_tasks_in_a_one_off_orchestrator_with_their_arguments(
+    target: str,
+) -> None:
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 
-    recipe = re.search(r"^restore-raw: ## .+\n\t(.+)$", makefile, re.MULTILINE)
-    assert recipe and recipe.group(1) == "$(RUN_TASK) restore-raw $(TASK_ARGS)"
+    recipe = re.search(rf"^{target}: ## .+\n\t(.+)$", makefile, re.MULTILINE)
+    assert recipe and recipe.group(1) == f"$(RUN_TASK) {target} $(TASK_ARGS)"
     phony = re.search(r"^\.PHONY:(.*?)\n\n", makefile, re.MULTILINE | re.DOTALL)
-    assert phony and "restore-raw" in phony.group(1).split()
+    assert phony and target in phony.group(1).split()
 
 
 @pytest.mark.parametrize(("returncode", "expected"), [(0, 0), (2, 2), (3, 3), (-15, 143), (-9, 137)])
@@ -136,15 +139,17 @@ def test_python_tasks_run_the_data_science_scripts(settings: RunnerSettings, rep
     predict = build_task_spec(TaskName.PREDICT, settings)
     reconcile = build_task_spec(TaskName.RECONCILE, settings)
     restore = build_task_spec(TaskName.RESTORE_RAW, settings)
+    evaluate = build_task_spec(TaskName.EVALUATE_SPECTRAL, settings)
 
     assert snapshot.argv == (PYTHON, str(scripts / "feature_pipeline.py"), "snapshot")
     assert train.argv == (PYTHON, str(scripts / "train_rul_model.py"))
     assert predict.argv == (PYTHON, str(scripts / "predict_rul.py"), "--mode", "batch")
     assert reconcile.argv == (PYTHON, str(scripts / "reconcile_lakehouse.py"))
     assert restore.argv == (PYTHON, str(scripts / "restore_from_lake.py"))
-    assert (REPO_ROOT / "data_science" / "reconcile_lakehouse.py").is_file()
-    assert (REPO_ROOT / "data_science" / "restore_from_lake.py").is_file()
-    for spec in (snapshot, train, predict, reconcile, restore):
+    assert evaluate.argv == (PYTHON, str(scripts / "evaluate_spectral.py"))
+    for script in ("reconcile_lakehouse.py", "restore_from_lake.py", "evaluate_spectral.py"):
+        assert (REPO_ROOT / "data_science" / script).is_file()
+    for spec in (snapshot, train, predict, reconcile, restore, evaluate):
         assert spec.cwd == repo_root
         assert spec.env_defaults == ()
 
@@ -186,13 +191,14 @@ def test_loop_mode_only_adds_skip_if_unchanged_to_training(settings: RunnerSetti
         (TaskName.PREDICT, 5),
         (TaskName.RECONCILE, 10),
         (TaskName.RESTORE_RAW, 60),
+        (TaskName.EVALUATE_SPECTRAL, 90),
     ],
 )
 def test_task_timeouts(settings: RunnerSettings, task: TaskName, minutes: int) -> None:
     assert build_task_spec(task, settings).timeout_seconds == minutes * 60
 
 
-def test_cli_task_names_are_the_contract_ones_plus_dbt_build_reconcile_and_restore_raw() -> None:
+def test_cli_task_names_are_the_contract_ones_plus_the_platform_jobs() -> None:
     assert CLI_TASK_CHOICES == (
         "dbt",
         "dbt-run",
@@ -203,6 +209,7 @@ def test_cli_task_names_are_the_contract_ones_plus_dbt_build_reconcile_and_resto
         "predict",
         "reconcile",
         "restore-raw",
+        "evaluate-spectral",
     )
 
 
