@@ -6,11 +6,14 @@ Run from the repository root, or from /app inside the data-platform image::
     python orchestration/pipeline_runner.py once
     python orchestration/pipeline_runner.py task TASK [-- ARG ...]
     python orchestration/pipeline_runner.py task train -- --promotion-policy always
+    python orchestration/pipeline_runner.py task restore-raw -- --from 2026-11-01 --dry-run
 
-TASK is dbt, dbt-run, dbt-test, dbt-build, snapshot, train, predict or reconcile. Every task
-is a subprocess. Exit code 3 from a task means "skipped: preconditions not met" and is logged
-as SKIPPED, not as a failure; ``reconcile`` exits 65 when a data layer disagrees with the
-source, a failure the loop backs off from. Every mode holds a per-task lock while a task
+TASK is dbt, dbt-run, dbt-test, dbt-build, snapshot, train, predict, reconcile or restore-raw.
+Every task is a subprocess. Exit code 3 from a task means "skipped: preconditions not met" and
+is logged as SKIPPED, not as a failure; ``reconcile`` exits 65 when a data layer disagrees with
+the source, a failure the loop backs off from. ``restore-raw`` rebuilds the ClickHouse raw tables
+from the silver lake and runs on demand only (exit 65: rows still missing after the restore, or
+its reconciliation found mismatches). Every mode holds a per-task lock while a task
 runs (see pipeline_locks), so manual runs and the loop never execute the same job at once.
 In ``loop`` and ``once``, a failed ``dbt test`` blocks training and the lake snapshot of
 that cycle (PIPELINE_GATE_ON_DBT_TESTS). Settings come from the environment variables of
@@ -87,7 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     task = modes.add_parser(
         "task",
-        help="run one task and exit with its exit code (3 = skipped, 65 = reconcile found mismatches)",
+        help="run one task and exit with its exit code (3 = skipped, 65 = reconcile or restore-raw "
+        "found mismatches)",
         description="Run one task; arguments after `--` are appended to its command line.",
     )
     task.add_argument("task", choices=CLI_TASK_CHOICES, help="'dbt' runs dbt run, then dbt test")

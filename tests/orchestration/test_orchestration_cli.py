@@ -109,6 +109,22 @@ def test_task_reconcile_exits_with_the_verdict_of_the_audit(cli: CliHarness, exi
     assert argv[2:] == ("--window-hours", "24")
 
 
+@pytest.mark.parametrize("exit_code", [0, 3, 65])
+def test_task_restore_raw_runs_the_restore_under_its_lock_and_exits_with_its_code(
+    cli: CliHarness, exit_code: int, tmp_path: Path
+) -> None:
+    cli.exit_codes[TaskName.RESTORE_RAW] = exit_code
+
+    code = pipeline_runner.main(["task", "restore-raw", "--", "--from", "2026-11-01", "--dry-run"])
+
+    assert code == exit_code
+    assert cli.executed == ["restore-raw"]
+    argv = cli.specs[0].argv
+    assert Path(argv[1]).parts[-2:] == ("data_science", "restore_from_lake.py")
+    assert argv[2:] == ("--from", "2026-11-01", "--dry-run")
+    assert cli.locked == [(tmp_path / "locks", TaskName.RESTORE_RAW)]
+
+
 def test_task_train_does_not_skip_unchanged_data(cli: CliHarness) -> None:
     assert pipeline_runner.main(["task", "train"]) == 0
     assert "--skip-if-unchanged" not in cli.specs[0].argv

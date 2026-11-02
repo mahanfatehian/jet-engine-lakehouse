@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 TaskExecutor = Callable[[TaskName], TaskResult]
 
+# restore-raw is absent on purpose: rebuilding raw from the lake is disaster recovery, run on demand.
 SCHEDULED_TASKS: tuple[TaskName, ...] = (
     TaskName.DBT_RUN,
     TaskName.DBT_TEST,

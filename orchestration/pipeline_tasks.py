@@ -1,7 +1,9 @@
 """Task catalogue of the pipeline runner: names, command lines, timeouts and exit codes.
 
 Every task runs as a separate process, so a crash, memory leak or hung query in dbt or in
-the data-science scripts can never take the scheduler down with it.
+the data-science scripts can never take the scheduler down with it. ``restore-raw``, the
+rebuild of the ClickHouse raw tables from the silver lake, is a disaster-recovery job: it runs
+on demand only (``task restore-raw``), never in ``loop`` or ``once``.
 """
 
 from __future__ import annotations
@@ -16,7 +18,9 @@ from pipeline_config import RunnerSettings
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 EXIT_SKIPPED = 3  # contract: "skipped: preconditions not met", never a crash
-EXIT_DATA_MISMATCH = 65  # sysexits EX_DATAERR: reconcile found a layer that disagrees with the source
+# sysexits EX_DATAERR: reconcile (or the audit after restore-raw) found a layer that disagrees
+# with the source, or restore-raw left rows of the lake missing from raw.
+EXIT_DATA_MISMATCH = 65
 EXIT_LOCK_TIMEOUT = 75  # sysexits EX_TEMPFAIL: another run held the task's lock for too long
 EXIT_TIMEOUT = 124  # same convention as coreutils `timeout`
 EXIT_SPAWN_FAILED = 127  # shell convention for "command not found / not executable"
@@ -37,6 +41,7 @@ class TaskName(StrEnum):
     TRAIN = "train"
     PREDICT = "predict"
     RECONCILE = "reconcile"
+    RESTORE_RAW = "restore-raw"
 
 
 class TaskStatus(StrEnum):
@@ -75,6 +80,9 @@ TASK_TIMEOUT_SECONDS: dict[TaskName, float] = {
     TaskName.TRAIN: 30 * 60,
     TaskName.PREDICT: 5 * 60,
     TaskName.RECONCILE: 10 * 60,
+    # Every day of every raw table at most once; a rerun after a timeout continues where it
+    # stopped, because the restore only adds the rows raw still lacks.
+    TaskName.RESTORE_RAW: 60 * 60,
 }
 
 # Applied with setdefault, so an operator can still override them: ANSI colour codes only
@@ -169,6 +177,8 @@ def build_task_spec(
         argv = _data_science_command(settings, "train_rul_model.py", *skip, *extra_args)
     elif task is TaskName.RECONCILE:
         argv = _data_science_command(settings, "reconcile_lakehouse.py", *extra_args)
+    elif task is TaskName.RESTORE_RAW:
+        argv = _data_science_command(settings, "restore_from_lake.py", *extra_args)
     else:
         argv = _data_science_command(settings, "predict_rul.py", "--mode", "batch", *extra_args)
     return TaskSpec(task, argv, settings.repo_root, timeout)

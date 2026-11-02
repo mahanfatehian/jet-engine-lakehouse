@@ -95,8 +95,8 @@ def test_dbt_tasks_share_one_lock_and_the_others_have_their_own() -> None:
     assert {LOCK_GROUPS[task] for task in (TaskName.DBT_RUN, TaskName.DBT_TEST, TaskName.DBT_BUILD)} == {
         "dbt"
     }
-    own = (TaskName.TRAIN, TaskName.SNAPSHOT, TaskName.PREDICT, TaskName.RECONCILE)
-    assert [LOCK_GROUPS[task] for task in own] == ["train", "snapshot", "predict", "reconcile"]
+    own = (TaskName.TRAIN, TaskName.SNAPSHOT, TaskName.PREDICT, TaskName.RECONCILE, TaskName.RESTORE_RAW)
+    assert [LOCK_GROUPS[task] for task in own] == ["train", "snapshot", "predict", "reconcile", "restore-raw"]
     assert lock_path(Path("/locks"), "dbt") == Path("/locks") / "pipeline-dbt.lock"
 
 
@@ -104,6 +104,7 @@ def test_wait_limit_outlasts_the_slowest_task_of_the_group() -> None:
     assert lock_wait_limit("dbt") == 30 * 60 + 20 + 60  # dbt build timeout + grace + margin
     assert lock_wait_limit("predict") == 5 * 60 + 20 + 60
     assert lock_wait_limit("reconcile") == 10 * 60 + 20 + 60
+    assert lock_wait_limit("restore-raw") == 60 * 60 + 20 + 60
 
 
 @needs_flock

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
 from pipeline_config import REPO_ROOT, RunnerSettings
+from pipeline_scheduler import SCHEDULED_TASKS, dependent_tasks
 from pipeline_tasks import (
     CLI_TASK_CHOICES,
     EXIT_DATA_MISMATCH,
@@ -75,6 +77,38 @@ def test_the_reconciliation_job_signals_mismatches_with_the_runners_exit_code() 
     assert constants["EXIT_DATA_MISMATCH"] == EXIT_DATA_MISMATCH == 65
 
 
+def test_the_restore_job_reuses_the_reconciliations_exit_codes() -> None:
+    # restore_from_lake imports EXIT_DATA_MISMATCH and the skip convention instead of its own.
+    tree = ast.parse((REPO_ROOT / "data_science" / "restore_from_lake.py").read_text(encoding="utf-8"))
+    imported = {
+        (node.module, alias.name)
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert ("reconcile_lakehouse", "EXIT_DATA_MISMATCH") in imported
+    assert ("ds_runtime", "PreconditionsNotMetError") in imported
+    assert ("ds_runtime", "run_cli") in imported
+
+
+def test_restore_raw_runs_on_demand_only() -> None:
+    restore = TaskName.RESTORE_RAW
+
+    assert restore not in SCHEDULED_TASKS
+    assert restore not in ONCE_SEQUENCE
+    assert restore not in dependent_tasks(bootstrap=True) and restore not in dependent_tasks(bootstrap=False)
+    assert restore not in GATED_BY_DBT_TESTS
+
+
+def test_make_restore_raw_runs_the_task_in_a_one_off_orchestrator_with_its_arguments() -> None:
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    recipe = re.search(r"^restore-raw: ## .+\n\t(.+)$", makefile, re.MULTILINE)
+    assert recipe and recipe.group(1) == "$(RUN_TASK) restore-raw $(TASK_ARGS)"
+    phony = re.search(r"^\.PHONY:(.*?)\n\n", makefile, re.MULTILINE | re.DOTALL)
+    assert phony and "restore-raw" in phony.group(1).split()
+
+
 @pytest.mark.parametrize(("returncode", "expected"), [(0, 0), (2, 2), (3, 3), (-15, 143), (-9, 137)])
 def test_signal_deaths_map_to_shell_exit_codes(returncode: int, expected: int) -> None:
     assert normalize_returncode(returncode) == expected
@@ -101,13 +135,16 @@ def test_python_tasks_run_the_data_science_scripts(settings: RunnerSettings, rep
     train = build_task_spec(TaskName.TRAIN, settings)
     predict = build_task_spec(TaskName.PREDICT, settings)
     reconcile = build_task_spec(TaskName.RECONCILE, settings)
+    restore = build_task_spec(TaskName.RESTORE_RAW, settings)
 
     assert snapshot.argv == (PYTHON, str(scripts / "feature_pipeline.py"), "snapshot")
     assert train.argv == (PYTHON, str(scripts / "train_rul_model.py"))
     assert predict.argv == (PYTHON, str(scripts / "predict_rul.py"), "--mode", "batch")
     assert reconcile.argv == (PYTHON, str(scripts / "reconcile_lakehouse.py"))
+    assert restore.argv == (PYTHON, str(scripts / "restore_from_lake.py"))
     assert (REPO_ROOT / "data_science" / "reconcile_lakehouse.py").is_file()
-    for spec in (snapshot, train, predict, reconcile):
+    assert (REPO_ROOT / "data_science" / "restore_from_lake.py").is_file()
+    for spec in (snapshot, train, predict, reconcile, restore):
         assert spec.cwd == repo_root
         assert spec.env_defaults == ()
 
@@ -148,13 +185,14 @@ def test_loop_mode_only_adds_skip_if_unchanged_to_training(settings: RunnerSetti
         (TaskName.TRAIN, 30),
         (TaskName.PREDICT, 5),
         (TaskName.RECONCILE, 10),
+        (TaskName.RESTORE_RAW, 60),
     ],
 )
 def test_task_timeouts(settings: RunnerSettings, task: TaskName, minutes: int) -> None:
     assert build_task_spec(task, settings).timeout_seconds == minutes * 60
 
 
-def test_cli_task_names_are_the_contract_ones_plus_dbt_build_and_reconcile() -> None:
+def test_cli_task_names_are_the_contract_ones_plus_dbt_build_reconcile_and_restore_raw() -> None:
     assert CLI_TASK_CHOICES == (
         "dbt",
         "dbt-run",
@@ -164,6 +202,7 @@ def test_cli_task_names_are_the_contract_ones_plus_dbt_build_and_reconcile() -> 
         "train",
         "predict",
         "reconcile",
+        "restore-raw",
     )
 
 
