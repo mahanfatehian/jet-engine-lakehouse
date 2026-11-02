@@ -1,0 +1,418 @@
+version: 2
+
+models:
+  - name: fct_engine_failures
+    description: >
+      One row per engine failure, derived from the SCD2 status history (int_engine_status_history).
+      The history alternates between runs of available intervals (HEALTHY, WARNING, CRITICAL) and
+      runs of unavailable ones (FAILURE, MAINTENANCE_RESET); a failure is an unavailable run that
+      contains a FAILURE interval. It fails when that interval begins (failed_at, the FAILURE
+      pulse's event time) and returns to service when the next available interval begins. The
+      time between failures (operating_seconds, operating_cycles) runs from the start of the
+      operating run before the failure, a return to service or the engine's registration, and is
+      only measured when that start is in the history: an engine's history that begins with the
+      connector's snapshot or a backfilled change, and a deregistration, leave it unknown. The
+      time to repair (repair_seconds) is NULL while the engine is still down
+      or when it was deregistered before it returned. The failure mode and the work order's own
+      downtime come from the lifecycle's maintenance work order (stg_maintenance_log); the mode
+      reads UNKNOWN until the work order has landed. Table (rebuilt every run) on
+      ReplacingMergeTree ordered by (engine_id, failed_at); rows are unique, so it can be read with
+      or without FINAL.
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'failed_at']
+      - expression_is_true:
+          name: fct_engine_failures_durations_consistent
+          arguments:
+            expression: >
+              isNull(returned_to_service_at) = isNull(repair_seconds)
+              and (isNull(returned_to_service_at) or returned_to_service_at > failed_at)
+              and isNull(operating_since) = isNull(operating_seconds)
+              and (isNull(operating_since) or operating_since < failed_at)
+              and (isNull(operating_cycles) or isNotNull(operating_since))
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine that failed.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model (registry).
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle that ended in this failure (registry lifecycle of the FAILURE interval).
+      - name: failure_cycle
+        data_type: UInt32
+        description: Cycle at which the engine failed (registry cycle of the FAILURE interval).
+      - name: failed_at
+        data_type: "DateTime64(6, 'UTC')"
+        description: Start of the FAILURE interval; the FAILURE pulse's event time (status_changed_ts).
+        data_tests:
+          - not_null
+      - name: returned_to_service_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: >
+          Start of the first available interval after the failure (the first pulse of the next
+          lifecycle); NULL while the engine is down or when it was deregistered before it returned.
+      - name: repair_seconds
+        data_type: Nullable(Float64)
+        description: >
+          Time to repair: returned_to_service_at - failed_at in seconds (repair plus the reset to
+          the next lifecycle). MTTR is its mean.
+        data_tests:
+          - non_negative
+      - name: operating_since
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: >
+          Start of the operating run before the failure: the return to service after the previous
+          failure, or the engine's registration (entry_cdc_op = 'c'); NULL when that run began
+          before the history, i.e. its start is unknown.
+      - name: operating_seconds
+        data_type: Nullable(Float64)
+        description: "Time between failures: failed_at - operating_since in seconds. MTBF is its mean."
+        data_tests:
+          - non_negative
+      - name: operating_cycles
+        data_type: Nullable(UInt32)
+        description: >
+          Cycles flown in that operating run, the failure cycle included (like cycles_since_new):
+          failure_cycle - the cycle at its start + 1, i.e. the lifecycle's length. NULL without
+          operating_since, or when the run began in another lifecycle.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: maintenance_id
+        data_type: Nullable(UInt64)
+        description: Work order of the failed lifecycle; NULL until it lands.
+      - name: failure_mode
+        data_type: LowCardinality(String)
+        description: Failure mode of the work order; UNKNOWN until it has landed.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HPT_BLADE_EROSION', 'BEARING_DEGRADATION', 'OIL_SYSTEM_LEAK', 'COMPRESSOR_FOULING', 'UNKNOWN']
+              config:
+                severity: warn
+      - name: work_order_downtime_seconds
+        data_type: Nullable(Int32)
+        description: >
+          Repair downtime the work order recorded (failure to repair completion, whole seconds);
+          NULL while it is open. repair_seconds also counts the reset until the first pulse.
+        data_tests:
+          - non_negative
+
+  - name: fct_engine_lifecycle_status_time
+    description: >
+      Time in each status per engine lifecycle, from the SCD2 status history: one row per engine
+      and lifecycle the history covers, keyed by the registry's lifecycle when an interval began
+      (the repair after a failure counts to the lifecycle that failed, MAINTENANCE_RESET to the one
+      it starts). The current interval is measured up to the history's horizon: the newest event
+      time the registry's CDC log reports, so a rebuild on the same data yields the same numbers.
+      A lifecycle that began before the CDC history is covered from its first interval on.
+      failures counts the failures of fct_engine_failures in the lifecycle. Durations are summed
+      in whole microseconds. Table (rebuilt every run) on ReplacingMergeTree ordered by
+      (engine_id, lifecycle_id); rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'lifecycle_id']
+      - expression_is_true:
+          name: fct_engine_lifecycle_status_time_adds_up
+          arguments:
+            expression: >
+              observed_to >= observed_from and status_intervals >= 1
+              and abs(observed_seconds - (healthy_seconds + warning_seconds + critical_seconds
+                + failure_seconds + maintenance_reset_seconds)) < 1e-6
+              and abs(available_seconds - (healthy_seconds + warning_seconds + critical_seconds)) < 1e-6
+              and abs(unavailable_seconds - (failure_seconds + maintenance_reset_seconds)) < 1e-6
+              and observed_seconds
+                <= (toUnixTimestamp64Micro(observed_to) - toUnixTimestamp64Micro(observed_from)) / 1e6 + 1e-6
+              and (observed_seconds > 0) = isNotNull(availability)
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine identifier.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model (registry).
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Registry lifecycle.
+      - name: observed_from
+        data_type: "DateTime64(6, 'UTC')"
+        description: Start of the lifecycle's first interval in the history.
+      - name: observed_to
+        data_type: "DateTime64(6, 'UTC')"
+        description: End of its last interval; the history's horizon while the lifecycle is current.
+      - name: is_current
+        data_type: UInt8
+        description: 1 when the lifecycle holds the engine's open interval (partial lifecycle).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: status_intervals
+        data_type: UInt64
+        description: Status intervals of the lifecycle in the history.
+      - name: failures
+        data_type: UInt64
+        description: Failures in the lifecycle (fct_engine_failures); 1 for a lifecycle that ended in a failure.
+      - name: healthy_seconds
+        data_type: Float64
+        description: Time in HEALTHY (seconds).
+        data_tests:
+          - non_negative
+      - name: warning_seconds
+        data_type: Float64
+        description: Time in WARNING (seconds).
+        data_tests:
+          - non_negative
+      - name: critical_seconds
+        data_type: Float64
+        description: Time in CRITICAL (seconds).
+        data_tests:
+          - non_negative
+      - name: failure_seconds
+        data_type: Float64
+        description: Time in FAILURE, i.e. under repair (seconds).
+        data_tests:
+          - non_negative
+      - name: maintenance_reset_seconds
+        data_type: Float64
+        description: Time in MAINTENANCE_RESET, i.e. repaired but not flown yet (seconds).
+        data_tests:
+          - non_negative
+      - name: available_seconds
+        data_type: Float64
+        description: Time in service (HEALTHY + WARNING + CRITICAL, seconds).
+      - name: unavailable_seconds
+        data_type: Float64
+        description: Time out of service (FAILURE + MAINTENANCE_RESET, seconds).
+      - name: observed_seconds
+        data_type: Float64
+        description: Time the history covers in the lifecycle (available + unavailable, seconds).
+      - name: availability
+        data_type: Nullable(Float64)
+        description: available_seconds / observed_seconds; NULL when no time is observed yet.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+
+  - name: rpt_fleet_reliability_daily
+    description: >
+      Reliability KPIs per UTC day: one row per day and engine, plus one engine_id = 'ALL' row per
+      day for the whole fleet (never sum across rows of one day). Time comes from the SCD2 status
+      history cut at UTC midnights, the open interval measured up to the history's horizon
+      (as_of_ts), so the newest day is partial. Failures count on the day the engine failed, and
+      so do their repair and operating times (fct_engine_failures). availability = time available
+      (HEALTHY, WARNING, CRITICAL) / time observed; MTTR = mean time from failure to return to
+      service over the day's repaired failures; MTBF = mean time (and cycles) from the previous
+      return to service (or registration) to the failure over the day's failures whose operating
+      run has a known start. The fleet row weighs engines by time (engine-seconds) and failures equally;
+      durations are summed in whole microseconds, so it is the exact sum of its engines. The
+      history is wall-clock: while the platform is stopped every engine stays in its last status.
+      Table (rebuilt every run) on ReplacingMergeTree ordered by (day, engine_id); rows are unique,
+      so it can be read with or without FINAL.
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['day', 'engine_id']
+      - expression_is_true:
+          name: rpt_fleet_reliability_daily_adds_up
+          arguments:
+            expression: >
+              abs(observed_seconds - (healthy_seconds + warning_seconds + critical_seconds
+                + failure_seconds + maintenance_reset_seconds)) < 1e-6
+              and abs(available_seconds - (healthy_seconds + warning_seconds + critical_seconds)) < 1e-6
+              and observed_seconds <= 86400 * engines + 1e-6
+              and (observed_seconds > 0) = isNotNull(availability)
+              and repairs <= failures and operating_periods <= failures
+              and isNull(mttr_seconds) = (repairs = 0)
+              and isNull(mtbf_seconds) = (operating_periods = 0)
+              and toDate(as_of_ts) >= day
+    columns:
+      - name: day
+        data_type: Date
+        description: UTC day.
+        data_tests:
+          - not_null
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine, or ALL for the whole fleet.
+        data_tests:
+          - not_null
+      - name: engines
+        data_type: UInt64
+        description: Engines with status history on the day (1 on an engine row).
+      - name: observed_seconds
+        data_type: Float64
+        description: Time the status history covers on the day (engine-seconds on the fleet row).
+        data_tests:
+          - non_negative
+      - name: healthy_seconds
+        data_type: Float64
+        description: Time in HEALTHY (seconds).
+      - name: warning_seconds
+        data_type: Float64
+        description: Time in WARNING (seconds).
+      - name: critical_seconds
+        data_type: Float64
+        description: Time in CRITICAL (seconds).
+      - name: failure_seconds
+        data_type: Float64
+        description: Time in FAILURE, under repair (seconds).
+      - name: maintenance_reset_seconds
+        data_type: Float64
+        description: Time in MAINTENANCE_RESET, repaired but not flown yet (seconds).
+      - name: available_seconds
+        data_type: Float64
+        description: Time in service (HEALTHY + WARNING + CRITICAL, seconds).
+      - name: availability
+        data_type: Nullable(Float64)
+        description: available_seconds / observed_seconds; NULL on a day without observed time.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: failures
+        data_type: UInt64
+        description: Failures that began on the day (fct_engine_failures.failed_at).
+      - name: repairs
+        data_type: UInt64
+        description: Of those failures, the ones that have returned to service.
+      - name: mttr_seconds
+        data_type: Nullable(Float64)
+        description: Mean time to repair of the day's repaired failures (seconds); NULL without one.
+        data_tests:
+          - non_negative
+      - name: operating_periods
+        data_type: UInt64
+        description: Of the day's failures, the ones with a measured operating time (the MTBF sample).
+      - name: mtbf_seconds
+        data_type: Nullable(Float64)
+        description: Mean time between failures (operating time before the failure, seconds); NULL without a sample.
+        data_tests:
+          - non_negative
+      - name: mtbf_cycles
+        data_type: Nullable(Float64)
+        description: Mean cycles flown between failures (fct_engine_failures.operating_cycles); NULL without a sample.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: as_of_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: >
+          Horizon of the status history: the newest event time the registry's CDC log reports;
+          open intervals are measured up to it.
+      - name: refreshed_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Build time of this table (UTC).
+
+  - name: rpt_failure_mode_pareto
+    description: >
+      Failure-mode Pareto from the maintenance work orders (stg_maintenance_log: one per failure,
+      deleted ones removed): one row per engine and failure mode, plus one engine_id = 'ALL' row
+      per mode for the whole fleet. Within each scope the modes are ranked by work orders (ties
+      by name); cumulative_share accumulates the shares in rank order and reaches exactly 1 at the
+      last rank. Downtime is the work order's own (completed orders). Table (rebuilt every run) on
+      ReplacingMergeTree ordered by (engine_id, pareto_rank); rows are unique, so it can be read
+      with or without FINAL.
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'failure_mode']
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'pareto_rank']
+      - expression_is_true:
+          name: rpt_failure_mode_pareto_counts_consistent
+          arguments:
+            expression: >
+              completed_work_orders <= work_orders
+              and engines_affected >= 1
+              and cumulative_share >= share_of_work_orders
+              and first_failure_ts <= last_failure_ts
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine, or ALL for the whole fleet.
+        data_tests:
+          - not_null
+      - name: failure_mode
+        data_type: LowCardinality(String)
+        description: Failure mode of the work orders.
+      - name: pareto_rank
+        data_type: UInt64
+        description: 1 = the mode with the most work orders in the scope.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: work_orders
+        data_type: UInt64
+        description: Work orders (failures) of the mode.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: completed_work_orders
+        data_type: UInt64
+        description: Of those, the ones whose repair is completed.
+      - name: share_of_work_orders
+        data_type: Float64
+        description: work_orders / all work orders of the scope.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: cumulative_share
+        data_type: Float64
+        description: Share of the scope's work orders in this and every higher-ranked mode.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: engines_affected
+        data_type: UInt64
+        description: Engines with a work order of the mode (1 on an engine row).
+      - name: mean_failure_cycle
+        data_type: Float64
+        description: Mean cycle at which the engines failed (work order failure_cycle, counted from 0 per lifecycle).
+      - name: total_downtime_seconds
+        data_type: Nullable(Int64)
+        description: Repair downtime of the completed work orders (seconds); NULL while none is completed.
+        data_tests:
+          - non_negative
+      - name: mean_downtime_seconds
+        data_type: Nullable(Float64)
+        description: Mean repair downtime of the completed work orders (seconds).
+        data_tests:
+          - non_negative
+      - name: first_failure_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Earliest failure of the mode.
+      - name: last_failure_ts
+        data_type: "DateTime64(6, 'UTC')"
+        description: Latest failure of the mode.
+      - name: refreshed_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Build time of this table (UTC).
