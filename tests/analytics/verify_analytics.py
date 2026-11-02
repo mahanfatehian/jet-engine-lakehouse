@@ -11,8 +11,9 @@ snapshot  copies the FINAL contents of every model (a view as it reads) into
 compare   row counts, per-column checksums and row-level EXCEPT diffs of two snapshots
 check     CDC dedup, late / deleted / corrected pulses, registry lag, RUL labels, finite
           features, fct grain, predictions and their aging, an independent Python
-          recomputation of the rolling features of selected lifecycles (feature_reference.py)
-          and of every spectral feature of the HF frames (verify_spectral.py)
+          recomputation of the rolling features of selected lifecycles (feature_reference.py),
+          of every spectral feature of the HF frames (verify_spectral.py) and of the status
+          history and reliability KPIs (verify_reliability.py)
 baseline  every live feature row records baseline_cycles = N and the reference lifecycles
           match the Python recomputation with an N-cycle baseline
 mart-cap  the training mart holds exactly the newest N completed lifecycles of every engine
@@ -38,6 +39,7 @@ from feature_reference import ROLLED_SENSORS, SENSORS, WINDOWS, Reading, expecte
 from seed_engine_raw import EXIT_REFUSED, connect, writes_allowed
 from verify_gold import check_board, check_mart_cap
 from verify_queries import DATABASE, rows, scalar
+from verify_reliability import check_reliability
 from verify_spectral import check_spectral
 
 LOGGER = logging.getLogger("verify_analytics")
@@ -55,6 +57,11 @@ MODELS = (
     "fct_engine_health_status",
     "fct_rul_prediction_backtest",
     "rpt_model_live_performance",
+    "int_engine_status_history",
+    "fct_engine_failures",
+    "fct_engine_lifecycle_status_time",
+    "rpt_fleet_reliability_daily",
+    "rpt_failure_mode_pareto",
 )
 BUILD_TIME_COLUMNS = frozenset(
     {"feature_computed_at", "refreshed_at", "telemetry_staleness_seconds", "prediction_age_seconds"}
@@ -375,6 +382,7 @@ def check(client: Client, manifest_path: Path, incremental: bool) -> list[str]:
         *check_board(client, manifest),
         *check_baseline(client, BASELINE_CYCLES),
         *check_spectral(client, manifest, incremental),
+        *check_reliability(client, manifest),
     ]
 
 

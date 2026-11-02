@@ -5,10 +5,13 @@
 #   2. python:3.12-slim-bookworm with the pinned dbt-core / dbt-clickhouse (repo mounted read-only,
 #      dbt target and logs kept inside the container)
 #   3. seed base -> dbt debug -> dbt build -> seed increment -> dbt build (incremental path);
-#      the seed holds synthetic CDC (duplicates, updates, deletes, late rows) and the matching
+#      the seed holds synthetic CDC (duplicates, updates, deletes, late rows, replays in a later
+#      batch), the registry's status history (failures and repairs, an out-of-order and a replayed
+#      version, a deregistration, history written behind its registration) and the matching
 #      high-frequency frame features (dropped frames, NaN features, absent process keys,
 #      redelivered, late and corrected copies, bearing degradation)
-#   4. invariant checks, snapshot, dbt build --full-refresh, snapshot, compare (every model,
+#   4. invariant checks (the rolling, spectral and reliability models against independent Python
+#      references), snapshot, dbt build --full-refresh, snapshot, compare (every model,
 #      incremental ones included), checks again
 #   5. var-driven definitions: a changed baseline_cycles heals on the next incremental run (and
 #      equals the full refresh again), the anomaly-threshold guard rejects miscalibrated
