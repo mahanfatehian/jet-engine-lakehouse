@@ -22,7 +22,13 @@ from feature_ablation import (
 from feature_pipeline import FEATURE_COLUMNS, PULSE_FEATURE_COLUMNS, SPECTRAL_FEATURE_COLUMNS
 from model_registry import METADATA_FILE, METRICS_FILE, ArtifactLayout, read_production_pointer
 from rul_metrics import HoldoutMetrics
-from rul_modeling import LabelSpec, evaluate_bundle, feature_importance, train_models
+from rul_modeling import (
+    LabelSpec,
+    evaluate_bundle,
+    evaluate_without_spectral,
+    feature_importance,
+    train_models,
+)
 from train_rul_model import TrainingContext, TrainingRequest, run_training
 
 T0 = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
@@ -88,6 +94,9 @@ def test_ablation_measures_the_same_models_without_the_spectral_features(
     )
 
     assert baseline.bundle.feature_columns == PULSE_FEATURE_COLUMNS
+    # Without spectral inputs there is nothing to mask: the baseline is fitted without copies.
+    assert synthetic_training.trained.spectral_dropout and not baseline.spectral_dropout
+    assert baseline.calibration.rows == len(frames["train"]) + len(frames["validation"])
     assert evaluate_bundle(baseline.bundle, frames["test"], label_spec) == ablation.without_spectral
 
 
@@ -105,10 +114,19 @@ def test_ablation_shows_the_gain_of_the_planted_bearing_signal(
     importance = feature_importance(synthetic_training.trained.bundle)
     spectral = importance[importance["feature"].isin(SPECTRAL_FEATURE_COLUMNS)]
     assert spectral["feature"].iloc[0] in {"fan_amp_bpfo_mean_5m", "fan_kurtosis_mean_5m"}
-    assert ablation.spectral_importance_share > 0.25
-    # The gain sits on the bearing lifecycles, where only the spectral features see the defect.
+    # Ten spectral inputs out of 59, and the spectral-dropout copies can only split on the others.
+    assert ablation.spectral_importance_share > 0.05
+    # The share of the booster's total gain (loss reduction summed over every split).
+    booster = synthetic_training.trained.bundle.regressor.get_booster()
+    total_gain = booster.get_score(importance_type="total_gain")
+    spectral_gain = sum(total_gain.get(column, 0.0) for column in SPECTRAL_FEATURE_COLUMNS)
+    assert ablation.spectral_importance_share == pytest.approx(spectral_gain / sum(total_gain.values()))
+    # The gain sits on the bearing lifecycles, where only the spectral features see the defect:
+    # with them masked, the same model scores those lifecycles far worse.
     bearing = test[test["failure_mode"] == BEARING].reset_index(drop=True)
-    assert evaluate_bundle(synthetic_training.trained.bundle, bearing, label_spec).rmse < 0.6 * without.rmse
+    bundle = synthetic_training.trained.bundle
+    bearing_masked = evaluate_without_spectral(bundle, bearing, label_spec)
+    assert evaluate_bundle(bundle, bearing, label_spec).rmse < 0.8 * bearing_masked.rmse
 
 
 def test_ablation_is_skipped_when_the_development_data_has_no_spectral_value(
@@ -172,13 +190,19 @@ def test_comparison_line_and_document(ablation: AblationResult) -> None:
     assert set(ablation.summary()) == {"status", "seconds", "spectral_importance_share", "with_minus_without"}
 
 
-def test_spectral_importance_share_sums_the_spectral_gain() -> None:
+def test_spectral_importance_share_sums_the_spectral_total_gain() -> None:
     importance = pd.DataFrame(
-        {"feature": ["fan_amp_bpfo_mean_5m", "egt_c", "oil_temp_c_mean_5m"], "gain": [3.0, 5.0, 2.0]}
+        {
+            "feature": ["fan_amp_bpfo_mean_5m", "egt_c", "oil_temp_c_mean_5m"],
+            "gain": [3.0, 5.0, 2.0],  # average per split
+            "weight": [10.0, 2.0, 30.0],  # splits
+            "total_gain": [30.0, 10.0, 60.0],
+        }
     )
 
-    assert spectral_importance_share(importance) == pytest.approx(0.5)
-    assert spectral_importance_share(importance.assign(gain=0.0)) == 0.0
+    # 90 of the total gain of 100; the average gains per split would claim (3 + 2) / 10.
+    assert spectral_importance_share(importance) == pytest.approx(0.9)
+    assert spectral_importance_share(importance.assign(total_gain=0.0)) == 0.0
 
 
 def test_every_training_run_records_the_ablation_as_evidence_only(

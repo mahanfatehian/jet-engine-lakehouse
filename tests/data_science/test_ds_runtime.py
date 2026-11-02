@@ -1,7 +1,12 @@
-"""Exit-code convention, bounded retries, transient-error classification and settings."""
+"""Exit-code convention, bounded retries, transient-error classification, the ClickHouse gateway's
+probe and statements, and settings."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import ds_runtime
+import lakehouse_io
 import pytest
 from artifact_store import _is_transient_s3_error
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -17,12 +22,73 @@ from ds_runtime import (
     retry_call,
     run_cli,
 )
-from ds_settings import ConfigError, PromotionSettings, load_settings
-from lakehouse_io import _is_transient, final_modifier
+from ds_settings import ClickHouseSettings, ConfigError, PromotionSettings, load_settings
+from lakehouse_io import ClickHouseGateway, _is_transient, final_modifier
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError, ReadTimeoutError
+
+CLICKHOUSE = ClickHouseSettings(
+    host="clickhouse", port=8123, user="default", password="", database="iot_engine"
+)
 
 
 def _raise(exc: Exception) -> int:
     raise exc
+
+
+def _transport_error(reason: Exception) -> OperationalError:
+    """An HTTP failure as clickhouse-connect raises it: an OperationalError chained to urllib3's error."""
+    error = OperationalError("Error executing HTTP request")
+    error.__cause__ = reason
+    return error
+
+
+def _connection_refused() -> OperationalError:
+    # urllib3 gave up connecting: nothing was sent.
+    return _transport_error(MaxRetryError(None, "/", NewConnectionError(None, "Connection refused")))
+
+
+class FakeClickHouseClient:
+    """clickhouse-connect client stand-in: scripted ping() answers and command() outcomes, calls recorded."""
+
+    def __init__(self, pings: list[bool] | None = None, outcomes: list[object] | None = None) -> None:
+        self.pings = list(pings or [])
+        self.outcomes = list(outcomes or [])
+        self.ping_calls = 0
+        self.commands: list[tuple[str, dict]] = []
+
+    def ping(self) -> bool:
+        # Like clickhouse-connect: a failed probe returns False, it never raises.
+        self.ping_calls += 1
+        return self.pings.pop(0)
+
+    def command(self, cmd: str, parameters: dict | None = None) -> object:
+        self.commands.append((cmd, parameters))
+        outcome = self.outcomes.pop(0) if self.outcomes else ""
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def backoffs(monkeypatch) -> list[float]:
+    """The waits of retry_call, recorded instead of slept."""
+    waits: list[float] = []
+    monkeypatch.setattr(ds_runtime.time, "sleep", waits.append)
+    return waits
+
+
+@pytest.fixture
+def gateway_over(monkeypatch) -> Callable[[FakeClickHouseClient], ClickHouseGateway]:
+    """A ClickHouseGateway (3 attempts) whose clickhouse-connect client is the given fake."""
+
+    def build(client: FakeClickHouseClient) -> ClickHouseGateway:
+        monkeypatch.setattr(lakehouse_io.clickhouse_connect, "get_client", lambda **_settings: client)
+        return ClickHouseGateway(CLICKHOUSE, attempts=3)
+
+    return build
 
 
 def test_exit_codes_follow_the_contract() -> None:
@@ -86,6 +152,59 @@ def test_transient_error_classification() -> None:
     assert _is_transient_s3_error(ClientError(slow_down, "PutObject"))
     denied = {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}}
     assert not _is_transient_s3_error(ClientError(denied, "PutObject"))
+
+
+def test_ping_retries_an_unanswered_probe_and_reports_false_after_the_last_attempt(
+    gateway_over, backoffs: list[float]
+) -> None:
+    restarting = FakeClickHouseClient(pings=[False, False, True])
+    down = FakeClickHouseClient(pings=[False, False, False])
+
+    assert gateway_over(restarting).ping() is True
+    assert restarting.ping_calls == 3 and len(backoffs) == 2
+    assert gateway_over(down).ping() is False
+    assert down.ping_calls == 3 and len(backoffs) == 4
+
+
+def test_command_passes_the_statement_through_and_retries_what_never_ran(
+    gateway_over, backoffs: list[float]
+) -> None:
+    statement = "ALTER TABLE ml_model_runs DELETE WHERE model_version = {version:String}"
+    client = FakeClickHouseClient(
+        outcomes=[_connection_refused(), DatabaseError("too many simultaneous queries", code=202), ""]
+    )
+    gateway = gateway_over(client)
+
+    assert gateway.command(statement, {"version": "rul-1"}) is None
+    gateway.command("OPTIMIZE TABLE ml_model_runs FINAL")
+
+    # Refused connections and admission control never started the statement: safe to send again.
+    retried = [(statement, {"version": "rul-1"})] * 3
+    assert client.commands == [*retried, ("OPTIMIZE TABLE ml_model_runs FINAL", {})]
+    assert len(backoffs) == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _transport_error(ReadTimeoutError(None, "/", "Read timed out. (read timeout=600)")),
+        _transport_error(ProtocolError("Connection aborted.", ConnectionResetError(104, "reset by peer"))),
+        DatabaseError("memory limit exceeded", code=241),
+        DatabaseError("timeout exceeded", code=159),
+        DatabaseError("unknown table", code=60),
+    ],
+    ids=["read-timeout", "connection-reset", "memory-limit", "timeout-exceeded", "unknown-table"],
+)
+def test_command_never_reruns_a_statement_that_may_have_run(
+    gateway_over, backoffs: list[float], failure: Exception
+) -> None:
+    client = FakeClickHouseClient(outcomes=[failure, ""])
+
+    with pytest.raises(type(failure)):
+        gateway_over(client).command("INSERT INTO gold_engine_rul_predictions SELECT * FROM staged")
+
+    # The server may already have applied it: a second run would insert every row twice.
+    assert len(client.commands) == 1 and backoffs == []
 
 
 def test_final_is_only_applied_to_engines_that_merge_versions() -> None:

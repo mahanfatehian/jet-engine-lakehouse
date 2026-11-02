@@ -16,6 +16,16 @@ SNAPSHOT_WINDOW_DAYS of event time only, so each snapshot stays bounded however 
 stack runs; ClickHouse streams the export to a local file, never into memory. It replaced
 the v1 export of int_sensor_rolling_features (whose features it contains): snapshots
 under silver/int_sensor_rolling_features/ are no longer written or pruned.
+
+The read stays bounded too. The view joins two FINAL reads, and an event-time filter above
+FINAL prunes nothing, so the export also keeps only the lifecycles that end inside the
+window (int_engine_lifecycles): (engine_id, lifecycle_id) is the sorting-key prefix of both
+tables, so their reads skip every older lifecycle. dbt rebuilds int_engine_lifecycles from
+the same staging rows as the pulse features, so every pulse of the window belongs to one of
+those lifecycles. The window ends at the newest event_ts of int_sensor_rolling_features
+(the view has one row per row of it) read without FINAL: every version of a pulse carries
+its event_ts, so only a deleted newest pulse could move the end, by seconds, and ClickHouse
+answers that max from part metadata instead of running the view's join.
 """
 
 from __future__ import annotations
@@ -23,7 +33,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,20 +62,36 @@ class SnapshotDataset:
     """A ClickHouse model exported to a medallion zone of the bucket.
 
     ``window_column`` limits the export to the last SNAPSHOT_WINDOW_DAYS of that
-    timestamp column (measured back from its newest value); None exports every row.
+    timestamp column, measured back from its newest value in ``window_source`` (default:
+    the table itself); None exports every row. ``lifecycles`` (a table of engine_id,
+    lifecycle_id and lifecycle_end_ts) further limits a windowed export to the lifecycles
+    that end inside the window.
     """
 
     zone: str
     table: str
     window_column: str | None = None
+    window_source: str | None = None
+    lifecycles: str | None = None
 
     @property
     def prefix(self) -> str:
         """Key prefix shared by every snapshot of this dataset."""
         return f"{self.zone}/{self.table}/snapshot_ts="
 
+    @property
+    def tables(self) -> tuple[str, ...]:
+        """Every table the export reads, the exported one first."""
+        return tuple(table for table in (self.table, self.window_source, self.lifecycles) if table)
 
-SILVER_ML_FEATURES = SnapshotDataset("silver", "int_ml_features", window_column="event_ts")
+
+SILVER_ML_FEATURES = SnapshotDataset(
+    "silver",
+    "int_ml_features",
+    window_column="event_ts",
+    window_source="int_sensor_rolling_features",
+    lifecycles="int_engine_lifecycles",
+)
 GOLD_TRAINING_FEATURES = SnapshotDataset("gold", "mart_rul_training_features")
 GOLD_HEALTH_STATUS = SnapshotDataset("gold", "fct_engine_health_status")
 SNAPSHOT_DATASETS = (SILVER_ML_FEATURES, GOLD_TRAINING_FEATURES, GOLD_HEALTH_STATUS)
@@ -193,15 +219,31 @@ def prune_snapshots(store: ArtifactStore, dataset: SnapshotDataset, retention: i
     return sorted(expired)
 
 
-def snapshot_select_sql(dataset: SnapshotDataset, engine: str, window_days: int) -> str:
-    """The export query of ``dataset`` (FINAL where the engine needs it, windowed if configured)."""
+def snapshot_select_sql(dataset: SnapshotDataset, engines: Mapping[str, str], window_days: int) -> str:
+    """The export query of ``dataset`` (FINAL where an engine needs it, windowed if configured).
+
+    ``engines`` maps the tables of ``dataset.tables`` to their engines. A separate
+    ``window_source`` is read without FINAL (see the module docstring).
+    """
     if window_days < 1:
         raise ValueError("window_days must be >= 1")
-    source = f"`{dataset.table}` {final_modifier(engine)}".rstrip()
-    sql = f"SELECT * FROM {source}"
-    if dataset.window_column is not None:
-        column = f"`{dataset.window_column}`"
-        sql += f" WHERE {column} >= (SELECT max({column}) FROM {source}) - INTERVAL {int(window_days)} DAY"
+
+    def source(table: str) -> str:
+        return f"`{table}` {final_modifier(engines[table])}".rstrip()
+
+    sql = f"SELECT * FROM {source(dataset.table)}"
+    if dataset.window_column is None:
+        return sql
+    column = f"`{dataset.window_column}`"
+    newest = source(dataset.table) if dataset.window_source is None else f"`{dataset.window_source}`"
+    start = f"(SELECT max({column}) FROM {newest}) - INTERVAL {int(window_days)} DAY"
+    sql += f" WHERE {column} >= {start}"
+    if dataset.lifecycles is not None:
+        lifecycles = source(dataset.lifecycles)
+        sql += (
+            f" AND (engine_id, lifecycle_id) IN (SELECT engine_id, lifecycle_id FROM {lifecycles}"
+            f" WHERE lifecycle_end_ts >= {start})"
+        )
     return sql
 
 
@@ -231,8 +273,9 @@ def run_snapshot(
     Returns the URI written per table. Raises PreconditionsNotMetError when a source
     table is missing or when every export is empty; nothing is written or pruned then.
     """
-    engines = exporter.table_engines(dataset.table for dataset in SNAPSHOT_DATASETS)
-    missing = [dataset.table for dataset in SNAPSHOT_DATASETS if dataset.table not in engines]
+    sources = list(dict.fromkeys(table for dataset in SNAPSHOT_DATASETS for table in dataset.tables))
+    engines = exporter.table_engines(sources)
+    missing = [table for table in sources if table not in engines]
     if missing:
         raise PreconditionsNotMetError(f"source tables do not exist yet: {', '.join(missing)}")
     snapshot_ts = format_snapshot_ts(now)
@@ -242,7 +285,7 @@ def run_snapshot(
         for dataset in SNAPSHOT_DATASETS:
             stop.raise_if_stopped()
             local_file = Path(workdir) / f"{dataset.table}.parquet"
-            sql = snapshot_select_sql(dataset, engines[dataset.table], window_days)
+            sql = snapshot_select_sql(dataset, engines, window_days)
             size = exporter.export_parquet(sql, local_file)
             rows = pq.read_metadata(local_file).num_rows
             scope = (

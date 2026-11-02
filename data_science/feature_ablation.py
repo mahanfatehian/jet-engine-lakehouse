@@ -1,13 +1,14 @@
 """Ablation of the spectral features: what the high-frequency path adds to the RUL models.
 
 Every training run refits the regressor and the calibrated classifier without the
-spectral features - same train/validation lifecycles, same procedure and seeds - and
+spectral features - same train/validation lifecycles, same procedure and seeds; with no
+spectral input there is nothing for spectral dropout to mask, so no rows are copied - and
 scores the result on the identical holdout, next to the production model. The comparison
 is evidence only: the production model always uses the full feature set and the
 promotion gate never looks at the ablation. It is logged as one comparison line and
 recorded as "ablation" in metrics.json, metadata.json and ml_model_runs.params_json,
-together with the spectral features' share of the production regressor's gain and how
-many rows had spectral features at all (coverage).
+together with the spectral features' share of the production regressor's total gain and
+how many rows had spectral features at all (coverage).
 
 It is skipped, and recorded as such, when the development lifecycles hold no spectral
 value (HF disabled, or its features not landed yet): both models would then see the same
@@ -135,12 +136,16 @@ AblationRunner = Callable[
 
 
 def spectral_importance_share(importance: pd.DataFrame) -> float:
-    """Share of the regressor's total gain that falls on spectral features (0 without any gain)."""
-    total = float(importance["gain"].sum())
+    """Share of the regressor's total gain that falls on spectral features (0 without any gain).
+
+    Summed over ``total_gain``, the loss reduction of every split: XGBoost's ``gain`` is an
+    average per split, and a sum of averages ignores how often each feature was split on.
+    """
+    total = float(importance["total_gain"].sum())
     if total <= 0:
         return 0.0
     spectral = importance["feature"].isin(SPECTRAL_FEATURE_COLUMNS)
-    return float(importance.loc[spectral, "gain"].sum()) / total
+    return float(importance.loc[spectral, "total_gain"].sum()) / total
 
 
 def _has_spectral_values(frame: pd.DataFrame) -> bool:

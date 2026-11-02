@@ -209,11 +209,14 @@ the 1 Hz vibration-growth flag fires before every failure whatever its cause (24
 bearing-degradation and all 4 oil-leak lifecycles (oil-starved bearings; a median 29 and 14 cycles
 ahead), in none of the 14 hot-section or compressor failures, and on no pulse with more than 100
 cycles of life left, which tells the shop which part to have on the shelf. For the RUL estimate the
-spectral features add nothing measurable in this simulation, where the 1 Hz summary already tracks
-the wear: over 8 different lifecycle splits the holdout RMSE was 12.0 cycles with them and 11.4
-without, and only the failure probability came out slightly better calibrated (lower Brier score
-in 7 of 8 splits). Every training run logs this with-and-without comparison
-([ML deep dive](docs/machine-learning.md)), so the evidence grows with the fleet's history.
+spectral features add little, and only once there is enough history, because the 1 Hz summary
+already tracks the wear: on a fresh stack's 24 lifecycles they did not help (over 8 lifecycle
+splits the holdout RMSE was 12.0 cycles with them and 11.4 without), while on 230 to 258 lifecycles
+they lowered it in every split measured, by 0.25 to 0.6 cycles (12.94 vs 13.42 in the latest
+production run). Every training run logs this with-and-without comparison
+([ML deep dive](docs/machine-learning.md)), so the evidence grows with the fleet's history; and
+because training fits the missing-spectral case too (spectral dropout), an engine whose frames do
+not land scores almost as well as one whose frames do (RMSE 13.57 vs 12.94 in that run).
 
 ## Quickstart
 
@@ -589,7 +592,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `HF_TOPIC_RETENTION_BYTES` | `2147483648` | per-partition cap of the HF topic, so frames can never fill the broker disk the CDC topics share |
 | `HF_BRONZE_RETENTION_DAYS` / `HF_TOPIC_RETENTION_MS` | `1` / `7200000` | how long raw frames live in the lake (MinIO lifecycle rule) and in Kafka |
 | `HF_MAX_OFFSETS_PER_TRIGGER` | `2000` | frames per HF micro-batch: a backlog is worked off in bounded batches |
-| `SPECTRAL_MAX_LAG_SECONDS` | `60` | scoring carries spectral features forward this far while the newest frames are still in flight |
+| `SPECTRAL_MAX_LAG_SECONDS` | `60` | scoring carries spectral features forward this far while the newest frames are still in flight; beyond it the pulse features alone decide |
 | `PIPELINE_GATE_ON_DBT_TESTS` | `true` | a failed dbt test skips training and lake snapshots in that cycle |
 | `BIND_HOST` | `127.0.0.1` | interface every published port binds to |
 | `DBT_INTERVAL_SECONDS` / `TRAIN_INTERVAL_SECONDS` | `120` / `1800` | orchestration cadence |
@@ -656,8 +659,10 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 - **No HF frames, or the HF check of `make verify` says WARN:** the HF path is best effort and
   never blocks the 1 Hz path. `make logs SERVICE=simulator` shows "HF frames waiting for Kafka"
   while the topic or the registry is not up yet, and a metrics line every minute (produced,
-  dropped, MB/s, queue depth). Spectral features stay NULL for pulses without a frame; the models
-  treat them as missing. After a stop during the first-boot drain, the next start logs "Resumed the
+  dropped, MB/s, queue depth). Spectral features stay NULL for pulses without a frame. Training
+  fits the models' missing-value branches on a copy of every training pulse without them (spectral
+  dropout), so such a pulse is scored from its pulse features alone; every training run logs and
+  stores how the model scores its holdout that way (`holdout_spectral_masked` in `metrics.json`). After a stop during the first-boot drain, the next start logs "Resumed the
   HF backfill of ..." and sends the history's frames again.
 - **Connector not RUNNING:** `make cdc-status`, then `make register-cdc` (it restarts a FAILED task
   and resumes a PAUSED connector).

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,7 +37,7 @@ from model_registry import (
     read_production_pointer,
     write_production_pointer,
 )
-from rul_modeling import evaluate_bundle, feature_importance
+from rul_modeling import SPECTRAL_DROPOUT_WEIGHT, evaluate_bundle, feature_importance
 from train_rul_model import TrainingRequest, run_training
 from training_sources import prepare_training_frame
 
@@ -91,7 +92,7 @@ def test_artifacts_round_trip_through_the_local_store(tmp_path: Path, synthetic_
     importance = pd.read_csv(
         io.BytesIO(store.get_bytes(LAYOUT.artifact_key(bundle.model_version, IMPORTANCE_FILE)))
     )
-    assert list(importance.columns) == ["feature", "gain", "weight", "cover", "gain_share"]
+    assert list(importance.columns) == ["feature", "gain", "total_gain", "weight", "cover", "gain_share"]
     metrics = store.get_json(LAYOUT.artifact_key(bundle.model_version, METRICS_FILE))
     assert metrics["holdout"]["rmse"] == pytest.approx(synthetic_training.holdout.rmse)
 
@@ -208,6 +209,30 @@ def test_first_run_publishes_promotes_and_records(tmp_path: Path, synthetic_mart
     assert metadata["promotion"]["champion_status"] == "none"
     assert metadata["promotion"]["floors"] == {"min_r2": 0.5, "min_roc_auc": 0.75, "f1_tolerance": 0.05}
     assert metadata["promotion"]["promoted"] and metadata["promotion"]["champion_version"] is None
+
+
+def test_every_run_records_its_holdout_with_every_spectral_value_masked(
+    tmp_path: Path, synthetic_mart, make_context, label_spec, hf_disabled, caplog
+) -> None:
+    context = make_context(tmp_path, synthetic_mart)
+
+    with caplog.at_level(logging.INFO, logger="training_report"):
+        outcome = run_training(_request(), context, now=T0)
+
+    stored = context.store.get_bytes(LAYOUT.artifact_key(outcome.model_version, BUNDLE_FILE))
+    bundle = deserialize_bundle(stored)
+    test = prepare_training_frame(synthetic_mart)
+    test = test[test["split_group"].isin(outcome.split.test)].reset_index(drop=True)
+    masked = evaluate_bundle(bundle, hf_disabled(test), label_spec).as_dict()
+    metrics = context.store.get_json(LAYOUT.artifact_key(outcome.model_version, METRICS_FILE))
+    metadata = context.store.get_json(LAYOUT.artifact_key(outcome.model_version, METADATA_FILE))
+    assert metrics["holdout_spectral_masked"] == metadata["holdout_spectral_masked"]
+    assert metrics["holdout_spectral_masked"] == pytest.approx(masked)
+    assert metrics["holdout_spectral_masked"]["rmse"] != metrics["holdout"]["rmse"]
+    assert metadata["spectral_dropout"] == {"applied": True, "copy_weight": SPECTRAL_DROPOUT_WEIGHT}
+    [line] = [entry.getMessage() for entry in caplog.records if "spectral value masked" in entry.getMessage()]
+    assert f"RMSE {masked['rmse']:.2f} | R2 {masked['r2']:.3f}" in line
+    assert line.endswith("spectral dropout on")
 
 
 def test_champion_is_rescored_on_the_challengers_holdout(

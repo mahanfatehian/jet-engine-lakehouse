@@ -6,16 +6,22 @@ int_engine_lifecycles, joined with the engine's latest registry status.
 
 Spectral features lag the pulse: HF frames reach ClickHouse on their own micro-batch
 cadence, so when dbt builds the view's sources the newest pulses of an engine usually have
-no HF frame yet, and the view gives them no spectral value at all. The models learned
-their missing-value branches from the few pulses that were missing in training, so scoring
-every newest pulse that way would silently drop the spectral evidence exactly where it
-matters. The spectral features of such a pulse are therefore carried forward from the
+no HF frame yet, and the view gives them no spectral value at all. Scored that way, a pulse
+goes down the models' missing-value branches: training fits those to the pulse features
+alone (spectral dropout, rul_modeling.py), so the estimate stays sound, but it drops the
+spectral evidence exactly where it matters (a bearing defect that the 1 Hz channels do not
+show yet). The spectral features of such a pulse are therefore carried forward from the
 engine's newest pulse whose frame has landed (an as-of join), provided that pulse belongs
 to the same lifecycle and is at most SPECTRAL_MAX_LAG_SECONDS older; the features are
 5-minute means, so seconds of lag barely move them. Beyond that (HF disabled or down) they
-stay missing and the models' missing-value branches decide. A pulse whose frame landed is
-scored as it is, also when one of its values is missing (a measurement gap, not lag), and
-the scored pulse itself never changes.
+stay missing and the missing-value branches decide. A pulse whose frame landed is scored
+as it is, also when one of its values is missing (a measurement gap, not lag), and the
+scored pulse itself never changes.
+
+The donor query reads only the lagging pulses' own lifecycles - (engine_id, lifecycle_id)
+is the sorting-key prefix of both tables behind the view, so their FINAL reads skip every
+other lifecycle instead of the whole feature history - between the oldest lagging pulse
+minus the lag limit and the newest lagging pulse.
 """
 
 from __future__ import annotations
@@ -120,22 +126,31 @@ def latest_frame_query(
 ) -> tuple[str, dict[str, Any]]:
     """Newest pulse whose HF frame landed (any spectral value present), per engine of ``lagging``.
 
-    Only pulses within ``max_lag_seconds`` of the oldest lagging pulse are read; whether
-    a donor is close enough for its own engine is decided by carry_forward_spectral.
+    Only the lagging pulses' lifecycles are read, from ``max_lag_seconds`` before the oldest
+    lagging pulse up to the newest one. carry_forward_spectral accepts only a donor of the
+    same lifecycle that is not newer than its engine's pulse, so the bounds never drop a
+    donor it would use; they only spare the scan. Whether a donor is close enough for its
+    own engine is decided there.
     """
-    since_us = min(epoch_micros(stamp) for stamp in lagging["event_ts"]) - int(max_lag_seconds * 1e6)
+    stamps = [epoch_micros(stamp) for stamp in lagging["event_ts"]]
     landed = " OR ".join(f"isFinite(`{column}`)" for column in SPECTRAL_FEATURE_COLUMNS)
     sql = f"""
         SELECT {column_list(_DONOR_COLUMNS)}
         FROM {source}
-        WHERE engine_id IN {{engines:Array(String)}}
+        WHERE (engine_id, lifecycle_id) IN {{lifecycles:Array(Tuple(String, UInt32))}}
           AND event_ts >= fromUnixTimestamp64Micro({{since_us:Int64}}, 'UTC')
+          AND event_ts <= fromUnixTimestamp64Micro({{until_us:Int64}}, 'UTC')
           AND ({landed})
         ORDER BY event_ts DESC, telemetry_id DESC
         LIMIT 1 BY engine_id
     """
-    engines = sorted({str(engine) for engine in lagging["engine_id"]})
-    return sql, {"engines": engines, "since_us": since_us}
+    pairs = zip(lagging["engine_id"], lagging["lifecycle_id"], strict=True)
+    lifecycles = sorted({(str(engine), int(lifecycle)) for engine, lifecycle in pairs})
+    return sql, {
+        "lifecycles": lifecycles,
+        "since_us": min(stamps) - int(max_lag_seconds * 1e6),
+        "until_us": max(stamps),
+    }
 
 
 def carry_forward_spectral(

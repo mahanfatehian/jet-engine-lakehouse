@@ -126,15 +126,20 @@ def test_lagging_spectral_values_are_carried_forward_within_the_lifecycle_and_th
     pd.testing.assert_frame_equal(frame.drop(columns=spectral), latest.drop(columns=spectral))
     assert "1 current, 2 carried forward (oldest 10.0 s), 3 missing" in caplog.text
     [_, (donor_sql, parameters)] = gateway.queries
-    assert parameters["engines"] == sorted(latest.loc[1:5, "engine_id"])
-    lagging_since = min(epoch_micros(stamp) for stamp in latest.loc[1:5, "event_ts"])
-    assert parameters["since_us"] == lagging_since - 60_000_000
-    landed = " OR ".join(f"isFinite(`{column}`)" for column in SPECTRAL_FEATURE_COLUMNS)
-    assert f"AND ({landed})" in donor_sql
-    assert (
-        "fromUnixTimestamp64Micro({since_us:Int64}, 'UTC')" in donor_sql
-        and "LIMIT 1 BY engine_id" in donor_sql
+    lagging = latest.loc[1:5]
+    # Only the lagging pulses' lifecycles: the sorting-key prefix of both tables behind the view.
+    assert "WHERE (engine_id, lifecycle_id) IN {lifecycles:Array(Tuple(String, UInt32))}" in donor_sql
+    assert parameters["lifecycles"] == sorted(
+        (engine, int(lifecycle))
+        for engine, lifecycle in zip(lagging["engine_id"], lagging["lifecycle_id"], strict=True)
     )
+    stamps = [epoch_micros(stamp) for stamp in lagging["event_ts"]]
+    assert parameters["since_us"] == min(stamps) - 60_000_000 and parameters["until_us"] == max(stamps)
+    assert "event_ts >= fromUnixTimestamp64Micro({since_us:Int64}, 'UTC')" in donor_sql
+    assert "event_ts <= fromUnixTimestamp64Micro({until_us:Int64}, 'UTC')" in donor_sql
+    landed = " OR ".join(f"isFinite(`{column}`)" for column in SPECTRAL_FEATURE_COLUMNS)
+    assert f"AND ({landed})" in donor_sql and "LIMIT 1 BY engine_id" in donor_sql
+    assert "engines" not in parameters
 
 
 def test_carry_forward_reports_where_each_value_came_from(inference_frame: pd.DataFrame) -> None:
@@ -186,7 +191,7 @@ def test_carrying_spectral_features_forward_keeps_the_bearing_evidence(
             n_engines=3,
             lifecycles_per_engine=1,
             seed=5,
-            observed_fraction=0.95,
+            observed_fraction=0.8,
             modes=("BEARING_DEGRADATION",),
         )
     )
@@ -201,7 +206,8 @@ def test_carrying_spectral_features_forward_keeps_the_bearing_evidence(
         bundle, load_inference_frame(ViewGateway(lagging, donors)), hours_per_cycle=2.0, predicted_at=NOW
     )
 
-    # Scored as missing, the newest pulse of a failing bearing looks healthy: a late warning.
-    assert (blind["predicted_rul_cycles"] > complete["predicted_rul_cycles"] + 20).all()
-    assert set(complete["risk_band"]) == {"HIGH"} and set(blind["risk_band"]) != {"HIGH"}
+    # Scored without spectral values, the pulse features alone decide, and they see a bearing
+    # defect late: every estimate is later and the HIGH warning is missed.
+    assert (blind["predicted_rul_cycles"] > complete["predicted_rul_cycles"] + 5).all()
+    assert "HIGH" in set(complete["risk_band"]) and "HIGH" not in set(blind["risk_band"])
     pd.testing.assert_frame_equal(carried, complete)

@@ -180,6 +180,14 @@ engine whose HF frames do not land. It is stored as `holdout_spectral_masked` in
    fired in every bearing-degradation and oil-leak lifecycle and in none of the 14 hot-section or
    compressor failures.
 
+   With more history the picture changes a little. On the live mart with 230 lifecycles the
+   spectral features lowered the holdout RMSE in each of three lifecycle splits (seeds 42, 1, 3:
+   12.70 / 12.78 / 11.31 cycles with them, 13.05 / 13.24 / 11.92 for the pulse-only model, before
+   spectral dropout), and the production run on 258 lifecycles logged 12.94 vs 13.42 cycles
+   (late-life RMSE 14.48 vs 14.95, F1 0.887 vs 0.879) with spectral dropout on. A modest gain, but a
+   consistent one: the failure-mode signatures help most late in life, where the bearing tone and
+   the oil-system channels separate the modes.
+
 ## 5. Promotion, artifacts and the registry
 
 - **Quality floors.** Every promotion, under any policy, requires holdout R² ≥ `PROMOTION_MIN_R2`
@@ -201,7 +209,9 @@ engine whose HF frames do not land. It is stored as `holdout_spectral_masked` in
 - **Artifacts** go to `s3://lakehouse/ml-artifacts/rul_model/rul-<UTC timestamp>/`:
   `model_bundle.joblib` (both models, calibration, threshold, feature list, categories, horizon,
   cap, library versions), `regressor.json` (portable XGBoost format, served trees only),
-  `metadata.json`, `metrics.json` and `feature_importance.csv`.
+  `metadata.json`, `metrics.json` and `feature_importance.csv` (per input: XGBoost's average
+  `gain` per split, `total_gain`, `weight` = number of splits, `cover`, and `gain_share`, the share
+  of the total gain; sorted by total gain).
 - **Integrity.** The SHA-256 of `model_bundle.joblib` is stored in `production.json`
   (`bundle_sha256`), `metadata.json` and the run registry; inference verifies it before unpickling
   and refuses a missing or mismatching digest.

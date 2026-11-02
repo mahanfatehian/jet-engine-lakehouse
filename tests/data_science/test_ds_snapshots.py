@@ -19,6 +19,7 @@ from lakehouse_snapshots import (
     GOLD_TRAINING_FEATURES,
     SILVER_ML_FEATURES,
     SNAPSHOT_DATASETS,
+    SnapshotDataset,
     format_snapshot_ts,
     latest_nonempty_snapshot,
     latest_snapshot_key,
@@ -60,10 +61,16 @@ class TailOnlyStore(LocalArtifactStore):
 
 
 def _tables(mart: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    lifecycles = mart.groupby(["engine_id", "lifecycle_id"], as_index=False).agg(
+        lifecycle_end_ts=("event_ts", "max")
+    )
     return {
         "int_ml_features": mart.loc[:, list(INFERENCE_FRAME_COLUMNS)],
         "mart_rul_training_features": mart.drop(columns=["wear_factor", "status"]),
         "fct_engine_health_status": pd.DataFrame({"engine_id": ["ENG-001"], "risk_band": ["LOW"]}),
+        # Read by the silver export's window, never exported themselves.
+        "int_sensor_rolling_features": mart.loc[:, ["engine_id", "lifecycle_id", "event_ts"]],
+        "int_engine_lifecycles": lifecycles,
     }
 
 
@@ -77,6 +84,8 @@ ENGINES = {
     "int_ml_features": "View",
     "mart_rul_training_features": "ReplacingMergeTree",
     "fct_engine_health_status": "MergeTree",
+    "int_sensor_rolling_features": "ReplacingMergeTree",
+    "int_engine_lifecycles": "ReplacingMergeTree",
 }
 NOW = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 
@@ -146,22 +155,33 @@ def test_latest_snapshot_ignores_incomplete_and_foreign_prefixes(tmp_path: Path)
     )
 
 
-def test_snapshot_query_windows_only_the_silver_features() -> None:
-    silver = snapshot_select_sql(SILVER_ML_FEATURES, "View", 7)
-    materialized = snapshot_select_sql(SILVER_ML_FEATURES, "ReplacingMergeTree", 2)
-    gold = snapshot_select_sql(GOLD_HEALTH_STATUS, "MergeTree", 7)
+def test_snapshot_query_windows_only_the_silver_features_and_bounds_their_lifecycles() -> None:
+    silver = snapshot_select_sql(SILVER_ML_FEATURES, ENGINES, 7)
+    materialized = snapshot_select_sql(
+        SILVER_ML_FEATURES, {**ENGINES, "int_ml_features": "ReplacingMergeTree"}, 2
+    )
+    gold = snapshot_select_sql(GOLD_HEALTH_STATUS, ENGINES, 7)
 
+    # The window ends at the newest pulse feature, read without the view's join; only the
+    # lifecycles ending inside it are read, by the sorting-key prefix of the view's tables.
+    start = "(SELECT max(`event_ts`) FROM `int_sensor_rolling_features`) - INTERVAL 7 DAY"
     assert silver == (
-        "SELECT * FROM `int_ml_features` WHERE `event_ts` >= "
-        "(SELECT max(`event_ts`) FROM `int_ml_features`) - INTERVAL 7 DAY"
+        f"SELECT * FROM `int_ml_features` WHERE `event_ts` >= {start} AND (engine_id, lifecycle_id) IN "
+        "(SELECT engine_id, lifecycle_id FROM `int_engine_lifecycles` FINAL "
+        f"WHERE lifecycle_end_ts >= {start})"
     )
-    assert materialized == (
-        "SELECT * FROM `int_ml_features` FINAL WHERE `event_ts` >= "
-        "(SELECT max(`event_ts`) FROM `int_ml_features` FINAL) - INTERVAL 2 DAY"
-    )
+    assert materialized.startswith("SELECT * FROM `int_ml_features` FINAL WHERE `event_ts` >= (SELECT max(")
+    assert materialized.count("INTERVAL 2 DAY") == 2
     assert gold == "SELECT * FROM `fct_engine_health_status`"
+    # A window without a separate source: the newest value of the exported table itself.
+    own_window = SnapshotDataset("silver", "int_sensor_rolling_features", window_column="event_ts")
+    assert own_window.tables == ("int_sensor_rolling_features",)
+    assert snapshot_select_sql(own_window, ENGINES, 7) == (
+        "SELECT * FROM `int_sensor_rolling_features` FINAL WHERE `event_ts` >= "
+        "(SELECT max(`event_ts`) FROM `int_sensor_rolling_features` FINAL) - INTERVAL 7 DAY"
+    )
     with pytest.raises(ValueError, match="window_days"):
-        snapshot_select_sql(SILVER_ML_FEATURES, "View", 0)
+        snapshot_select_sql(SILVER_ML_FEATURES, ENGINES, 0)
 
 
 def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path, synthetic_mart) -> None:
@@ -181,8 +201,10 @@ def test_snapshot_job_exports_every_dataset_and_applies_retention(tmp_path: Path
             "20261026T030000Z",
         ]
     silver_queries = [query for query in exporter.queries if "int_ml_features" in query]
-    assert len(silver_queries) == 4 and all("FINAL" not in query for query in silver_queries)
-    assert all("INTERVAL 7 DAY" in query for query in silver_queries)
+    assert len(silver_queries) == 4
+    for query in silver_queries:
+        assert "`int_ml_features` FINAL" not in query and "`int_engine_lifecycles` FINAL" in query
+        assert "INTERVAL 7 DAY" in query
     assert all("FINAL" not in query for query in exporter.queries if "fct_engine_health_status" in query)
 
     with SnapshotTrainingSource(store) as source:
@@ -227,12 +249,17 @@ def test_snapshot_job_skips_when_every_source_is_empty(tmp_path: Path, synthetic
     assert store.list_keys("silver/") == [] and store.list_keys("gold/mart") == []
 
 
-def test_snapshot_job_skips_until_every_source_table_exists(tmp_path: Path, synthetic_mart) -> None:
+@pytest.mark.parametrize(
+    "absent", ["fct_engine_health_status", "int_sensor_rolling_features", "int_engine_lifecycles"]
+)
+def test_snapshot_job_skips_until_every_source_table_exists(
+    tmp_path: Path, synthetic_mart, absent: str
+) -> None:
     store = LocalArtifactStore(tmp_path)
     tables = _tables(synthetic_mart)
-    del tables["fct_engine_health_status"]
+    del tables[absent]
 
-    with pytest.raises(PreconditionsNotMetError, match="fct_engine_health_status"):
+    with pytest.raises(PreconditionsNotMetError, match=absent):
         run_snapshot(
             FakeExporter(tables, ENGINES), store, retention=5, now=datetime.now(UTC), stop=StopToken()
         )

@@ -263,7 +263,7 @@ flowchart LR
 | The reconciliation finds a layer that disagrees with the source | task `reconcile` exits 65, is logged as FAILED with the worst (layer, engine, hour) cells and backs off; every cell is in `ops_reconciliation`, on the Data Platform dashboard and in `make verify` (WARN) |
 | Nothing to reconcile yet (fresh stack, lake or staging not built, `ops_reconciliation` missing) | `reconcile` exits 3 (SKIPPED) and is retried after the next dbt run; on a fresh stack the first comparison follows about `RECONCILE_LAG_SECONDS` after the backfill |
 | HF backlog older than the 2-hour topic retention | the HF queries skip the deleted frames with a warning; those pulses keep NULL spectral features, which the models treat as missing |
-| HF disabled (`SIM_HF_ENABLED=false`) or lagging | the CDC path, dbt and scoring run unchanged; scoring carries spectral features forward for at most `SPECTRAL_MAX_LAG_SECONDS`, then the models' missing-value branches decide; no HF backfill rows are written, and rows left by an earlier run wait for the next start with HF enabled |
+| HF disabled (`SIM_HF_ENABLED=false`) or lagging | the CDC path, dbt and scoring run unchanged; scoring carries spectral features forward for at most `SPECTRAL_MAX_LAG_SECONDS`, then the models' missing-value branches, fitted by spectral dropout in training, score the pulse from its pulse features; no HF backfill rows are written, and rows left by an earlier run wait for the next start with HF enabled |
 | `make clean` | all volumes are deleted; the next `make up` rebuilds history from the backfill |
 
 ## 7. Design decisions
