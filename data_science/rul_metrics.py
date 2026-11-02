@@ -37,31 +37,45 @@ def _rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
     return float(np.sqrt(np.mean((predicted - actual) ** 2)))
 
 
-def brier_score(outcome: np.ndarray, probability: np.ndarray) -> float:
-    """Mean squared difference between predicted probabilities and 0/1 outcomes (lower is better)."""
+def row_weights(outcome: np.ndarray, weight: np.ndarray | None) -> np.ndarray:
+    """``weight`` as float64, or a weight of 1 for every row of ``outcome`` when it is None."""
+    return np.ones(np.asarray(outcome).size) if weight is None else np.asarray(weight, dtype=np.float64)
+
+
+def brier_score(outcome: np.ndarray, probability: np.ndarray, weight: np.ndarray | None = None) -> float:
+    """Mean squared difference between predicted probabilities and 0/1 outcomes (lower is better).
+
+    ``weight`` weighs each row (default: every row counts once).
+    """
     outcome = np.asarray(outcome, dtype=np.float64)
     if outcome.size == 0:
         return math.nan
-    return float(np.mean((np.asarray(probability, dtype=np.float64) - outcome) ** 2))
+    squared = (np.asarray(probability, dtype=np.float64) - outcome) ** 2
+    return float(np.average(squared, weights=row_weights(outcome, weight)))
 
 
 def expected_calibration_error(
-    outcome: np.ndarray, probability: np.ndarray, bins: int = CALIBRATION_BINS
+    outcome: np.ndarray,
+    probability: np.ndarray,
+    bins: int = CALIBRATION_BINS,
+    weight: np.ndarray | None = None,
 ) -> float:
     """Expected calibration error over ``bins`` equal-width probability bins.
 
     ``sum_b (n_b / n) * |mean probability in b - observed positive rate in b|``: 0 for a
     perfectly calibrated model, and the average gap between stated and observed risk otherwise.
+    ``weight`` weighs each row (default: every row counts once).
     """
     outcome = np.asarray(outcome, dtype=np.float64)
     probability = np.clip(np.asarray(probability, dtype=np.float64), 0.0, 1.0)
     if outcome.size == 0:
         return math.nan
+    weight = row_weights(outcome, weight)
     # Bin b holds [b/bins, (b+1)/bins); probability 1.0 joins the last bin.
     index = np.minimum((probability * bins).astype(np.int64), bins - 1)
-    stated = np.bincount(index, weights=probability, minlength=bins)
-    observed = np.bincount(index, weights=outcome, minlength=bins)
-    return float(np.abs(stated - observed).sum() / outcome.size)
+    stated = np.bincount(index, weights=weight * probability, minlength=bins)
+    observed = np.bincount(index, weights=weight * outcome, minlength=bins)
+    return float(np.abs(stated - observed).sum() / weight.sum())
 
 
 @dataclass(frozen=True)

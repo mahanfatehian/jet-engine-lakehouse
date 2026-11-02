@@ -6,9 +6,11 @@
 Rows come from the dbt gold mart (ClickHouse) or its newest non-empty MinIO snapshot, at
 most TRAINING_MAX_ROWS of them (the newest completed lifecycles, see training_window.py).
 Whole lifecycles are split into train / validation / test; the challenger is scored on the
-test lifecycles and, when a production model exists, so is the champion. Both models are
+test lifecycles and, when a production model exists, so is the champion. The challenger is
+also scored on the test lifecycles with every spectral value masked, which is how it scores
+an engine while no HF frame lands (rul_modeling.py, spectral dropout). Both models are
 also refitted without the spectral features on the identical split: that ablation is
-logged and recorded as evidence of what the HF path adds (feature_ablation.py) and never
+logged and recorded as evidence of what the HF path adds (feature_ablation.py). Neither
 influences promotion. The promotion gate (model_promotion.py) applies absolute quality
 floors to every promotion and, under MODEL_PROMOTION_POLICY=better, the champion
 comparison; it fails closed. Artifacts go to MinIO and every non-dry run is recorded in
@@ -57,6 +59,7 @@ from rul_modeling import (
     GroupSplit,
     LabelSpec,
     evaluate_bundle,
+    evaluate_without_spectral,
     feature_importance,
     split_groups,
     train_models,
@@ -258,6 +261,7 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
     )
     context.stop.raise_if_stopped()
     holdout = evaluate_bundle(trained.bundle, frames["test"], context.labels)
+    holdout_spectral_masked = evaluate_without_spectral(trained.bundle, frames["test"], context.labels)
     context.stop.raise_if_stopped()
     ablation = context.ablate(frames, context.labels, trained, holdout)
     context.stop.raise_if_stopped()
@@ -270,6 +274,7 @@ def run_training(request: TrainingRequest, context: TrainingContext, *, now: dat
         rows={side: len(frame) for side, frame in frames.items()},
         trained=trained,
         holdout=holdout,
+        holdout_spectral_masked=holdout_spectral_masked,
         ablation=ablation,
         champion=champion,
         decision=decision,

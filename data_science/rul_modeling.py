@@ -8,8 +8,34 @@ Two models share one feature matrix:
     calibrated out-of-fold over lifecycles and whose decision threshold maximises F1 on
     those calibrated probabilities (see failure_classifier.py).
 
-The classifier is deliberately unweighted: class re-weighting would inflate the minority
-class probability, and ``failure_probability`` is published as a calibrated probability.
+The classifier is deliberately not class-weighted: class re-weighting would inflate the
+minority class probability, and ``failure_probability`` is published as a calibrated
+probability.
+
+Spectral dropout. A pulse is scored without spectral features whenever its HF frame is
+missing (HF disabled or down, the stack just started, or the frame lagging more than
+SPECTRAL_MAX_LAG_SECONDS). Both models send a missing value down a default branch, but a
+branch is only fitted where training rows were missing: trained on rows that all carry
+spectral values, every such branch is an untrained default and the estimate of a pulse
+without them is arbitrary. So whenever the development rows hold spectral values, both
+models are fitted on those rows plus a copy of every row with all spectral features
+missing, which fits the missing-value branches to what the pulse features alone say. Every
+row is copied, also rows already without spectral values, so the lifecycles keep their
+relative weights. A copy keeps the lifecycle (``split_group``) of its row, so the
+classifier's lifecycle-grouped folds never score a row with a model that saw its copy. The
+regressor early-stops on the validation rows plus their copy, and the classifier's iteration
+count, calibration and threshold come from both, so the published probability holds for
+pulses with and without an HF frame. A model without spectral inputs (the spectral
+ablation) gets no copy.
+
+A copy weighs SPECTRAL_DROPOUT_WEIGHT of a row, in every fit, early stopping, calibration
+and threshold. At full weight half of every node's rows have no value to split a spectral
+feature on, which halves the gain of every spectral split: the trees then all but ignore
+the spectral features, and on the live mart the regressor lost all it gained from them
+(holdout RMSE as high as the pulse-only model's). A tenth of a row still fits the
+missing-value branches - with every spectral value masked the models score about as well
+as models of the pulse features alone - while pulses with an HF frame keep much of the
+spectral gain. A larger weight buys a little accuracy without HF frames for a loss with them.
 """
 
 from __future__ import annotations
@@ -26,7 +52,13 @@ import sklearn
 import xgboost as xgb
 from ds_settings import MIN_SPLIT_LIFECYCLES
 from failure_classifier import CalibrationReport, PlattCalibration, fit_failure_classifier
-from feature_pipeline import FEATURE_COLUMNS, build_feature_matrix, fit_categories, matrix_columns
+from feature_pipeline import (
+    FEATURE_COLUMNS,
+    SPECTRAL_FEATURE_COLUMNS,
+    build_feature_matrix,
+    fit_categories,
+    matrix_columns,
+)
 from rul_metrics import HoldoutMetrics, evaluate_predictions
 from sklearn.ensemble import HistGradientBoostingClassifier
 
@@ -37,6 +69,8 @@ TEST_FRACTION = 0.25
 VALIDATION_FRACTION = 0.2
 MIN_SPLIT_GROUPS = MIN_SPLIT_LIFECYCLES
 EARLY_STOPPING_ROUNDS = 75
+# Weight of a spectral-dropout copy relative to its row (see the module docstring).
+SPECTRAL_DROPOUT_WEIGHT = 0.1
 
 REGRESSOR_PARAMS: dict[str, Any] = {
     "objective": "reg:squarederror",
@@ -226,6 +260,7 @@ class TrainedModel:
     best_iteration: int
     validation: HoldoutMetrics
     calibration: CalibrationReport
+    spectral_dropout: bool = False  # fitted on the rows plus a copy without spectral values
 
 
 def library_versions() -> dict[str, str]:
@@ -239,15 +274,70 @@ def library_versions() -> dict[str, str]:
     }
 
 
-def _fit_regressor(
-    x_train: pd.DataFrame, y_train: np.ndarray, x_val: pd.DataFrame, y_val: np.ndarray
-) -> xgb.XGBRegressor:
+@dataclass(frozen=True)
+class FitRows:
+    """Model input, both targets and the lifecycles of one side (train or validation) of a fit."""
+
+    matrix: pd.DataFrame
+    rul: np.ndarray
+    failure: np.ndarray
+    groups: np.ndarray
+    weight: np.ndarray | None = None  # per row; None: every row counts once
+
+    @classmethod
+    def of(
+        cls,
+        frame: pd.DataFrame,
+        categories: Mapping[str, Sequence[str]],
+        columns: Sequence[str],
+        labels: LabelSpec,
+    ) -> FitRows:
+        """Encode ``frame`` and derive both targets with ``labels``."""
+        return cls(
+            matrix=build_feature_matrix(frame, categories, columns),
+            rul=labels.regression_target(frame),
+            failure=labels.failure_target(frame),
+            groups=frame["split_group"].to_numpy(),
+        )
+
+    def holds_values(self, columns: Sequence[str]) -> bool:
+        """True when any row has a value in any of ``columns``."""
+        return bool(self.matrix.loc[:, list(columns)].notna().to_numpy().any())
+
+    def with_spectral_dropout(
+        self, columns: Sequence[str], weight: float = SPECTRAL_DROPOUT_WEIGHT
+    ) -> FitRows:
+        """These rows followed by a copy of every row with ``columns`` missing (see above).
+
+        A copy keeps the targets and the lifecycle of its row and weighs ``weight`` of it.
+        """
+        values = self.matrix.to_numpy()
+        doubled = np.concatenate([values, values])
+        doubled[len(values) :, [self.matrix.columns.get_loc(column) for column in columns]] = np.nan
+        row_weight = np.ones(len(values)) if self.weight is None else self.weight
+        return FitRows(
+            matrix=pd.DataFrame(doubled, columns=self.matrix.columns),
+            rul=np.tile(self.rul, 2),
+            failure=np.tile(self.failure, 2),
+            groups=np.tile(self.groups, 2),
+            weight=np.concatenate([row_weight, weight * row_weight]),
+        )
+
+
+def _fit_regressor(train: FitRows, validation: FitRows) -> xgb.XGBRegressor:
     """Early-stop on the validation lifecycles and keep only the trees up to the best iteration."""
     regressor = xgb.XGBRegressor(
         **REGRESSOR_PARAMS,
         callbacks=[xgb.callback.EarlyStopping(rounds=EARLY_STOPPING_ROUNDS, save_best=True)],
     )
-    regressor.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=False)
+    regressor.fit(
+        train.matrix,
+        train.rul,
+        sample_weight=train.weight,
+        eval_set=[(validation.matrix, validation.rul)],
+        sample_weight_eval_set=None if validation.weight is None else [validation.weight],
+        verbose=False,
+    )
     return regressor
 
 
@@ -266,24 +356,26 @@ def train_models(
     The regressor trains on the train lifecycles and early-stops on the validation ones;
     the classifier's iteration count comes from the same validation lifecycles, its
     calibration and threshold from out-of-fold scores over both (failure_classifier.py).
-    ``feature_columns`` defaults to the full contract; the spectral ablation
-    (feature_ablation.py) passes the same columns without the spectral features.
+    When the development rows hold spectral values, both sides are fitted with spectral
+    dropout (see above). ``feature_columns`` defaults to the full contract; the spectral
+    ablation (feature_ablation.py) passes the same columns without the spectral features.
     """
     columns = tuple(feature_columns)
     categories = fit_categories(train_frame)
-    x_train = build_feature_matrix(train_frame, categories, columns)
-    x_val = build_feature_matrix(validation_frame, categories, columns)
-    failure_train = labels.failure_target(train_frame)
-    failure_val = labels.failure_target(validation_frame)
-    if np.unique(failure_train).size < 2 or np.unique(failure_val).size < 2:
+    train = FitRows.of(train_frame, categories, columns, labels)
+    validation = FitRows.of(validation_frame, categories, columns, labels)
+    if np.unique(train.failure).size < 2 or np.unique(validation.failure).size < 2:
         raise ValueError("training and validation lifecycles must contain rows on both sides of the horizon")
+    spectral = [column for column in columns if column in SPECTRAL_FEATURE_COLUMNS]
+    dropout = bool(spectral) and (train.holds_values(spectral) or validation.holds_values(spectral))
+    if dropout:
+        train, validation = train.with_spectral_dropout(spectral), validation.with_spectral_dropout(spectral)
 
-    regressor = _fit_regressor(
-        x_train, labels.regression_target(train_frame), x_val, labels.regression_target(validation_frame)
-    )
+    regressor = _fit_regressor(train, validation)
     classifier = fit_failure_classifier(
-        (x_train, failure_train, train_frame["split_group"].to_numpy()),
-        (x_val, failure_val, validation_frame["split_group"].to_numpy()),
+        (train.matrix, train.failure, train.groups),
+        (validation.matrix, validation.failure, validation.groups),
+        weights=None if train.weight is None else (train.weight, validation.weight),
     )
     bundle = RulModelBundle(
         model_version=model_version,
@@ -304,6 +396,7 @@ def train_models(
         best_iteration=int(regressor.best_iteration),
         validation=evaluate_bundle(bundle, validation_frame, labels),
         calibration=classifier.report,
+        spectral_dropout=dropout,
     )
 
 
@@ -321,17 +414,28 @@ def evaluate_bundle(bundle: RulModelBundle, frame: pd.DataFrame, labels: LabelSp
     )
 
 
-def feature_importance(bundle: RulModelBundle) -> pd.DataFrame:
-    """XGBoost importances (gain, weight, cover) of every model input, by gain descending.
+def evaluate_without_spectral(
+    bundle: RulModelBundle, frame: pd.DataFrame, labels: LabelSpec
+) -> HoldoutMetrics:
+    """Score ``bundle`` on ``frame`` with every spectral feature missing, as if no HF frame had landed."""
+    return evaluate_bundle(bundle, frame.assign(**dict.fromkeys(SPECTRAL_FEATURE_COLUMNS, np.nan)), labels)
 
-    The regressor holds only the trees up to its best iteration, so these are the
-    importances of exactly the trees that serve predictions.
+
+def feature_importance(bundle: RulModelBundle) -> pd.DataFrame:
+    """XGBoost importances of every model input, by total gain descending.
+
+    ``total_gain`` is the loss reduction summed over every split on the feature, ``gain``
+    XGBoost's average per split (``total_gain / weight``), ``weight`` the number of splits
+    and ``cover`` their average coverage (rows, for squared error). Only the total adds up
+    across features, so ``gain_share`` is each feature's share of the total gain. The
+    regressor holds only the trees up to its best iteration, so these are the importances
+    of exactly the trees that serve predictions.
     """
     booster = bundle.regressor.get_booster()
     importance = pd.DataFrame({"feature": bundle.matrix_columns})
-    for kind in ("gain", "weight", "cover"):
+    for kind in ("gain", "total_gain", "weight", "cover"):
         scores = booster.get_score(importance_type=kind)
         importance[kind] = [float(scores.get(name, 0.0)) for name in importance["feature"]]
-    total_gain = float(importance["gain"].sum())
-    importance["gain_share"] = importance["gain"] / total_gain if total_gain > 0 else 0.0
-    return importance.sort_values("gain", ascending=False, kind="mergesort").reset_index(drop=True)
+    total = float(importance["total_gain"].sum())
+    importance["gain_share"] = importance["total_gain"] / total if total > 0 else 0.0
+    return importance.sort_values("total_gain", ascending=False, kind="mergesort").reset_index(drop=True)

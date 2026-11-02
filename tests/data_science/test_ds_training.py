@@ -3,23 +3,33 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import pytest
+import rul_modeling
 from failure_classifier import (
     CALIBRATION_FOLDS,
     CLASSIFIER_PARAMS,
     NEUTRAL_THRESHOLD,
     THRESHOLD_BOUNDS,
     PlattCalibration,
+    WeightedLossClassifier,
     fit_platt,
     group_folds,
     out_of_fold_scores,
     select_threshold,
     without_empty_columns,
 )
-from feature_pipeline import FEATURE_COLUMNS, SPECTRAL_FEATURE_COLUMNS, build_feature_matrix, fit_categories
+from feature_pipeline import (
+    FEATURE_COLUMNS,
+    PULSE_FEATURE_COLUMNS,
+    SPECTRAL_FEATURE_COLUMNS,
+    build_feature_matrix,
+    fit_categories,
+    spectral_coverage,
+)
 from rul_metrics import (
     HoldoutMetrics,
     brier_score,
@@ -28,16 +38,21 @@ from rul_metrics import (
     nasa_scores,
 )
 from rul_modeling import (
+    SPECTRAL_DROPOUT_WEIGHT,
+    FitRows,
     IncompatibleModelError,
     LabelSpec,
     RulModelBundle,
+    TrainedModel,
     evaluate_bundle,
+    evaluate_without_spectral,
     feature_importance,
     split_groups,
     train_models,
 )
 from scipy.special import expit
-from sklearn.metrics import f1_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import f1_score, roc_auc_score
 
 
 def test_split_keeps_every_lifecycle_on_exactly_one_side(synthetic_mart: pd.DataFrame) -> None:
@@ -127,7 +142,8 @@ def test_both_models_train_calibrate_and_score_with_missing_spectral_features(
     report = trained.calibration
     assert np.isfinite([report.calibration.slope, report.calibration.intercept, report.oof_brier]).all()
     assert THRESHOLD_BOUNDS[0] <= report.threshold <= THRESHOLD_BOUNDS[1]
-    assert report.rows == len(frames["train"]) + len(frames["validation"])
+    assert trained.spectral_dropout
+    assert report.rows == 2 * (len(frames["train"]) + len(frames["validation"]))
     assert holdout.rows == len(frames["test"]) and np.isfinite([holdout.rmse, holdout.clf_roc_auc]).all()
     matrix = trained.bundle.feature_matrix(hf_disabled(frames["test"]))
     probability = trained.bundle.predict_failure_probability(matrix)
@@ -152,6 +168,9 @@ def test_models_train_when_hf_is_disabled(synthetic_training, label_spec: LabelS
 
     bundle = trained.bundle
     assert bundle.feature_columns == FEATURE_COLUMNS
+    # Nothing to mask: no copies are added.
+    assert not trained.spectral_dropout
+    assert trained.calibration.rows == len(frames["train"]) + len(frames["validation"])
     holdout = evaluate_bundle(bundle, frames["test"], label_spec)
     assert holdout.r2 > 0.5 and np.isfinite(trained.calibration.oof_brier)
     # With HF back, the served models still score: they simply never split on the spectral features.
@@ -161,6 +180,114 @@ def test_models_train_when_hf_is_disabled(synthetic_training, label_spec: LabelS
     )
     importance = feature_importance(bundle).set_index("feature")["gain"]
     assert importance[list(SPECTRAL_FEATURE_COLUMNS)].sum() == 0.0
+
+
+@dataclass(frozen=True)
+class FullCoverage:
+    """Models fitted on lifecycles where every pulse has its HF frame, and the rows each model saw."""
+
+    frames: dict[str, pd.DataFrame]
+    trained: TrainedModel
+    pulse_only: TrainedModel
+    regressor_rows: tuple[FitRows, FitRows]  # fit and early-stopping rows
+    classifier_rows: tuple[tuple, tuple]  # (matrix, outcome, lifecycles) of train and validation
+    classifier_weights: tuple[np.ndarray, np.ndarray]
+
+
+@pytest.fixture(scope="module")
+def full_coverage(make_mart, label_spec: LabelSpec) -> FullCoverage:
+    mart = make_mart(hf_outage_probability=0.0)
+    assert spectral_coverage(mart) == 1.0
+    split = split_groups(mart["split_group"].unique())
+    sides = {"train": split.train, "validation": split.validation, "test": split.test}
+    frames = {
+        side: mart[mart["split_group"].isin(groups)].reset_index(drop=True) for side, groups in sides.items()
+    }
+    seen: dict[str, tuple] = {}
+    fit_regressor, fit_classifier = rul_modeling._fit_regressor, rul_modeling.fit_failure_classifier
+
+    def regressor(train, validation):
+        seen["regressor"] = (train, validation)
+        return fit_regressor(train, validation)
+
+    def classifier(train, validation, *, weights):
+        seen["classifier"] = (train, validation, weights)
+        return fit_classifier(train, validation, weights=weights)
+
+    run = {"model_version": "rul-20260101T000000Z", "trained_at": "2026-01-01T00:00:00+00:00"}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(rul_modeling, "_fit_regressor", regressor)
+        patch.setattr(rul_modeling, "fit_failure_classifier", classifier)
+        trained = train_models(frames["train"], frames["validation"], label_spec, hours_per_cycle=2.0, **run)
+    pulse_only = train_models(
+        frames["train"],
+        frames["validation"],
+        label_spec,
+        hours_per_cycle=2.0,
+        feature_columns=PULSE_FEATURE_COLUMNS,
+        **run,
+    )
+    return FullCoverage(
+        frames, trained, pulse_only, seen["regressor"], seen["classifier"][:2], seen["classifier"][2]
+    )
+
+
+def test_spectral_dropout_fits_both_models_on_every_row_and_its_copy_without_spectral_values(
+    full_coverage: FullCoverage, label_spec: LabelSpec
+) -> None:
+    train, validation = full_coverage.frames["train"], full_coverage.frames["validation"]
+    spectral = list(SPECTRAL_FEATURE_COLUMNS)
+
+    assert full_coverage.trained.spectral_dropout and not full_coverage.pulse_only.spectral_dropout
+    # The regressor's fit rows and its early-stopping rows: every row, then all of them again
+    # with every spectral value missing, the pulse features and targets unchanged, at a fraction
+    # of a row's weight.
+    for rows, frame in zip(full_coverage.regressor_rows, (train, validation), strict=True):
+        size = len(frame)
+        original, copy = rows.matrix.iloc[:size], rows.matrix.iloc[size:]
+        assert len(copy) == size and (rows.matrix.dtypes == np.float32).all()
+        assert original[spectral].notna().all(axis=None) and copy[spectral].isna().all(axis=None)
+        np.testing.assert_array_equal(
+            copy.drop(columns=spectral).to_numpy(), original.drop(columns=spectral).to_numpy()
+        )
+        np.testing.assert_array_equal(rows.rul, np.tile(label_spec.regression_target(frame), 2))
+        np.testing.assert_array_equal(rows.weight, np.repeat([1.0, SPECTRAL_DROPOUT_WEIGHT], size))
+    # The classifier (iteration count, out-of-fold calibration, threshold) sees the same rows and
+    # weights; a copy keeps its target and its lifecycle, so the lifecycle-grouped folds keep it
+    # with its original.
+    for (matrix, outcome, groups), weight, rows, frame in zip(
+        full_coverage.classifier_rows,
+        full_coverage.classifier_weights,
+        full_coverage.regressor_rows,
+        (train, validation),
+        strict=True,
+    ):
+        pd.testing.assert_frame_equal(matrix, rows.matrix)
+        np.testing.assert_array_equal(weight, rows.weight)
+        np.testing.assert_array_equal(outcome, np.tile(label_spec.failure_target(frame), 2))
+        np.testing.assert_array_equal(groups, np.tile(frame["split_group"].to_numpy(), 2))
+    report = full_coverage.trained.calibration
+    assert report.lifecycles == train["split_group"].nunique() + validation["split_group"].nunique()
+    assert report.rows == 2 * (len(train) + len(validation))
+
+
+def test_without_spectral_values_the_model_falls_back_to_the_pulse_features(
+    full_coverage: FullCoverage, label_spec: LabelSpec, hf_disabled
+) -> None:
+    test = full_coverage.frames["test"]
+    bundle = full_coverage.trained.bundle
+
+    with_hf = evaluate_bundle(bundle, test, label_spec)
+    without_hf = evaluate_without_spectral(bundle, test, label_spec)
+    pulse_only = evaluate_bundle(full_coverage.pulse_only.bundle, test, label_spec)
+
+    assert without_hf == evaluate_bundle(bundle, hf_disabled(test), label_spec)
+    # Every training pulse had its HF frame, yet the missing-value branches were fitted: without
+    # spectral values the estimate is about as good as from a model of the pulse features alone ...
+    assert without_hf.rmse < 1.1 * pulse_only.rmse
+    assert without_hf.clf_roc_auc > 0.9
+    # ... and with them the spectral evidence still counts.
+    assert with_hf.rmse < pulse_only.rmse - 3.0
 
 
 def test_empty_columns_become_constant_for_a_classifier_fit_only() -> None:
@@ -228,8 +355,10 @@ def test_calibration_report_comes_from_out_of_fold_lifecycles(synthetic_training
 
     assert report.lifecycles == len(development)
     assert report.folds == min(CALIBRATION_FOLDS, len(development))
-    assert report.rows == len(synthetic_training.frames["train"]) + len(
-        synthetic_training.frames["validation"]
+    # Spectral dropout: every development row is calibrated with and without its spectral values.
+    assert synthetic_training.trained.spectral_dropout
+    assert report.rows == 2 * (
+        len(synthetic_training.frames["train"]) + len(synthetic_training.frames["validation"])
     )
     assert report.n_iter == synthetic_training.trained.bundle.classifier.n_iter_
     assert report.oof_roc_auc > 0.9 and 0 <= report.oof_brier < 0.1 and 0 <= report.oof_ece < 0.1
@@ -251,10 +380,22 @@ def test_feature_importance_covers_every_model_input(synthetic_training) -> None
     importance = feature_importance(bundle)
 
     assert sorted(importance["feature"]) == sorted(bundle.matrix_columns)
-    assert importance["gain"].is_monotonic_decreasing
-    assert importance["gain_share"].sum() == pytest.approx(1.0)
+    assert importance["total_gain"].is_monotonic_decreasing
     trees = bundle.regressor.get_booster().trees_to_dataframe()
-    assert importance["weight"].sum() == (trees["Feature"] != "Leaf").sum()
+    splits = trees[trees["Feature"] != "Leaf"]
+    assert importance["weight"].sum() == len(splits)
+    # total_gain sums the loss reduction of every split; gain is its average per split.
+    by_feature = importance.set_index("feature")
+    np.testing.assert_allclose(
+        by_feature["total_gain"],
+        splits.groupby("Feature")["Gain"].sum().reindex(by_feature.index, fill_value=0.0),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(by_feature["total_gain"], by_feature["gain"] * by_feature["weight"], rtol=1e-5)
+    assert importance["gain_share"].sum() == pytest.approx(1.0)
+    np.testing.assert_allclose(
+        importance["gain_share"], importance["total_gain"] / importance["total_gain"].sum()
+    )
 
 
 def test_bundle_payload_round_trip_and_format_check(synthetic_training) -> None:
@@ -338,6 +479,31 @@ def test_brier_score_and_calibration_error_known_values() -> None:
     # Four rows stated at 25 % with one positive: perfectly calibrated.
     assert expected_calibration_error(np.array([1, 0, 0, 0]), np.full(4, 0.25)) == pytest.approx(0.0)
     assert expected_calibration_error(np.array([1]), np.array([1.0])) == pytest.approx(0.0)
+
+
+def test_a_row_weight_counts_like_repeating_the_row() -> None:
+    # Spectral-dropout copies enter the calibration at a fraction of a row's weight.
+    rng = np.random.default_rng(11)
+    score = rng.normal(0.0, 2.0, 400)
+    outcome = (rng.random(400) < expit(1.3 * score - 0.5)).astype(np.int8)
+    probability = expit(0.8 * score)
+    repeats = rng.integers(1, 4, 400)
+    weight = repeats.astype(np.float64)
+
+    weighted = fit_platt(score, outcome, weight)
+    repeated = fit_platt(np.repeat(score, repeats), np.repeat(outcome, repeats))
+    assert (weighted.slope, weighted.intercept) == pytest.approx(
+        (repeated.slope, repeated.intercept), abs=1e-6
+    )
+    assert select_threshold(outcome, probability, weight=weight) == select_threshold(
+        np.repeat(outcome, repeats), np.repeat(probability, repeats)
+    )
+    assert brier_score(outcome, probability, weight) == pytest.approx(
+        brier_score(np.repeat(outcome, repeats), np.repeat(probability, repeats))
+    )
+    assert expected_calibration_error(outcome, probability, weight=weight) == pytest.approx(
+        expected_calibration_error(np.repeat(outcome, repeats), np.repeat(probability, repeats))
+    )
 
 
 def test_platt_scaling_recovers_a_known_sigmoid() -> None:
@@ -431,3 +597,40 @@ def test_threshold_ties_break_towards_one_half() -> None:
 
 def test_threshold_without_both_classes_is_neutral() -> None:
     assert select_threshold(np.zeros(4, dtype=int), np.linspace(0, 1, 4)) == NEUTRAL_THRESHOLD
+
+
+def test_dropout_copies_and_their_weights_leave_the_classifier_bin_edges_where_the_rows_put_them() -> None:
+    # Rows plus their spectral-dropout copies: the copies repeat the pulse features and hold NaN in
+    # the spectral columns, at a tenth of a row's weight. Scikit-learn derives weighted bin edges
+    # with one percentile pass per edge (the slow path); WeightedLossClassifier skips the weights
+    # in binning only, so its edges are those of the original rows alone.
+    rng = np.random.default_rng(7)
+    rows = 3000
+    pulse = rng.normal(size=(rows, 4)) * [1.0, 5.0, 0.1, 30.0]
+    spectral = rng.gamma(2.0, size=(rows, 2))
+    outcome = (pulse[:, 0] + spectral[:, 0] + rng.normal(scale=0.5, size=rows) > 2.0).astype(int)
+    matrix = np.vstack([np.hstack([pulse, spectral]), np.hstack([pulse, np.full_like(spectral, np.nan)])])
+    target = np.tile(outcome, 2)
+    weight = np.repeat([1.0, SPECTRAL_DROPOUT_WEIGHT], rows)
+    params = {"max_iter": 30, "early_stopping": False, "random_state": 0}
+
+    fast = WeightedLossClassifier(**params).fit(matrix, target, sample_weight=weight)
+    rows_alone = HistGradientBoostingClassifier(**params).fit(np.hstack([pulse, spectral]), outcome)
+    stock = HistGradientBoostingClassifier(**params).fit(matrix, target, sample_weight=weight)
+
+    for fast_edges, row_edges, stock_edges in zip(
+        fast._bin_mapper.bin_thresholds_,
+        rows_alone._bin_mapper.bin_thresholds_,
+        stock._bin_mapper.bin_thresholds_,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(fast_edges, row_edges)
+        span = row_edges.max() - row_edges.min()
+        assert np.abs(stock_edges - fast_edges).max() < 1e-3 * span, (
+            "weighted rounding moves a few edges only"
+        )
+    # The weights still reach the loss: the copies change the fit, not its quality.
+    assert not np.array_equal(fast.predict_proba(matrix), rows_alone.predict_proba(matrix))
+    scored = np.hstack([pulse, spectral])
+    fast_auc = roc_auc_score(outcome, fast.predict_proba(scored)[:, 1])
+    assert fast_auc == pytest.approx(roc_auc_score(outcome, stock.predict_proba(scored)[:, 1]), abs=0.01)

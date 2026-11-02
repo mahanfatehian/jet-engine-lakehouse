@@ -88,8 +88,9 @@ and inference, so there is no train/serve skew:
 | Spectral (10, HF path) | 5-minute means of the fan bearing-defect (BPFO) amplitude, fan kurtosis and crest factor, fan 1×N1 and core 1×N2 amplitudes, fan high-frequency energy share, oil temperature, oil quantity, oil filter ΔP and the EGT A/B sensor split |
 
 The spectral features are the only ones allowed to be missing (HF disabled, lagging or a dropped
-frame); XGBoost and the classifier treat them as missing values, while a missing pulse feature fails
-the job.
+frame); a missing pulse feature fails the job. Both models send a missing spectral value down a
+default branch of each tree, and training fits those branches on purpose (spectral dropout, section
+4), so a pulse without spectral values is scored from its pulse features alone.
 
 Plus `engine_model` one-hot (categories persisted with the model). Windows are time ranges
 (`RANGE BETWEEN 300 PRECEDING AND CURRENT ROW` over epoch seconds) partitioned by engine
@@ -119,7 +120,27 @@ status columns, identifiers and labels as features.
    cross-validation, so `failure_probability` means what it says. The decision threshold maximises
    F1 on those out-of-fold calibrated probabilities, restricted to [0.05, 0.95] with ties broken
    towards 0.5; the threshold, not class re-weighting, handles the imbalance.
-5. **Evaluate on the holdout lifecycles:**
+5. **Spectral dropout.** A model fitted only on pulses that carry spectral values never fits the
+   missing-value branches of its trees. They stay untrained defaults, so a pulse scored without an
+   HF frame (HF disabled or down, a fresh stack, a frame lagging more than
+   `SPECTRAL_MAX_LAG_SECONDS`) gets an arbitrary estimate: on the live mart (230 lifecycles,
+   99.98 % spectral coverage) masking every spectral value of the holdout raised the RMSE from 12.7
+   to 25.0 cycles and cut F1 from 0.89 to 0.80. So whenever the development rows hold spectral
+   values, both models are fitted on those rows plus a copy of every row with all 10 spectral
+   features missing. A copy keeps its lifecycle, so the lifecycle-grouped calibration folds never
+   score a pulse with a model that saw its copy, and it weighs a tenth of a row
+   (`SPECTRAL_DROPOUT_WEIGHT`) everywhere: in both fits, in early stopping, in the Platt
+   calibration, in the threshold search and in the out-of-fold report. At full weight the copies
+   halve the gain of every split on a spectral feature and the trees stop using them: the holdout
+   RMSE with spectral values rose to the pulse-only model's. Over three lifecycle splits (seeds 42,
+   1, 3) the holdout RMSE with every spectral value masked fell from 25.0 / 19.5 / 24.6 to 13.1 /
+   13.5 / 12.0 cycles (pulse-only model: 13.1 / 13.2 / 11.9) and F1 from 0.80 / 0.83 / 0.88 to
+   0.89 / 0.88 / 0.90, while the RMSE with spectral values moved from 12.70 / 12.78 / 11.31 to
+   12.70 / 12.99 / 11.64. The cost: the production fit takes about 40 % longer (a run with its
+   ablation about 25 %), and training peaks about 0.65 GiB higher near the `TRAINING_MAX_ROWS` cap
+   (2.2 GiB in total, inside the orchestrator's 4 GB limit). `metadata.json` records
+   `spectral_dropout` (applied, copy weight); the out-of-fold report counts the copies as rows.
+6. **Evaluate on the holdout lifecycles:**
 
 | Metric | Meaning |
 |---|---|
@@ -135,11 +156,17 @@ ROC-AUC 0.99, Brier 0.028, ECE 0.017**. The live backtest of the models trained 
 the lifecycles that failed after each went live, agrees: RMSE 13–17 cycles, recall 0.88–0.96 and a
 median warning 17–30 cycles before the failure.
 
-6. **Spectral ablation (evidence only):** every run also refits both models without the 10
+Every run also scores the holdout with every spectral value masked: how the model does for an
+engine whose HF frames do not land. It is stored as `holdout_spectral_masked` in `metrics.json` and
+`metadata.json` and logged as one line; it is evidence only and never gates a promotion.
+
+7. **Spectral ablation (evidence only):** every run also refits both models without the 10
    spectral features on the identical split and scores them on the same holdout. The comparison
-   (RMSE, MAE, R², late-life RMSE, F1, ROC-AUC, the spectral share of the regressor's gain, HF
-   coverage, extra seconds) is logged and stored as `ablation` in `metrics.json`, `metadata.json`
-   and `ml_model_runs.params_json`. It never influences promotion and adds roughly 40 % to a run.
+   (RMSE, MAE, R², late-life RMSE, F1, ROC-AUC, the spectral features' share of the regressor's
+   total gain (the loss reduction summed over all their splits), HF coverage, extra seconds) is
+   logged and stored as `ablation` in `metrics.json`, `metadata.json` and
+   `ml_model_runs.params_json`. Without spectral inputs there is nothing to mask, so the baseline is
+   fitted without dropout copies. It never influences promotion and adds roughly 30 % to a run.
 
    **What it showed.** One run's holdout is small (3 to 9 lifecycles), so on a fresh stack's 24
    backfilled lifecycles (100 % spectral coverage) the comparison was repeated over 8 different
@@ -167,6 +194,10 @@ median warning 17–30 cycles before the failure.
   `always` skips the
   comparison, never the floors; `make train-ml ARGS="--promotion-policy always"` is the escape
   hatch when a champion is permanently unloadable. `production.json` is replaced atomically.
+  After upgrading a stack whose champion was trained before spectral dropout, the first challenger
+  may lose to it on the holdout with spectral values present (dropout costs up to about 0.3 cycles
+  there, and the gate does not see the masked score): `make train-ml ARGS="--promotion-policy
+  always"` once puts the more robust model in production.
 - **Artifacts** go to `s3://lakehouse/ml-artifacts/rul_model/rul-<UTC timestamp>/`:
   `model_bundle.joblib` (both models, calibration, threshold, feature list, categories, horizon,
   cap, library versions), `regressor.json` (portable XGBoost format, served trees only),
@@ -184,7 +215,9 @@ median warning 17–30 cycles before the failure.
 [`predict_rul.py`](../data_science/predict_rul.py) loads the model named by `production.json`,
 takes the newest pulse of every engine from the view `int_ml_features` (`LIMIT 1 BY engine_id`;
 when that pulse's HF frame has not landed yet, its spectral features come from the engine's newest
-landed frame of the same lifecycle at most `SPECTRAL_MAX_LAG_SECONDS` older) and writes to
+landed frame of the same lifecycle at most `SPECTRAL_MAX_LAG_SECONDS` older; beyond that the
+spectral values stay missing and the models' fitted missing-value branches score the pulse from
+its pulse features) and writes to
 `gold_engine_rul_predictions`:
 
 | Column | Meaning |

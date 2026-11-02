@@ -19,6 +19,7 @@ from rul_metrics import HoldoutMetrics
 from rul_modeling import (
     EARLY_STOPPING_ROUNDS,
     REGRESSOR_PARAMS,
+    SPECTRAL_DROPOUT_WEIGHT,
     SPLIT_SEED,
     TEST_FRACTION,
     VALIDATION_FRACTION,
@@ -50,6 +51,7 @@ class TrainingReport:
     rows: dict[str, int]
     trained: TrainedModel
     holdout: HoldoutMetrics
+    holdout_spectral_masked: HoldoutMetrics  # the holdout with every spectral value missing
     ablation: AblationResult
     champion: ChampionOutcome
     decision: PromotionDecision
@@ -86,6 +88,18 @@ class TrainingReport:
             holdout.clf_roc_auc,
             holdout.clf_brier,
             holdout.clf_ece,
+        )
+        masked = self.holdout_spectral_masked
+        logger.info(
+            "holdout, every spectral value masked (an engine without HF frames; evidence only) | RMSE %.2f "
+            "| R2 %.3f | late-life RMSE %.2f | F1 %.3f | ROC-AUC %.3f | Brier %.4f | spectral dropout %s",
+            masked.rmse,
+            masked.r2,
+            masked.late_life_rmse,
+            masked.clf_f1,
+            masked.clf_roc_auc,
+            masked.clf_brier,
+            "on" if self.trained.spectral_dropout else "off",
         )
         calibration = self.trained.calibration
         logger.info(
@@ -193,6 +207,13 @@ class TrainingReport:
             },
             "classifier": {"params": CLASSIFIER_PARAMS, "n_iter": int(bundle.classifier.n_iter_)},
             "calibration": self.trained.calibration.as_dict(),
+            # Applied: both models were fitted on the rows plus a copy without spectral values,
+            # each copy weighing copy_weight of a row (rul_modeling.py); the calibration's
+            # out-of-fold rows include the copies.
+            "spectral_dropout": {
+                "applied": self.trained.spectral_dropout,
+                "copy_weight": SPECTRAL_DROPOUT_WEIGHT,
+            },
             "split": {
                 "method": "sha256(seed|split_group) thresholds",
                 "seed": SPLIT_SEED,
@@ -200,6 +221,7 @@ class TrainingReport:
                 "validation_fraction": VALIDATION_FRACTION,
             },
             "library_versions": bundle.library_versions,
+            "holdout_spectral_masked": self.holdout_spectral_masked.as_dict(),
             "ablation": self.ablation.as_dict(),
             "promotion": self._promotion_document(),
         }
@@ -213,6 +235,9 @@ class TrainingReport:
             # on them, so these are optimistic; holdout and out_of_fold are the honest numbers.
             "validation": self.trained.validation.as_dict(),
             "out_of_fold": self.trained.calibration.as_dict(),
+            # Evidence only, never gated: this model on the same holdout with every spectral value
+            # missing, as it scores an engine while no HF frame lands (HF disabled, down or lagging).
+            "holdout_spectral_masked": self.holdout_spectral_masked.as_dict(),
             # Evidence only: the same models without the spectral features, on the same split.
             "ablation": self.ablation.as_dict(),
             "champion": self.champion.as_dict(),

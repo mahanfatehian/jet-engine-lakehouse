@@ -401,9 +401,9 @@ services:
     command: ["python", "orchestration/pipeline_runner.py", "loop"]
     # tini as PID 1 reaps grandchildren of the dbt/ML subprocesses.
     init: true
-    # Training is bounded by TRAINING_MAX_ROWS (~1.3 GiB RSS near the cap); the limit keeps
-    # a runaway job from starving Spark and ClickHouse on the same host.
-    mem_limit: ${ORCHESTRATOR_MEM_LIMIT:-3g}
+    # Training is bounded by TRAINING_MAX_ROWS (~2.3 GiB RSS near the cap with spectral dropout);
+    # the limit keeps a runaway job from starving Spark and ClickHouse on the same host.
+    mem_limit: ${ORCHESTRATOR_MEM_LIMIT:-4g}
     environment:
       # The reconciliation audit hands the POSTGRES_* and S3 settings to ClickHouse as query
       # parameters: ClickHouse itself connects to postgres:5432 and minio:9000.
