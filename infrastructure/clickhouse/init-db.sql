@@ -11,6 +11,7 @@
 --   ml_model_runs               training run registry written by train_rul_model.py
 --   v_engine_rul_latest         latest prediction per engine
 --   ops_reconciliation          end-to-end reconciliation audit (reconcile_lakehouse.py)
+--   ops_stream_progress         one row per micro-batch of every streaming query
 -- dbt builds the silver/gold models on top of the raw_* tables.
 -- =============================================================================
 
@@ -279,3 +280,27 @@ PARTITION BY toYYYYMM(run_at)
 ORDER BY (run_at, layer, engine_id, event_hour)
 TTL toDateTime(run_at) + INTERVAL 30 DAY
 COMMENT 'Reconciliation runs: source pulses a layer must hold vs pulses it holds, per layer, engine and event hour (OK, MISSING or EXTRA; informational = best-effort HF layer)';
+
+-- -----------------------------------------------------------------------------
+-- Operations: Spark's micro-batch progress, inserted best effort every 10 s.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ops_stream_progress
+(
+    query_name            LowCardinality(String),
+    run_id                UUID,
+    batch_id              UInt64,
+    trigger_ts            DateTime64(3, 'UTC'),
+    input_rows            UInt64,
+    input_rows_per_s      Float64,
+    processed_rows_per_s  Float64,
+    batch_duration_ms     UInt32,
+    add_batch_ms          UInt32,
+    latest_offset_ms      UInt32,
+    kafka_lag_records     Nullable(UInt64)
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(trigger_ts)
+ORDER BY (query_name, trigger_ts)
+TTL toDateTime(trigger_ts) + INTERVAL 30 DAY
+COMMENT 'One row per micro-batch of every streaming query: input rows and rates, durations (whole batch, sink, Kafka offset lookup) and the Kafka records not read yet';
