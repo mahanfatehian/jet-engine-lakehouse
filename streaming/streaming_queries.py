@@ -25,6 +25,7 @@ row_number, which also drops exact copies).
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -48,6 +49,7 @@ from pyspark.sql import functions as sf
 from pyspark.sql.streaming import StreamingQuery, StreamingQueryListener
 from pyspark.sql.streaming.listener import QueryProgressEvent, QueryStartedEvent, QueryTerminatedEvent
 from streaming_config import StreamingSettings, trigger_interval
+from streaming_progress import ProgressBuffer, progress_row
 from streaming_readiness import check_clickhouse_dependencies, check_lake_dependencies
 from streaming_supervisor import QueryGroup, QuerySpec
 
@@ -172,6 +174,24 @@ class ProgressLogger(StreamingQueryListener):
                 progress.numInputRows,
                 progress.batchDuration,
             )
+
+    def onQueryTerminated(self, event: QueryTerminatedEvent) -> None:  # noqa: N802 - PySpark listener API
+        """Terminations are reported, with the query name, by ``streaming_supervisor``."""
+
+
+class ProgressRecorder(StreamingQueryListener):
+    """Buffers one ``ops_stream_progress`` row per micro-batch of every query (see ``streaming_progress``)."""
+
+    def __init__(self, progress: ProgressBuffer) -> None:
+        super().__init__()
+        self._progress = progress
+
+    def onQueryStarted(self, event: QueryStartedEvent) -> None:  # noqa: N802 - PySpark listener API
+        """Starts are logged by :class:`ProgressLogger`."""
+
+    def onQueryProgress(self, event: QueryProgressEvent) -> None:  # noqa: N802 - PySpark listener API
+        """Buffer the row of the micro-batch: only the flush thread waits for ClickHouse."""
+        self._progress.add(progress_row(json.loads(event.progress.json)))
 
     def onQueryTerminated(self, event: QueryTerminatedEvent) -> None:  # noqa: N802 - PySpark listener API
         """Terminations are reported, with the query name, by ``streaming_supervisor``."""

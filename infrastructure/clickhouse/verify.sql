@@ -152,6 +152,21 @@ SELECT
 FROM hf_ingest_batches
 WHERE batch_started_at >= now64(3) - INTERVAL 15 MINUTE;
 
+SELECT '\n== 7c. Streaming queries: latest micro-batch of each query (ops_stream_progress) ==' FORMAT TSVRaw;
+SELECT
+    query_name,
+    trigger_ts AS latest_batch_at,
+    dateDiff('second', trigger_ts, now64(3)) AS seconds_ago,
+    batch_id,
+    input_rows,
+    round(processed_rows_per_s) AS processed_rows_per_s,
+    batch_duration_ms,
+    add_batch_ms,
+    kafka_lag_records
+FROM ops_stream_progress
+ORDER BY query_name, trigger_ts DESC
+LIMIT 1 BY query_name;
+
 SELECT '\n== 8. dbt models: row counts (UNKNOWN_TABLE = not built by dbt yet) ==' FORMAT TSVRaw;
 SELECT 'stg_engine_telemetry' AS model, count() AS row_count
 FROM stg_engine_telemetry SETTINGS final = 1;
@@ -349,6 +364,24 @@ FROM
     FROM ops_reconciliation
     WHERE run_at = (SELECT max(run_at) FROM ops_reconciliation)
       AND informational = 0
+    UNION ALL
+    -- A batch leaves records behind only when maxOffsetsPerTrigger caps it; one re-run after a failure
+    -- reports no lag (NULL). 50000 records are about two hours of the default fleet's CDC; the first-boot
+    -- backfill leaves the HF lake queries some 46000 frames behind, which they work off at 2000 a minute.
+    SELECT
+        10,
+        'streaming consumer lag below 50000 records (latest batch of every query)',
+        if(count() > 0 AND max(kafka_lag_records) < 50000, 'OK', 'WARN'),
+        if(count() = 0, 'no micro-batch recorded yet',
+           concat(toString(count()), ' queries, largest lag ',
+                  ifNull(concat(toString(max(kafka_lag_records)), ' records'), 'unknown')))
+    FROM
+    (
+        SELECT query_name, kafka_lag_records
+        FROM ops_stream_progress
+        ORDER BY query_name, trigger_ts DESC
+        LIMIT 1 BY query_name
+    )
 )
 ORDER BY ord
 FORMAT TSVRaw;

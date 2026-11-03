@@ -6,7 +6,8 @@ supervisor (see ``streaming_supervisor``). The lake queries start once Kafka and
 answer, the ClickHouse queries once Kafka and ClickHouse (with its tables) answer; a query
 that fails is restarted from its checkpoint with a capped exponential backoff while the
 others keep running. The supervisor keeps the heartbeat file (STREAMING_HEARTBEAT_FILE)
-fresh for the container healthcheck.
+fresh for the container healthcheck. A listener buffers the progress of every micro-batch, and
+a thread of its own writes it to ClickHouse (``ops_stream_progress``, see ``streaming_progress``).
 
 Exit codes: 0 after a requested shutdown (SIGTERM/SIGINT), 1 when the Spark driver cannot be
 started or stops (Docker's ``restart: unless-stopped`` then restarts the job, which resumes
@@ -38,7 +39,8 @@ import clickhouse_sink
 from pyspark.sql import SparkSession
 from streaming_config import ConfigError, StreamingSettings, load_settings, spark_conf
 from streaming_heartbeat import HeartbeatWriter
-from streaming_queries import build_query_groups
+from streaming_progress import ProgressBuffer
+from streaming_queries import ProgressRecorder, build_query_groups
 from streaming_readiness import Probe, dependency_probes, unavailable_dependencies
 from streaming_supervisor import EXIT_OK, QuerySupervisor
 
@@ -121,15 +123,19 @@ def run(settings: StreamingSettings, stop_event: threading.Event, heartbeat: Hea
     """Build the driver, then supervise the streaming queries until shutdown."""
     spark = build_spark_session(settings)
     clickhouse = clickhouse_sink.ClickHouseTarget(settings, stop_event.wait)
+    progress = ProgressBuffer(lambda: clickhouse.writer)
     try:
         # Creating the SparkContext replaced our SIGINT handler with PySpark's own.
         install_signal_handlers(stop_event)
         groups = build_query_groups(spark, settings, clickhouse)
+        spark.streams.addListener(ProgressRecorder(progress))
+        threading.Thread(target=progress.run, args=(stop_event,), name="stream-progress", daemon=True).start()
         supervisor = QuerySupervisor(groups, stop_event, heartbeat, driver_alive=partial(driver_alive, spark))
         return supervisor.run()
     finally:
+        spark.stop()  # first: it delivers the progress events still queued in Spark's listener bus
+        progress.flush()
         clickhouse.close()
-        spark.stop()
 
 
 def main(argv: Sequence[str] = ()) -> int:
