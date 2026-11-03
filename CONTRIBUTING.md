@@ -44,7 +44,8 @@ local Python is needed.
 ## Branching model
 
 * `main` is the default branch. CI runs on every push to `main` and on every pull request,
-  and a nightly full-stack smoke test runs `make up` and `make verify`.
+  and a nightly full-stack smoke test runs `make up`, `make verify` and, with the simulator
+  stopped, `make dr-drill`.
 * Branch from `main` and merge back through a pull request. Keep commits atomic and squash
   fixups before merging.
 

@@ -608,7 +608,11 @@ def test_a_dry_run_reports_every_table_and_day_and_writes_nothing(caplog: pytest
     assert len(outcome.plan) == len(RESTORE_TABLES) * len(DAYS)
     assert DayCounts("raw_engine_telemetry", date(2026, 11, 1), 167415, 0, 167415) in outcome.plan
     assert "plan: raw_engine_telemetry 2026-11-01: lake 167415, raw 0, to restore 167415" in caplog.text
-    assert "plan: raw_engine_telemetry, 4 day(s) of the lake as of 2026-11-02T06:30:16Z" in caplog.text
+    # The whole message: make dr-drill (infrastructure/clickhouse/dr-drill.sh) parses these totals.
+    assert (
+        "plan: raw_engine_telemetry, 4 day(s) of the lake as of 2026-11-02T06:30:16Z: "
+        "lake 167715, raw 300, to restore 167415"
+    ) in caplog.messages
     assert (
         "dry run: nothing written; a restore would add 167415 row(s) to raw_engine_telemetry" in caplog.text
     )
