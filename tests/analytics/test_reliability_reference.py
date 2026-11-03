@@ -220,6 +220,25 @@ def test_only_pauses_of_the_fleet_longer_than_the_gap_are_outages() -> None:
     assert platform_outages(pulses, 60 * S) == [(83 * S, 200 * S)]
 
 
+def test_outage_time_is_unobserved_instead_of_status_or_operating_time() -> None:
+    intervals, outage = status_intervals(LIFECYCLE), [(40 * S, 60 * S)]
+    first = failures(intervals, outage)[0]
+    assert (first.operating_us, first.operating_unobserved_us, first.operating_cycles) == (80 * S, 20 * S, 10)
+    row = lifecycle_status_time(intervals, [first], as_of_us(LIFECYCLE), outage)[(ENGINE, 1)]
+    assert (row["healthy_seconds"], row["warning_seconds"], row["unobserved_seconds"]) == (40, 20, 20)
+    assert (row["observed_seconds"], row["availability"]) == (100, 0.8)
+
+
+def test_an_outage_across_midnight_is_unobserved_on_both_days() -> None:
+    midnight = DAY_US // S
+    log = [version(1, "HEALTHY", midnight - 30, cdc_op="c", last_telemetry_us=(midnight + 30) * S)]
+    outage = [((midnight - 10) * S, (midnight + 20) * S)]
+    rows = daily_reliability(status_intervals(log), [], as_of_us(log), outage)
+    first, second = rows[(date(1970, 1, 1), ENGINE)], rows[(date(1970, 1, 2), ENGINE)]
+    assert (first["observed_seconds"], first["unobserved_seconds"]) == (20, 10)
+    assert (second["observed_seconds"], second["unobserved_seconds"], second["availability"]) == (10, 20, 1)
+
+
 def test_the_pareto_ranks_modes_and_accumulates_their_shares() -> None:
     def order(number: int, engine: str, mode: str, downtime: int | None) -> WorkOrder:
         status = "OPEN" if downtime is None else "COMPLETED"
@@ -296,3 +315,17 @@ def test_the_fixture_failures_follow_from_its_registry_log() -> None:
         datetime.fromisoformat(spare[key]) for key in ("registered_at", "deregistered_at")
     )
     assert registered.tzinfo == UTC and registered.date() < deregistered.date()
+
+
+def test_the_fixture_stops_the_platform_once_across_midnight() -> None:
+    history = build_history(42)
+    pulses = [_micros(e.image["event_ts"]) for e in history.events if e.table == "engine_telemetry"]
+    outage = history.manifest["reliability"]["platform_outage"]
+    start, end = (_micros(datetime.fromisoformat(t)) for t in outage)
+    assert platform_outages(pulses, 60 * S) == [(start, end)]
+    assert start // DAY_US < end // DAY_US
+    # every engine under repair at once pauses the fleet as well, for less than the gap
+    assert len(platform_outages(pulses, 15 * S)) == 2
+    # the stop opens at a pulse deleted later: a retracted pulse still proves that the platform ran
+    retracted = [e for e in history.events if e.table == "engine_telemetry" and e.op == "d"]
+    assert start in {_micros(e.image["event_ts"]) for e in retracted}

@@ -8,8 +8,9 @@ check_reliability  reads the CDC versions of engine_status_registry, work orders
                    fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily and
                    rpt_failure_mode_pareto; then checks the fixture's own truth (synthetic_cdc.py,
                    manifest key ``reliability``): the failures it simulated with their return to
-                   service and operating run, each registry scenario, and that every failure is a
-                   failed lifecycle of int_engine_lifecycles at the same cycle and instant
+                   service and operating run, each registry scenario, its platform stop, and that
+                   every failure is a failed lifecycle of int_engine_lifecycles at the same cycle
+                   and instant
 """
 
 from __future__ import annotations
@@ -67,6 +68,7 @@ FAILURE_COLUMNS = {
     "repair_seconds": "repair_seconds",
     "operating_since_us": "toUnixTimestamp64Micro(operating_since)",
     "operating_seconds": "operating_seconds",
+    "operating_unobserved_seconds": "operating_unobserved_seconds",
     "operating_cycles": "operating_cycles",
     "maintenance_id": "maintenance_id",
     "failure_mode": "toString(failure_mode)",
@@ -83,6 +85,7 @@ LIFECYCLE_COLUMNS = {
     "available_seconds": "available_seconds",
     "unavailable_seconds": "unavailable_seconds",
     "observed_seconds": "observed_seconds",
+    "unobserved_seconds": "unobserved_seconds",
     "availability": "availability",
 }
 DAILY_COLUMNS = {
@@ -90,6 +93,7 @@ DAILY_COLUMNS = {
     for name in (
         "engines",
         "observed_seconds",
+        "unobserved_seconds",
         *STATUS_SECONDS,
         "available_seconds",
         "availability",
@@ -263,6 +267,9 @@ def _failure_reference(failure_list: list[Failure], orders: list[WorkOrder]) -> 
             "repair_seconds": None if f.repair_us is None else f.repair_us / 1e6,
             "operating_since_us": f.operating_since_us,
             "operating_seconds": None if f.operating_us is None else f.operating_us / 1e6,
+            "operating_unobserved_seconds": (
+                None if f.operating_us is None else f.operating_unobserved_us / 1e6
+            ),
             "operating_cycles": f.operating_cycles,
             "maintenance_id": None if order is None else order.maintenance_id,
             "failure_mode": "UNKNOWN" if order is None else order.failure_mode,
@@ -277,7 +284,7 @@ def check_reference(client: Client) -> tuple[list[str], list[StatusInterval]]:
     orders = read_work_orders(client)
     intervals = status_intervals(versions)
     outages = platform_outages(read_pulse_times(client), OUTAGE_MIN_GAP_US)
-    failure_list = failures(intervals)
+    failure_list = failures(intervals, outages)
     horizon = as_of_us(versions)
     found = compare_rows(
         "int_platform_outages",
@@ -312,7 +319,7 @@ def check_reference(client: Client) -> tuple[list[str], list[StatusInterval]]:
             ("toString(engine_id)", "lifecycle_id"),
             LIFECYCLE_COLUMNS,
         ),
-        lifecycle_status_time(intervals, failure_list, horizon),
+        lifecycle_status_time(intervals, failure_list, horizon, outages),
     )
     daily = read_model(
         client,
@@ -324,7 +331,7 @@ def check_reference(client: Client) -> tuple[list[str], list[StatusInterval]]:
     if horizons - {horizon}:
         found.append(f"rpt_fleet_reliability_daily: as_of_ts {sorted(horizons)}, expected {horizon}")
     found += compare_rows(
-        "rpt_fleet_reliability_daily", daily, daily_reliability(intervals, failure_list, horizon)
+        "rpt_fleet_reliability_daily", daily, daily_reliability(intervals, failure_list, horizon, outages)
     )
     found += compare_rows(
         "rpt_failure_mode_pareto",
@@ -416,7 +423,7 @@ def _deregistered_engine(intervals: list[StatusInterval], scenario: dict[str, An
 
 
 def check_scenarios(client: Client, scenario: dict[str, Any], intervals: list[StatusInterval]) -> list[str]:
-    """The fixture's truth: the simulated failures and every registry scenario it delivers."""
+    """The fixture's truth: the simulated failures, every registry scenario it delivers and its stop."""
     by_engine: dict[str, list[StatusInterval]] = {}
     for interval in intervals:
         by_engine.setdefault(interval.engine_id, []).append(interval)
@@ -440,6 +447,12 @@ def check_scenarios(client: Client, scenario: dict[str, Any], intervals: list[St
     )[0][0]
     if copies < 2:
         found.append(f"the replayed registry version landed {copies} time(s): nothing was replayed")
+    start, end = (_iso_micros(t) for t in scenario["platform_outage"])
+    outages = read_model(
+        client, "int_platform_outages", ("toUnixTimestamp64Micro(outage_start)",), OUTAGE_COLUMNS
+    )
+    if outages != {(start,): {"outage_end_us": end}}:
+        found.append(f"int_platform_outages holds {outages}, not the fixture's one stop [{start}, {end})")
     LOGGER.info(
         "registry scenarios: backfilled %s, deregistered %s, out-of-order lsn %d, lsn %d landed %d times",
         backfilled["engine_id"],

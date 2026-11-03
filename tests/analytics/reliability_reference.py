@@ -9,7 +9,8 @@ status_intervals         the SCD2 history: versions in log order, replays collap
                          closes the open interval at its commit time; boundary times are made
                          monotonic by a suffix minimum (a change backdated before earlier ones
                          supersedes them) and intervals without duration are dropped
-platform_outages         every pause of the fleet's pulses longer than the gap, as [start, end)
+platform_outages         every pause of the fleet's pulses longer than the gap, as [start, end); its
+                         time counts to no status and to no operating time, only as unobserved
 failures                 one per run of unavailable intervals that contains a FAILURE, with the
                          time to repair and the operating time and cycles since the start of the
                          operating run before it (a return to service or a registration)
@@ -90,6 +91,7 @@ class Failure:
     returned_us: int | None
     operating_since_us: int | None
     operating_cycles: int | None
+    operating_unobserved_us: int  # the operating run's time inside outages (0 while its start is unknown)
 
     @property
     def repair_us(self) -> int | None:
@@ -97,7 +99,10 @@ class Failure:
 
     @property
     def operating_us(self) -> int | None:
-        return None if self.operating_since_us is None else self.failed_at_us - self.operating_since_us
+        """Observed time of the operating run: its time inside outages left out."""
+        if self.operating_since_us is None:
+            return None
+        return self.failed_at_us - self.operating_since_us - self.operating_unobserved_us
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,7 @@ class _Tally:
     """Accumulated time per status and failure statistics of one report cell."""
 
     status_us: defaultdict[str, int] = field(default_factory=lambda: defaultdict(int))
+    unobserved: int = 0
     engines: set[str] = field(default_factory=set)
     failures: int = 0
     repairs: list[int] = field(default_factory=list)
@@ -142,6 +148,11 @@ def _mean(values: Sequence[int], scale: float = 1.0) -> float | None:
 def platform_outages(pulse_us: Iterable[int], min_gap_us: int) -> list[Outage]:
     """int_platform_outages: every pause between two pulses of the fleet longer than ``min_gap_us``."""
     return [(start, end) for start, end in pairwise(sorted(set(pulse_us))) if end - start > min_gap_us]
+
+
+def unobserved_us(start_us: int, end_us: int, outages: Iterable[Outage]) -> int:
+    """Microseconds of [start_us, end_us) inside an outage."""
+    return sum(max(min(end_us, end) - max(start_us, start), 0) for start, end in outages)
 
 
 def as_of_us(versions: Iterable[RegistryVersion]) -> int:
@@ -229,7 +240,7 @@ def _runs(intervals: Sequence[StatusInterval]) -> list[tuple[list[StatusInterval
     return runs
 
 
-def failures(intervals: Iterable[StatusInterval]) -> list[Failure]:
+def failures(intervals: Iterable[StatusInterval], outages: Sequence[Outage] = ()) -> list[Failure]:
     """One failure per run of unavailable intervals that contains a FAILURE (see the module doc)."""
     result = []
     ordered = sorted(intervals, key=lambda i: (i.engine_id, i.valid_from_us))
@@ -239,6 +250,7 @@ def failures(intervals: Iterable[StatusInterval]) -> list[Failure]:
             failed = [i for i in run if i.operational_status == "FAILURE"]
             if run[0].is_available or not failed:
                 continue
+            failed_at = failed[0].valid_from_us
             last = run[-1]
             returned = None if last.closed_by_delete else last.valid_to_us
             since = cycles = None
@@ -258,10 +270,11 @@ def failures(intervals: Iterable[StatusInterval]) -> list[Failure]:
                     engine_model=run[0].engine_model,
                     lifecycle_id=failed[0].lifecycle_id,
                     failure_cycle=failed[0].cycle_at_entry,
-                    failed_at_us=failed[0].valid_from_us,
+                    failed_at_us=failed_at,
                     returned_us=returned,
                     operating_since_us=since,
                     operating_cycles=cycles,
+                    operating_unobserved_us=0 if since is None else unobserved_us(since, failed_at, outages),
                 )
             )
     return result
@@ -280,7 +293,10 @@ def _status_columns(status_us: dict[str, int]) -> dict[str, float]:
 
 
 def lifecycle_status_time(
-    intervals: Iterable[StatusInterval], failure_list: Iterable[Failure], as_of: int
+    intervals: Iterable[StatusInterval],
+    failure_list: Iterable[Failure],
+    as_of: int,
+    outages: Sequence[Outage] = (),
 ) -> dict[tuple[str, int], dict[str, Any]]:
     """fct_engine_lifecycle_status_time by (engine_id, lifecycle_id)."""
     grouped: defaultdict[tuple[str, int], list[StatusInterval]] = defaultdict(list)
@@ -293,8 +309,12 @@ def lifecycle_status_time(
     for key, members in grouped.items():
         members.sort(key=lambda i: i.valid_from_us)
         status_us: defaultdict[str, int] = defaultdict(int)
+        unobserved = 0
         for interval in members:
-            status_us[interval.operational_status] += interval.end_us(as_of) - interval.valid_from_us
+            end = interval.end_us(as_of)
+            hidden = unobserved_us(interval.valid_from_us, end, outages)
+            status_us[interval.operational_status] += end - interval.valid_from_us - hidden
+            unobserved += hidden
         columns = _status_columns(status_us)
         rows[key] = {
             "engine_model": members[0].engine_model,
@@ -306,12 +326,16 @@ def lifecycle_status_time(
             **{name: value for name, value in columns.items() if name != "observed_seconds"},
             "unavailable_seconds": columns["observed_seconds"] - columns["available_seconds"],
             "observed_seconds": columns["observed_seconds"],
+            "unobserved_seconds": unobserved / 1e6,
         }
     return rows
 
 
 def daily_reliability(
-    intervals: Iterable[StatusInterval], failure_list: Iterable[Failure], as_of: int
+    intervals: Iterable[StatusInterval],
+    failure_list: Iterable[Failure],
+    as_of: int,
+    outages: Sequence[Outage] = (),
 ) -> dict[tuple[date, str], dict[str, Any]]:
     """rpt_fleet_reliability_daily by (day, engine_id), the fleet under engine_id 'ALL'."""
     cells: defaultdict[tuple[int, str], _Tally] = defaultdict(_Tally)
@@ -320,8 +344,10 @@ def daily_reliability(
         while start < end:
             day = start // DAY_US
             piece_end = min(end, (day + 1) * DAY_US)
+            hidden = unobserved_us(start, piece_end, outages)
             for scope in (interval.engine_id, FLEET):
-                cells[(day, scope)].status_us[interval.operational_status] += piece_end - start
+                cells[(day, scope)].status_us[interval.operational_status] += piece_end - start - hidden
+                cells[(day, scope)].unobserved += hidden
                 cells[(day, scope)].engines.add(interval.engine_id)
             start = piece_end
     for failure in failure_list:
@@ -333,6 +359,7 @@ def daily_reliability(
         rows[(EPOCH + timedelta(days=day), scope)] = {
             "engines": len(tally.engines),
             **columns,
+            "unobserved_seconds": tally.unobserved / 1e6,
             "failures": tally.failures,
             "repairs": len(tally.repairs),
             "mttr_seconds": _mean(tally.repairs, 1e6),

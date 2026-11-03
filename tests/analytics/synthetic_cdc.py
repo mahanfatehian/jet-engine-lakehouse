@@ -8,7 +8,10 @@ simulator writes it (fleet_runtime): on every status change and on the first pul
 cycle, FAILURE at the failure pulse, MAINTENANCE_RESET into the next lifecycle when the repair
 completes (plus one spare engine that is registered but never reports telemetry). JT9D-001's
 registration row is dated after the start of its history, the way the first-boot backfill writes
-history behind a registration the CDC connector has already captured.
+history behind a registration the CDC connector has already captured. The platform is stopped
+overnight once, across a UTC midnight: nothing is written meanwhile and the engines resume in
+their last status, while every engine under repair at once pauses the fleet for about 20 s. The
+last pulse before the stop is deleted later: a retracted pulse still proves that the platform ran.
 
 ``build_history`` splits the change stream into two delivery phases around a cut-off:
 
@@ -19,7 +22,7 @@ history behind a registration the CDC connector has already captured.
   (one group in a lifecycle's baseline period), GE90-202's whole registry history (telemetry
   landed first), GE90-201's first MAINTENANCE_RESET (out of log order: the engine's later
   versions landed first), replays of already published versions (a registry change and a pulse's
-  newest version), the spare engine's re-registration, a late delete and a late sensor
+  newest version), the spare engine's re-registration, two late deletes and a late sensor
   correction of already published pulses.
   ``late_visible`` pulses must be loaded with an ingested_at older than the dbt watermark.
 
@@ -60,6 +63,9 @@ BACKFILL_REGISTERED_AT = SIM_START + timedelta(seconds=450)
 SPARE_REGISTERED_AT = SIM_START - timedelta(days=1)
 DEREGISTERED_BEFORE_CUTOFF = timedelta(seconds=200)
 REREGISTERED_AFTER_CUTOFF = timedelta(seconds=150)
+# every time from this instant on (no change lies within 0.1 s of it) moves by the stop
+PLATFORM_STOPPED_AT = SIM_START + timedelta(seconds=800)
+PLATFORM_STOP = timedelta(hours=16)
 REPAIR_ACTIONS = {
     "HPT_BLADE_EROSION": "HPT_BLADE_REPLACEMENT",
     "BEARING_DEGRADATION": "BEARING_REPLACEMENT",
@@ -270,7 +276,22 @@ def simulate(rng: random.Random) -> tuple[list[Lifecycle], list[CdcEvent], datet
             events += _lifecycle_events(lifecycle, registries[plan.engine_id])
             if lifecycle.failure_mode:
                 events += _failure_events(lifecycle, work_orders[id(lifecycle)], registries[plan.engine_id])
-    return lifecycles, events, cutoff
+    _stop_platform(lifecycles, events)
+    return lifecycles, events, cutoff + PLATFORM_STOP
+
+
+def _stop_platform(lifecycles: list[Lifecycle], events: list[CdcEvent]) -> None:
+    """The platform is down for PLATFORM_STOP from PLATFORM_STOPPED_AT: every later time moves by it."""
+
+    def moved(value: Any) -> Any:
+        later = isinstance(value, datetime) and value >= PLATFORM_STOPPED_AT
+        return value + PLATFORM_STOP if later else value
+
+    for pulse in (pulse for lifecycle in lifecycles for pulse in lifecycle.pulses):
+        pulse.event_ts = moved(pulse.event_ts)
+    for event in events:
+        event.commit_ts = moved(event.commit_ts)
+        event.image = {name: moved(value) for name, value in event.image.items()}
 
 
 def _assign_lsns(events: list[CdcEvent], rng: random.Random) -> None:
@@ -434,10 +455,16 @@ def build_history(seed: int) -> History:
 
     deleted_late = lifecycle_of[("JT9D-001", 2)].pulses[100]
     deleted_base = lifecycle_of[("GE90-201", 1)].pulses[50]
+    # the newest version of the last pulse before the stop: deleted late, it still proves the platform ran
+    pre_stop = max(
+        (e for e in events if e.table == "engine_telemetry" and e.image["event_ts"] < PLATFORM_STOPPED_AT),
+        key=lambda e: (e.image["event_ts"], e.commit_ts),
+    )
     corrected = running["GE90-202"].pulses[60]  # inside the baseline period of a running lifecycle
     correction = {**_telemetry_image(corrected), "egt_c": round(corrected.readings["egt_c"] + 15.0, 4)}
     events += [
         CdcEvent("engine_telemetry", "d", cutoff + timedelta(seconds=30), _telemetry_image(deleted_late)),
+        CdcEvent("engine_telemetry", "d", cutoff + timedelta(seconds=35), dict(pre_stop.image)),
         CdcEvent("engine_telemetry", "u", cutoff + timedelta(seconds=40), correction),
         CdcEvent(
             "engine_telemetry",
@@ -500,6 +527,7 @@ def build_history(seed: int) -> History:
 
     predictions = _predictions(lifecycle_of, cutoff)
     frames, hf_manifest = build_hf_frames(lifecycles, cutoff, seed)
+    pulse_times = [pulse.event_ts for lifecycle in lifecycles for pulse in lifecycle.pulses]
     manifest = {
         "cutoff": cutoff.isoformat(),
         "engines": [plan.engine_id for plan in (*FLEET, SPARE_ENGINE)],
@@ -510,7 +538,7 @@ def build_history(seed: int) -> History:
         "running_lifecycles": [[lc.plan.engine_id, lc.lifecycle_id] for lc in running.values()],
         "withheld_ids": sorted(withheld),
         "late_visible_ids": sorted(late_visible),
-        "deleted_ids": [deleted_late.telemetry_id, deleted_base.telemetry_id],
+        "deleted_ids": [deleted_late.telemetry_id, deleted_base.telemetry_id, pre_stop.image["telemetry_id"]],
         "corrected_id": corrected.telemetry_id,
         "corrected_egt_c": correction["egt_c"],
         "lagging_registry_engine": "GE90-202",
@@ -539,6 +567,10 @@ def build_history(seed: int) -> History:
             },
             "replayed": {"engine_id": replayed.image["engine_id"], "cdc_lsn": replayed.lsn},
             "failures": _expected_failures(lifecycle_of),
+            "platform_outage": [
+                max(t for t in pulse_times if t < PLATFORM_STOPPED_AT).isoformat(),
+                min(t for t in pulse_times if t > PLATFORM_STOPPED_AT).isoformat(),
+            ],
         },
     }
     return History(events, cutoff, predictions, manifest, frames)

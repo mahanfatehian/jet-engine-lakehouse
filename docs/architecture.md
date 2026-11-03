@@ -178,9 +178,10 @@ whose loss would stop the query on its next restart.
 | gold | `fct_engine_health_status` | dbt, table | `ReplacingMergeTree` | one row per engine: state, KPIs, calibrated anomaly flags, latest prediction aged to the current cycle |
 | gold | `fct_rul_prediction_backtest` | dbt, table | `ReplacingMergeTree` | first scoring of every pre-failure pulse of a failed lifecycle, scored against the truth |
 | silver | `int_engine_status_history` | dbt, table | `ReplacingMergeTree`, key `(engine_id, valid_from)` | SCD Type 2 status history: one row per engine and status interval, rebuilt from the registry's CDC log every run |
-| gold | `fct_engine_failures` | dbt, table | `ReplacingMergeTree` | one row per failure: time to repair, time and cycles in service since the previous return to service, failure mode |
-| gold | `fct_engine_lifecycle_status_time` | dbt, table | `ReplacingMergeTree` | time in each status per engine lifecycle, availability, failures |
-| gold | `rpt_fleet_reliability_daily` | dbt, table | `ReplacingMergeTree` | availability, failures, MTBF (time and cycles), MTTR per UTC day and engine, plus the fleet (`ALL`) |
+| silver | `int_platform_outages` | dbt, table | `ReplacingMergeTree`, key `outage_start` | platform outages: every pause of the whole fleet's telemetry longer than `outage_min_gap_seconds`, from the last pulse before it to the first pulse after it, rebuilt every run |
+| gold | `fct_engine_failures` | dbt, table | `ReplacingMergeTree` | one row per failure: time to repair, observed time and cycles in service since the previous return to service (its time inside platform outages apart), failure mode |
+| gold | `fct_engine_lifecycle_status_time` | dbt, table | `ReplacingMergeTree` | observed time in each status per engine lifecycle, unobserved time, availability, failures |
+| gold | `rpt_fleet_reliability_daily` | dbt, table | `ReplacingMergeTree` | availability, failures, MTBF (observed time and cycles), MTTR, unobserved time per UTC day and engine, plus the fleet (`ALL`) |
 | gold | `rpt_failure_mode_pareto` | dbt, table | `ReplacingMergeTree` | work orders per failure mode, ranked with cumulative shares, per engine and fleet |
 | gold | `rpt_model_live_performance` | dbt, table | `ReplacingMergeTree` | live RMSE, MAE, bias, NASA score, horizon precision/recall/F1 and warning lead time per model version |
 | serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL, insert deduplication window 100 | every prediction with its sensor readings |
@@ -220,6 +221,10 @@ flowchart LR
     FAIL --> LST
     SCD --> DAY[rpt_fleet_reliability_daily]
     FAIL --> DAY
+    STG --> OUT[int_platform_outages]
+    OUT --> FAIL
+    OUT --> LST
+    OUT --> DAY
     STM --> PAR[rpt_failure_mode_pareto]
 ```
 
@@ -227,7 +232,8 @@ flowchart LR
 
 - **Replays are harmless.** Spark may replay a micro-batch after a crash. ClickHouse tables are
   keyed by the source primary key and versioned by `cdc_lsn`, so a replayed row collapses into the
-  same version, and every dbt model reads with `FINAL` or explicit `argMax(..., cdc_lsn)`.
+  same version, and every dbt model reads with `FINAL` or explicit `argMax(..., cdc_lsn)`, except
+  `int_platform_outages`, which needs only the distinct event times (see below).
 - **A retried insert lands once.** The data-science jobs append predictions, training runs and
   audit cells through one ClickHouse gateway, which retries an insert after a read timeout or a
   dropped connection, failures that can come after ClickHouse stored the batch. Every attempt of one
@@ -261,6 +267,17 @@ flowchart LR
   registration tiles correctly; dbt tests prove that intervals never overlap and tile time, and that
   the open interval is the registry's current state. Staging keeps the first copy of a replayed
   version, the one an incremental run published, so a full refresh reproduces `stg_*` exactly.
+- **Stopped time is unobserved, not operating time.** The status history is wall-clock, so while
+  the stack is stopped every engine keeps its last status. `int_platform_outages` turns every pause
+  of the whole fleet's telemetry longer than `outage_min_gap_seconds` (60 s, about three times the
+  longest pause of a running fleet: a repair of every engine at once plus a tick) into an outage
+  from the last pulse before it to the first pulse after it, rebuilt every run so late pulses can
+  split or shorten it. It reads the distinct event times of `stg_engine_telemetry` without `FINAL`:
+  every version of a pulse carries its event time, and a retracted pulse still proves that the
+  platform ran. The reliability marts subtract each interval's overlap with the outages from its
+  status time and report it as unobserved, so availability and MTBF in time cover observed time
+  only, while MTBF in cycles counts every cycle and MTTR stays wall-clock; dbt tests prove that
+  observed and unobserved time add up to the wall-clock time and are never negative.
 
 - **Every layer is reconciled against the source.** Every `RECONCILE_INTERVAL_SECONDS` the
   orchestrator task `reconcile` (`data_science/reconcile_lakehouse.py`) counts in one ClickHouse
@@ -313,6 +330,7 @@ flowchart LR
 | Community MinIO build (`pgsty/minio`) | the official images are no longer published | pinned by digest; override with `MINIO_IMAGE` |
 | Rebuild raw from the silver lake inside ClickHouse (`INSERT ... SELECT ... FROM s3()`, one statement per table and day) | the lake is the system of record: silver holds every raw column but `ingested_at` under the same key and `cdc_lsn`, so a restored row collapses with any copy the streaming job writes; no row passes through Python | `ingested_at` becomes the restore time (lag panels spike once); for an event Debezium delivered twice the restore keeps the later copy where raw may hold the first (only `kafka_offset` and `cdc_emitted_ts` differ); restored HF frames are republished to staging once |
 | SCD2 status history derived from the CDC log, rebuilt every run (no dbt snapshot) | the log already holds every version; a rebuild equals a full refresh, and one late or backdated version can move intervals anywhere in an engine's history | reads one registry version per engine and cycle (~52k a day for 6 engines) every dbt cycle |
+| Platform outages derived from fleet-wide pauses of the telemetry | every tick of a running fleet writes pulses, so a long fleet-wide pause is the evidence that the platform was down; no heartbeat writer or table to deploy, and the rebuild recomputes the outages when late pulses land | a stop shorter than `outage_min_gap_seconds` counts as observed time, a stop is only known once the first pulse after it has reached staging, and every run scans the event times of all pulses (about 0.04 s for 0.8 million staging rows, linear in history) and compares every status interval with every outage |
 | One HF backfill row per engine, cleared after every frame of it is acknowledged | a stop or a Kafka outage during the first-boot drain no longer leaves history without spectral features | an interrupted drain re-sends that engine's whole backfill (harmless duplicates) |
 | Reconcile inside ClickHouse (`postgresql()`, `s3()` table functions) | one SQL statement compares every layer where the data already lives; nothing new to deploy, and only the window's source rows leave Postgres | ClickHouse must reach Postgres and MinIO by their compose names, and the window reaches Postgres as UTC literals (the database runs with TimeZone UTC, the image default) |
 | Progress rows from a listener into a bounded buffer, inserted by a thread of their own and dropped when ClickHouse refuses them | monitoring must never block or fail a micro-batch, and a row ClickHouse rejects must not hold back the rows after it | an outage longer than the insert retries (about 15 s) loses the rows of that flush (counted in the log) |

@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,206 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 168 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,210 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -244,7 +244,7 @@ make up            # build 4 images and start 14 services; the CDC connector reg
 make ps            # wait until services are healthy and the init jobs exited with 0
 make register-cdc  # registers or updates the connector, restarts a FAILED task, waits for RUNNING
 make stream        # follow Spark: "clickhouse batch N: engine_telemetry=30 ..." every 5 s
-make dbt-run       # dbt build: 17 models + 163 data tests
+make dbt-run       # dbt build: 18 models + 168 data tests
 make train-ml      # train, evaluate and promote the RUL model; artifacts land in MinIO
 make predict-ml    # score every engine; predictions land in ClickHouse
 make verify        # end-to-end report across Postgres, Debezium, MinIO and ClickHouse
@@ -534,15 +534,17 @@ in service; FAILURE (under repair) and MAINTENANCE_RESET (repaired, not flown ye
 
 | Model | Grain | Answers |
 |---|---|---|
-| `fct_engine_failures` | one row per failure | time to repair (to the first pulse of the next lifecycle), time and cycles in service since the previous return to service, failure mode of the work order |
-| `fct_engine_lifecycle_status_time` | engine × lifecycle | time in each status, availability, failures |
-| `rpt_fleet_reliability_daily` | UTC day × engine, plus the fleet (`ALL`) | availability, failures, MTBF (time and cycles), MTTR |
+| `int_platform_outages` | one row per platform outage | when the platform observed nothing: every pause of the whole fleet's telemetry longer than `outage_min_gap_seconds`, from the last pulse before it to the first pulse after it |
+| `fct_engine_failures` | one row per failure | time to repair (to the first pulse of the next lifecycle), observed time and cycles in service since the previous return to service (the run's time inside outages apart), failure mode of the work order |
+| `fct_engine_lifecycle_status_time` | engine × lifecycle | observed time in each status, unobserved time, availability, failures |
+| `rpt_fleet_reliability_daily` | UTC day × engine, plus the fleet (`ALL`) | availability, failures, MTBF (observed time and cycles), MTTR, unobserved time |
 | `rpt_failure_mode_pareto` | engine × failure mode, plus the fleet (`ALL`) | work orders per mode, ranked, with cumulative share |
 
 dbt tests prove that an engine's intervals never overlap and tile its history, that the open
 interval is the registry's current state, that every failure is a failed lifecycle of
-`int_engine_lifecycles` at the same cycle and instant, and that the daily and Pareto reports add up;
-the integration harness checks every value against an independent Python reference.
+`int_engine_lifecycles` at the same cycle and instant, that the daily and Pareto reports add up, and
+that observed and unobserved time add up to the wall-clock time and are never negative; the
+integration harness checks every value against an independent Python reference.
 
 ```sql
 -- The status of every engine at an instant (SCD2 "as of" query)
@@ -569,8 +571,16 @@ FROM fct_engine_failures FINAL GROUP BY engine_id ORDER BY engine_id;
 
 MTTR is the 20 s repair plus the tick until the next lifecycle's first pulse, and MTBF in cycles
 tracks `SIM_MEAN_LIFE_CYCLES` (180). The history is wall-clock: while the stack is stopped every
-engine stays in its last status, so a day the stack did not run reads as fully available, and a
-lifecycle that spans a stop has a long time in service. Cycles are not affected.
+engine stays in its last status. `int_platform_outages` finds those stops as pauses of the whole
+fleet's telemetry longer than the dbt var `outage_min_gap_seconds` (60 s; a running fleet pauses at
+most for a repair of every engine at once plus a tick, about 21 s), and the reliability marts count
+their time as unobserved (`unobserved_seconds`, `operating_unobserved_seconds`) instead of in any
+status: availability and MTBF in time cover observed time only, a day the stack did not run has no
+availability, and MTBF in cycles is unchanged. MTTR stays wall-clock: a stop during a repair counts
+to it, because the simulator completes the overdue repair at restart (none of the 414 live repairs
+spans one). On the live stack on 2026-11-03 (7.6 days of history, 5 stops, 866 of 1,079
+engine-hours unobserved) this moved the fleet's MTBF from 158 to 30.4 minutes, in line with 182.8
+cycles of 10 s, and its availability from 0.998 to 0.988.
 
 ## Dashboards
 
@@ -581,10 +591,10 @@ ClickHouse account that can only run queries, never write.
 
 | Dashboard | What it answers |
 |---|---|
-| **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, failures by mode |
+| **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, work orders and failures by mode (each linked to the Fleet Reliability board) |
 | **Vibration Analytics (HF Sensor Frames)** | bearing defect tone (BPFO), kurtosis, crest factor and core unbalance per engine, the oil system (quantity, filter ΔP, temperatures), the EGT A/B sensor split, HF frames per minute |
 | **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source, and the processing rate and Kafka consumer lag of every streaming query |
-| **Fleet Reliability** | availability, failures, MTBF (time and cycles) and MTTR per engine and per day, time in each status per day, engine and lifecycle, the failure-mode Pareto, the SCD2 status timeline and every failure with its repair |
+| **Fleet Reliability** | availability, failures, MTBF (observed time and cycles) and MTTR per engine and per day, observed time in each status per day, engine and lifecycle (platform outages left out), the failure-mode Pareto, the SCD2 status timeline and every failure with its repair |
 | **Model Operations & Live Backtest** | the production model, every training run with its promotion decision, calibration of the failure probability, live versus holdout performance against failures that happened later |
 
 ## Service endpoints
@@ -763,10 +773,10 @@ jet-engine-lakehouse/
   ClickHouse with synthetic CDC (duplicates, updates, deletes, late rows) and the matching
   high-frequency frame features (dropped frames, NaN features, absent process keys, redelivered,
   late and corrected copies, a bearing spall), checks every spectral feature against an
-  independent Python reference, rebuilds the SCD2 status history and every reliability KPI in
-  Python and compares them value by value (failures and repairs, an out-of-order and a replayed
-  registry version, a deregistration, history written behind its registration), and proves that
-  the incremental models equal a full refresh.
+  independent Python reference, rebuilds the SCD2 status history, the platform outages and every
+  reliability KPI in Python and compares them value by value (failures and repairs, an out-of-order
+  and a replayed registry version, a deregistration, history written behind its registration, the
+  platform stopped overnight), and proves that the incremental models equal a full refresh.
 - **Lint:** `make lint` (ruff check + format check).
 
 ## Production hardening notes
@@ -816,6 +826,12 @@ same replication slot from its stored offsets: no new snapshot and nothing to re
 For the few seconds in between, the recreated worker reports the task FAILED, because the stored
 configuration still names the superuser's variables; after recreating only `debezium`, run
 `make register-cdc`.
+
+The platform outages need the rebuilt data-platform image, which holds the dbt project: `make up`
+rebuilds it, and the next dbt cycle (or `make dbt-run`) builds `int_platform_outages` and the
+unobserved columns. Until then the Fleet Reliability board's Availability, Downtime, Reliability by
+engine and Time in status by engine panels fail on the missing table, because Grafana loads the new
+dashboard JSON within 30 seconds.
 
 ## License
 
