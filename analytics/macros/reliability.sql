@@ -50,3 +50,17 @@
     {#- whole microseconds from start_ts to end_ts (Int64; NULL when either is NULL) -#}
     (toUnixTimestamp64Micro({{ end_ts }}) - toUnixTimestamp64Micro({{ start_ts }}))
 {%- endmacro %}
+
+
+{% macro outage_overlap_us(from_us, to_us) -%}
+    {#- microseconds of [from_us, to_us) inside platform outages (unix micros). Both bounds must be
+        non-NULL: greatest() and least() skip a NULL, so a NULL bound would count every outage on its
+        side; ifNull() only drops the Nullable type that arraySum rejects -#}
+    arraySum(
+        outage -> ifNull(greatest(least({{ to_us }}, outage.2) - greatest({{ from_us }}, outage.1), 0), 0),
+        (
+            select groupArray((toUnixTimestamp64Micro(outage_start), toUnixTimestamp64Micro(outage_end)))
+            from {{ ref('int_platform_outages') }} final
+        )
+    )
+{%- endmacro %}

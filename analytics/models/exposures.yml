@@ -37,6 +37,7 @@ exposures:
       failure-mode Pareto and the SCD2 status timeline.
     depends_on:
       - ref('int_engine_status_history')
+      - ref('int_platform_outages')
       - ref('fct_engine_failures')
       - ref('fct_engine_lifecycle_status_time')
       - ref('rpt_fleet_reliability_daily')

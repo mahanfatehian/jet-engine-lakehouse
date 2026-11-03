@@ -62,7 +62,7 @@
     {
       "type": "stat",
       "title": "Availability",
-      "description": "Share of the selected engines' time in the range spent in service (HEALTHY, WARNING or CRITICAL) rather than in FAILURE (under repair) or MAINTENANCE_RESET (repaired, not flown yet). Every interval of the SCD2 status history (int_engine_status_history) is clipped to the range; the open interval counts up to now.",
+      "description": "Share of the selected engines' time in the range spent in service (HEALTHY, WARNING or CRITICAL) rather than in FAILURE (under repair) or MAINTENANCE_RESET (repaired, not flown yet). Every interval of the SCD2 status history (int_engine_status_history) is clipped to the range; the open interval counts up to now. Time inside platform outages (int_platform_outages: the stack was stopped) is not observed and counts to no status.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -83,7 +83,7 @@
           "format": 1,
           "pluginVersion": "4.23.2",
           "queryType": "table",
-          "rawSql": "-- time in service / time observed of the selected engines in the range\nSELECT if(sum(seconds) > 0, sumIf(seconds, is_available = 1) / sum(seconds), NULL) AS availability\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        (toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC')))\n            - toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC')))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0",
+          "rawSql": "-- time in service / time observed of the selected engines in the range\nSELECT if(sum(seconds) > 0, sumIf(seconds, is_available = 1) / sum(seconds), NULL) AS availability\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC'))) AS from_us,\n        toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC'))) AS to_us,\n        -- observed time only: time inside platform outages (int_platform_outages) counts to no status\n        (to_us - from_us - arraySum(o -> greatest(least(to_us, o.2) - greatest(from_us, o.1), 0),\n            (SELECT groupArray((toUnixTimestamp64Micro(outage_start), toUnixTimestamp64Micro(outage_end)))\n             FROM int_platform_outages FINAL))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0",
           "refId": "A"
         }
       ],
@@ -204,7 +204,7 @@
     {
       "type": "stat",
       "title": "MTBF",
-      "description": "Mean time between failures of the failures in the range: wall-clock time in service from the previous return to service (or registration) to the failure, and the cycles flown in it (fct_engine_failures.operating_seconds / operating_cycles; failures whose operating run began before the CDC history are left out). While the platform is stopped every engine keeps its last status, so a lifecycle that spans a stop inflates the time; the cycles are not affected.",
+      "description": "Mean time between failures of the failures in the range: observed time in service from the previous return to service (or registration) to the failure, and the cycles flown in it (fct_engine_failures.operating_seconds / operating_cycles; failures whose operating run began before the CDC history are left out). Time inside platform outages (int_platform_outages) is left out; the cycles count every cycle flown.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -426,7 +426,7 @@
     {
       "type": "stat",
       "title": "Downtime",
-      "description": "Engine-time of the selected engines in the range spent out of service (FAILURE + MAINTENANCE_RESET intervals of the SCD2 status history, clipped to the range).",
+      "description": "Engine-time of the selected engines in the range spent out of service (FAILURE + MAINTENANCE_RESET intervals of the SCD2 status history, clipped to the range, outside platform outages).",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -447,7 +447,7 @@
           "format": 1,
           "pluginVersion": "4.23.2",
           "queryType": "table",
-          "rawSql": "-- engine-time out of service (FAILURE, MAINTENANCE_RESET) of the selected engines in the range\nSELECT sumIf(seconds, is_available = 0) AS downtime\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        (toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC')))\n            - toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC')))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0",
+          "rawSql": "-- engine-time out of service (FAILURE, MAINTENANCE_RESET) of the selected engines in the range\nSELECT sumIf(seconds, is_available = 0) AS downtime\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC'))) AS from_us,\n        toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC'))) AS to_us,\n        -- observed time only: time inside platform outages (int_platform_outages) counts to no status\n        (to_us - from_us - arraySum(o -> greatest(least(to_us, o.2) - greatest(from_us, o.1), 0),\n            (SELECT groupArray((toUnixTimestamp64Micro(outage_start), toUnixTimestamp64Micro(outage_end)))\n             FROM int_platform_outages FINAL))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0",
           "refId": "A"
         }
       ],
@@ -506,7 +506,7 @@
     {
       "type": "timeseries",
       "title": "Availability per day",
-      "description": "Daily availability (time in service / time observed) of every selected engine and of the whole fleet (engine-seconds of all engines). The newest day is partial, up to the status history's horizon. A day the platform was stopped counts in each engine's last status.",
+      "description": "Daily availability (time in service / time observed) of every selected engine and of the whole fleet (engine-seconds of all engines). The newest day is partial, up to the status history's horizon. Time inside platform outages is not observed: a day the platform was stopped has no availability.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -738,7 +738,7 @@
     {
       "type": "timeseries",
       "title": "MTBF per day (fleet)",
-      "description": "Fleet-wide mean time between failures of the failures of each UTC day: wall-clock time in service since the previous return to service (left) and the cycles flown (right). Independent of the engine filter. A lifecycle that spans a stop of the platform inflates the time, never the cycles.",
+      "description": "Fleet-wide mean time between failures of the failures of each UTC day: observed time in service since the previous return to service (left) and the cycles flown (right). Independent of the engine filter. Time inside platform outages is left out of the time, never out of the cycles.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -1016,7 +1016,7 @@
     {
       "type": "timeseries",
       "title": "Time in status per day",
-      "description": "Share of the selected engines' time per UTC day in each registry status (rpt_fleet_reliability_daily; hours in the tooltip). HEALTHY, WARNING and CRITICAL are in service; FAILURE is the repair, MAINTENANCE the reset into the next lifecycle.",
+      "description": "Share of the selected engines' observed time per UTC day in each registry status (rpt_fleet_reliability_daily; hours in the tooltip). Time inside platform outages counts to no status. HEALTHY, WARNING and CRITICAL are in service; FAILURE is the repair, MAINTENANCE the reset into the next lifecycle.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -1201,7 +1201,7 @@
     {
       "type": "table",
       "title": "Reliability by engine",
-      "description": "Per selected engine over the range: current status, availability (time in service / time observed), failures that began in the range with their MTBF (time in service and cycles since the previous return to service) and MTTR, and the time in each status (SCD2 intervals clipped to the range). Sorted by availability. Click an engine for its fleet health board.",
+      "description": "Per selected engine over the range: current status, availability (time in service / time observed), failures that began in the range with their MTBF (time in service and cycles since the previous return to service) and MTTR, and the time in each status (SCD2 intervals clipped to the range, outside platform outages). Sorted by availability. Click an engine for its fleet health board.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -1222,7 +1222,7 @@
           "format": 1,
           "pluginVersion": "4.23.2",
           "queryType": "table",
-          "rawSql": "SELECT\n    t.engine_id AS `Engine`,\n    c.status AS `Status now`,\n    t.available / t.observed AS `Availability`,\n    f.failures AS `Failures`,\n    f.mtbf_seconds AS `MTBF`,\n    f.mtbf_cycles AS `MTBF (cycles)`,\n    f.mttr_seconds AS `MTTR`,\n    t.healthy AS `Healthy`,\n    t.warning AS `Warning`,\n    t.critical AS `Critical`,\n    t.failure AS `In repair`,\n    t.maintenance_reset AS `Reset`\nFROM\n(\n    -- time per status in the range, every interval clipped to it\n    SELECT\n        engine_id,\n        sum(seconds) AS observed,\n        sumIf(seconds, is_available = 1) AS available,\n        sumIf(seconds, operational_status = 'HEALTHY') AS healthy,\n        sumIf(seconds, operational_status = 'WARNING') AS warning,\n        sumIf(seconds, operational_status = 'CRITICAL') AS critical,\n        sumIf(seconds, operational_status = 'FAILURE') AS failure,\n        sumIf(seconds, operational_status = 'MAINTENANCE_RESET') AS maintenance_reset\n    FROM\n    (\n        SELECT\n            engine_id,\n            operational_status,\n            is_available,\n            (toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC')))\n                - toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC')))) / 1e6 AS seconds\n        FROM int_engine_status_history FINAL\n        WHERE valid_from < $__toTime\n          AND (valid_to IS NULL OR valid_to > $__fromTime)\n          AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n    )\n    WHERE seconds > 0\n    GROUP BY engine_id\n) AS t\nLEFT JOIN\n(\n    -- failures in the range; averages of an empty set read NULL\n    SELECT\n        engine_id,\n        count() AS failures,\n        avg(operating_seconds) AS mtbf_seconds,\n        avg(operating_cycles) AS mtbf_cycles,\n        avg(repair_seconds) AS mttr_seconds\n    FROM fct_engine_failures FINAL\n    WHERE $__timeFilter(failed_at)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n    GROUP BY engine_id\n) AS f ON f.engine_id = t.engine_id\nLEFT JOIN\n(\n    SELECT engine_id, toNullable(toString(operational_status)) AS status\n    FROM int_engine_status_history FINAL\n    WHERE is_current = 1\n) AS c ON c.engine_id = t.engine_id\nORDER BY `Availability`, `Engine`",
+          "rawSql": "SELECT\n    t.engine_id AS `Engine`,\n    c.status AS `Status now`,\n    t.available / t.observed AS `Availability`,\n    f.failures AS `Failures`,\n    f.mtbf_seconds AS `MTBF`,\n    f.mtbf_cycles AS `MTBF (cycles)`,\n    f.mttr_seconds AS `MTTR`,\n    t.healthy AS `Healthy`,\n    t.warning AS `Warning`,\n    t.critical AS `Critical`,\n    t.failure AS `In repair`,\n    t.maintenance_reset AS `Reset`\nFROM\n(\n    -- time per status in the range, every interval clipped to it\n    SELECT\n        engine_id,\n        sum(seconds) AS observed,\n        sumIf(seconds, is_available = 1) AS available,\n        sumIf(seconds, operational_status = 'HEALTHY') AS healthy,\n        sumIf(seconds, operational_status = 'WARNING') AS warning,\n        sumIf(seconds, operational_status = 'CRITICAL') AS critical,\n        sumIf(seconds, operational_status = 'FAILURE') AS failure,\n        sumIf(seconds, operational_status = 'MAINTENANCE_RESET') AS maintenance_reset\n    FROM\n    (\n        SELECT\n            engine_id,\n            operational_status,\n            is_available,\n            toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC'))) AS from_us,\n            toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC'))) AS to_us,\n            -- observed time only: time inside platform outages (int_platform_outages) counts to no status\n            (to_us - from_us - arraySum(o -> greatest(least(to_us, o.2) - greatest(from_us, o.1), 0),\n                (SELECT groupArray((toUnixTimestamp64Micro(outage_start), toUnixTimestamp64Micro(outage_end)))\n                 FROM int_platform_outages FINAL))) / 1e6 AS seconds\n        FROM int_engine_status_history FINAL\n        WHERE valid_from < $__toTime\n          AND (valid_to IS NULL OR valid_to > $__fromTime)\n          AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n    )\n    WHERE seconds > 0\n    GROUP BY engine_id\n) AS t\nLEFT JOIN\n(\n    -- failures in the range; averages of an empty set read NULL\n    SELECT\n        engine_id,\n        count() AS failures,\n        avg(operating_seconds) AS mtbf_seconds,\n        avg(operating_cycles) AS mtbf_cycles,\n        avg(repair_seconds) AS mttr_seconds\n    FROM fct_engine_failures FINAL\n    WHERE $__timeFilter(failed_at)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n    GROUP BY engine_id\n) AS f ON f.engine_id = t.engine_id\nLEFT JOIN\n(\n    SELECT engine_id, toNullable(toString(operational_status)) AS status\n    FROM int_engine_status_history FINAL\n    WHERE is_current = 1\n) AS c ON c.engine_id = t.engine_id\nORDER BY `Availability`, `Engine`",
           "refId": "A"
         }
       ],
@@ -1543,7 +1543,7 @@
     {
       "type": "barchart",
       "title": "Time in status by engine",
-      "description": "Share of each selected engine's time in the range per registry status (SCD2 intervals clipped to the range; hours in the tooltip).",
+      "description": "Share of each selected engine's time in the range per registry status (SCD2 intervals clipped to the range, outside platform outages; hours in the tooltip).",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -1564,7 +1564,7 @@
           "format": 1,
           "pluginVersion": "4.23.2",
           "queryType": "table",
-          "rawSql": "SELECT\n    engine_id AS engine,\n    sumIf(seconds, operational_status = 'HEALTHY') / 3600 AS HEALTHY,\n    sumIf(seconds, operational_status = 'WARNING') / 3600 AS WARNING,\n    sumIf(seconds, operational_status = 'CRITICAL') / 3600 AS CRITICAL,\n    sumIf(seconds, operational_status = 'FAILURE') / 3600 AS FAILURE,\n    sumIf(seconds, operational_status = 'MAINTENANCE_RESET') / 3600 AS MAINTENANCE\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        (toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC')))\n            - toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC')))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0\nGROUP BY engine\nORDER BY engine",
+          "rawSql": "SELECT\n    engine_id AS engine,\n    sumIf(seconds, operational_status = 'HEALTHY') / 3600 AS HEALTHY,\n    sumIf(seconds, operational_status = 'WARNING') / 3600 AS WARNING,\n    sumIf(seconds, operational_status = 'CRITICAL') / 3600 AS CRITICAL,\n    sumIf(seconds, operational_status = 'FAILURE') / 3600 AS FAILURE,\n    sumIf(seconds, operational_status = 'MAINTENANCE_RESET') / 3600 AS MAINTENANCE\nFROM\n(\n    SELECT\n        engine_id,\n        operational_status,\n        is_available,\n        toUnixTimestamp64Micro(greatest(valid_from, toDateTime64($__fromTime, 6, 'UTC'))) AS from_us,\n        toUnixTimestamp64Micro(least(coalesce(valid_to, now64(6, 'UTC')), toDateTime64($__toTime, 6, 'UTC'))) AS to_us,\n        -- observed time only: time inside platform outages (int_platform_outages) counts to no status\n        (to_us - from_us - arraySum(o -> greatest(least(to_us, o.2) - greatest(from_us, o.1), 0),\n            (SELECT groupArray((toUnixTimestamp64Micro(outage_start), toUnixTimestamp64Micro(outage_end)))\n             FROM int_platform_outages FINAL))) / 1e6 AS seconds\n    FROM int_engine_status_history FINAL\n    WHERE valid_from < $__toTime\n      AND (valid_to IS NULL OR valid_to > $__fromTime)\n      AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\n)\nWHERE seconds > 0\nGROUP BY engine\nORDER BY engine",
           "refId": "A"
         }
       ],
@@ -2189,7 +2189,7 @@
     {
       "type": "table",
       "title": "Time in status per lifecycle",
-      "description": "Every lifecycle of the selected engines that overlaps the range (fct_engine_lifecycle_status_time): time in each status, availability and failures. A lifecycle is keyed by the registry's lifecycle when an interval began: its repair belongs to the lifecycle that failed, the reset to the one it starts. To is empty for the running lifecycle.",
+      "description": "Every lifecycle of the selected engines that overlaps the range (fct_engine_lifecycle_status_time): observed time in each status, availability and failures. A lifecycle is keyed by the registry's lifecycle when an interval began: its repair belongs to the lifecycle that failed, the reset to the one it starts. To is empty for the running lifecycle.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"

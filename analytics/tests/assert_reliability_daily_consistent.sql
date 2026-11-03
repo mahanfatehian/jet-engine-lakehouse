@@ -2,8 +2,8 @@
     rpt_fleet_reliability_daily must add up: the fleet row of every day is the sum of its engine
     rows (time, engines, failures, repairs and the MTTR / MTBF samples, re-weighted by their
     counts), every engine's failures over all days are its failures in fct_engine_failures, and
-    every engine's observed time over all days is the length of its status history up to the
-    report's horizon (so the days neither lose nor double-count time). Times compare to 1 ms.
+    every engine's observed and unobserved time over all days is the length of its status history
+    up to the report's horizon (so the days neither lose nor double-count time). Times compare to 1 ms.
 -#}
 
 {%- set tolerance_seconds = 0.001 %}
@@ -14,6 +14,7 @@ with engine_days as (
         day,
         sum(engines) as engines_sum,
         sum(observed_seconds) as observed_seconds_sum,
+        sum(unobserved_seconds) as unobserved_seconds_sum,
         sum(available_seconds) as available_seconds_sum,
         sum(failures) as failures_sum,
         sum(repairs) as repairs_sum,
@@ -32,6 +33,7 @@ fleet_days as (
         day,
         engines as fleet_engines,
         observed_seconds as fleet_observed_seconds,
+        unobserved_seconds as fleet_unobserved_seconds,
         available_seconds as fleet_available_seconds,
         failures as fleet_failures,
         repairs as fleet_repairs,
@@ -45,7 +47,10 @@ fleet_days as (
 
 engine_totals as (
 
-    select engine_id, sum(failures) as report_failures, sum(observed_seconds) as report_observed_seconds
+    select
+        engine_id,
+        sum(failures) as report_failures,
+        sum(observed_seconds + unobserved_seconds) as report_seconds
     from {{ ref('rpt_fleet_reliability_daily') }} final
     where engine_id != 'ALL'
     group by engine_id
@@ -89,6 +94,7 @@ where engines_sum != fleet_engines
    or repairs_sum != fleet_repairs
    or operating_periods_sum != fleet_operating_periods
    or abs(observed_seconds_sum - fleet_observed_seconds) > {{ tolerance_seconds }}
+   or abs(unobserved_seconds_sum - fleet_unobserved_seconds) > {{ tolerance_seconds }}
    or abs(available_seconds_sum - fleet_available_seconds) > {{ tolerance_seconds }}
    or abs(repair_seconds_sum - fleet_repair_seconds) > {{ tolerance_seconds }}
    or abs(operating_seconds_sum - fleet_operating_seconds) > {{ tolerance_seconds }}
@@ -110,7 +116,7 @@ select
     'engine_time_differs' as issue,
     toString(engine_id) as scope,
     history_seconds as expected,
-    report_observed_seconds as actual
+    report_seconds as actual
 from engine_history
 full outer join engine_totals using (engine_id)
-where abs(history_seconds - report_observed_seconds) > {{ tolerance_seconds }}
+where abs(history_seconds - report_seconds) > {{ tolerance_seconds }}

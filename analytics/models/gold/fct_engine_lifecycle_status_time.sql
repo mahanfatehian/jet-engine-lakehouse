@@ -14,6 +14,7 @@
     so a rebuild on the same data yields the same numbers. Durations are summed in whole
     microseconds, so they add up exactly. A lifecycle whose start predates the CDC history (the
     connector's initial snapshot) is covered from its first interval on. Table, rebuilt on every run.
+    Time inside platform outages counts to no status but as unobserved: availability is observed time.
 -#}
 
 {%- set statuses = registry_statuses() %}
@@ -28,7 +29,10 @@ with intervals as (
         is_available,
         is_current,
         valid_from,
-        coalesce(valid_to, greatest(valid_from, {{ status_history_as_of() }})) as interval_end
+        coalesce(valid_to, greatest(valid_from, {{ status_history_as_of() }})) as interval_end,
+        {{ outage_overlap_us('toUnixTimestamp64Micro(valid_from)', 'toUnixTimestamp64Micro(interval_end)') }}
+            as unobserved_us,
+        {{ micros_between('valid_from', 'interval_end') }} - unobserved_us as observed_us
     from {{ ref('int_engine_status_history') }} final
 
 ),
@@ -44,11 +48,11 @@ status_time as (
         max(is_current) as is_current,
         count() as status_intervals,
         {%- for entry in statuses %}
-        sumIf({{ micros_between('valid_from', 'interval_end') }}, operational_status = '{{ entry.status }}')
-            as {{ entry.column }}_us,
+        sumIf(observed_us, operational_status = '{{ entry.status }}') as {{ entry.column }}_us,
         {%- endfor %}
-        sumIf({{ micros_between('valid_from', 'interval_end') }}, is_available = 1) as available_us,
-        sumIf({{ micros_between('valid_from', 'interval_end') }}, is_available = 0) as unavailable_us
+        sumIf(observed_us, is_available = 1) as available_us,
+        sumIf(observed_us, is_available = 0) as unavailable_us,
+        sum(unobserved_us) as unobserved_us
     from intervals
     group by engine_id, lifecycle_id
 
@@ -78,6 +82,7 @@ select
     available_us / 1000000.0 as available_seconds,
     unavailable_us / 1000000.0 as unavailable_seconds,
     (available_us + unavailable_us) / 1000000.0 as observed_seconds,
+    unobserved_us / 1000000.0 as unobserved_seconds,
     if(available_us + unavailable_us > 0, available_us / (available_us + unavailable_us), null) as availability
 from status_time
 left join lifecycle_failures using (engine_id, lifecycle_id)

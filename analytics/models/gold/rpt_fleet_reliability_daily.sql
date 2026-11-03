@@ -19,6 +19,8 @@
       MTBF         = mean operating time (and cycles) since the previous return to service (or
                      the registration), over the day's failures whose operating run has a known start
 
+    Time inside platform outages counts to no status but as unobserved, and to no operating time.
+
     Fleet rows weigh engines by time (engine-seconds) and failures equally. Durations are summed in
     whole microseconds, so the fleet row is the exact sum of its engines. Table, rebuilt on every run.
 -#}
@@ -55,11 +57,13 @@ day_pieces as (
         operational_status,
         is_available,
         toDate('1970-01-01') + day_number as day,
-        least(to_us, (day_number + 1) * {{ day_us }}) - greatest(from_us, day_number * {{ day_us }})
-            as piece_us
+        greatest(from_us, day_number * {{ day_us }}) as piece_from_us,
+        least(to_us, (day_number + 1) * {{ day_us }}) as piece_to_us,
+        {{ outage_overlap_us('piece_from_us', 'piece_to_us') }} as unobserved_us,
+        piece_to_us - piece_from_us - unobserved_us as piece_us
     from intervals
     array join range(intDiv(from_us, {{ day_us }}), intDiv(to_us, {{ day_us }}) + 1) as day_number
-    where least(to_us, (day_number + 1) * {{ day_us }}) > greatest(from_us, day_number * {{ day_us }})
+    where piece_to_us > piece_from_us
 
 ),
 
@@ -70,6 +74,7 @@ status_time as (
         if(grouping(engine_id) = 1, 'ALL', engine_id) as engine_scope,
         uniqExact(engine_id) as engines,
         sum(piece_us) as observed_us,
+        sum(unobserved_us) as unobserved_us,
         {%- for entry in statuses %}
         sumIf(piece_us, operational_status = '{{ entry.status }}') as {{ entry.column }}_us,
         {%- endfor %}
@@ -96,7 +101,10 @@ failure_stats as (
             engine_id,
             failed_at,
             {{ micros_between('failed_at', 'returned_to_service_at') }} as repair_us,
-            {{ micros_between('operating_since', 'failed_at') }} as operating_us,
+            toUnixTimestamp64Micro(operating_since) as since_us,
+            toUnixTimestamp64Micro(failed_at) as failed_us,
+            -- observed time only, like fct_engine_failures.operating_seconds
+            failed_us - since_us - {{ outage_overlap_us('since_us', 'failed_us') }} as operating_us,
             operating_cycles
         from {{ ref('fct_engine_failures') }} final
     )
@@ -110,6 +118,7 @@ select
     cast(engine_scope as LowCardinality(String)) as engine_id,
     engines,
     observed_us / 1000000.0 as observed_seconds,
+    unobserved_us / 1000000.0 as unobserved_seconds,
     {%- for entry in statuses %}
     {{ entry.column }}_us / 1000000.0 as {{ entry.column }}_seconds,
     {%- endfor %}

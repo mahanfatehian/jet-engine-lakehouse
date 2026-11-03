@@ -19,7 +19,8 @@
     unknown, unless the interval is a registration (entry_cdc_op = 'c'): an engine enters service
     when it is registered. So the time between failures is only measured for an operating run
     whose start is known (a return to service or a registration), and the time to repair stays
-    NULL while the engine is still down or was deregistered before it returned.
+    NULL while the engine is still down or was deregistered before it returned. The operating time
+    leaves out the run's time inside platform outages, reported as unobserved (cycles count all).
 
     The work order is the lifecycle's (maintenance_log is unique per engine lifecycle); its failure
     mode reads UNKNOWN until it has landed. Table, rebuilt on every run.
@@ -138,6 +139,11 @@ failures as (
         -- the operating run right before the failure, if its start is known
         if(run_follows_run = 1 and previous_run_start_observed = 1, previous_run_start, null)
             as operating_since,
+        -- its time inside platform outages (meaningless while its start is unknown: both columns
+        -- derived from it below are NULL then)
+        {{ outage_overlap_us(
+            'toUnixTimestamp64Micro(operating_since)', 'toUnixTimestamp64Micro(failed_at)'
+        ) }} as operating_unobserved_us,
         previous_run_lifecycle_id,
         previous_run_entry_cycle
     from sequenced
@@ -170,7 +176,9 @@ select
     returned_to_service_at,
     {{ micros_between('failed_at', 'returned_to_service_at') }} / 1000000.0 as repair_seconds,
     operating_since,
-    {{ micros_between('operating_since', 'failed_at') }} / 1000000.0 as operating_seconds,
+    ({{ micros_between('operating_since', 'failed_at') }} - operating_unobserved_us) / 1000000.0
+        as operating_seconds,
+    if(isNull(operating_since), null, operating_unobserved_us / 1000000.0) as operating_unobserved_seconds,
     -- cycles flown in that run, the failure cycle included (like cycles_since_new)
     cast(
         if(

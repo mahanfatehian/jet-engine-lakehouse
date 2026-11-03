@@ -12,7 +12,9 @@ models:
       operating run before the failure, a return to service or the engine's registration, and is
       only measured when that start is in the history: an engine's history that begins with the
       connector's snapshot or a backfilled change, and a deregistration, leave it unknown. The
-      time to repair (repair_seconds) is NULL while the engine is still down
+      operating time leaves out the run's time inside platform outages (int_platform_outages): that
+      is operating_unobserved_seconds, so operating_seconds is observed time, while operating_cycles
+      counts every cycle. The time to repair (repair_seconds) is NULL while the engine is still down
       or when it was deregistered before it returned. The failure mode and the work order's own
       downtime come from the lifecycle's maintenance work order (stg_maintenance_log); the mode
       reads UNKNOWN until the work order has landed. Table (rebuilt every run) on
@@ -31,7 +33,10 @@ models:
               isNull(returned_to_service_at) = isNull(repair_seconds)
               and (isNull(returned_to_service_at) or returned_to_service_at > failed_at)
               and isNull(operating_since) = isNull(operating_seconds)
+              and isNull(operating_since) = isNull(operating_unobserved_seconds)
               and (isNull(operating_since) or operating_since < failed_at)
+              and (isNull(operating_since) or abs(operating_seconds + operating_unobserved_seconds
+                - (toUnixTimestamp64Micro(failed_at) - toUnixTimestamp64Micro(operating_since)) / 1e6) < 1e-6)
               and (isNull(operating_cycles) or isNotNull(operating_since))
     columns:
       - name: engine_id
@@ -73,7 +78,16 @@ models:
           before the history, i.e. its start is unknown.
       - name: operating_seconds
         data_type: Nullable(Float64)
-        description: "Time between failures: failed_at - operating_since in seconds. MTBF is its mean."
+        description: >
+          Time between failures in observed time: failed_at - operating_since -
+          operating_unobserved_seconds (seconds). MTBF is its mean.
+        data_tests:
+          - non_negative
+      - name: operating_unobserved_seconds
+        data_type: Nullable(Float64)
+        description: >
+          Time of the operating run inside platform outages (int_platform_outages, seconds), left out
+          of operating_seconds; NULL without operating_since.
         data_tests:
           - non_negative
       - name: operating_cycles
@@ -114,6 +128,7 @@ models:
       it starts). The current interval is measured up to the history's horizon: the newest event
       time the registry's CDC log reports, so a rebuild on the same data yields the same numbers.
       A lifecycle that began before the CDC history is covered from its first interval on.
+      Time inside platform outages (int_platform_outages) counts to no status but to unobserved_seconds.
       failures counts the failures of fct_engine_failures in the lifecycle. Durations are summed
       in whole microseconds. Table (rebuilt every run) on ReplacingMergeTree ordered by
       (engine_id, lifecycle_id); rows are unique, so it can be read with or without FINAL.
@@ -132,7 +147,7 @@ models:
                 + failure_seconds + maintenance_reset_seconds)) < 1e-6
               and abs(available_seconds - (healthy_seconds + warning_seconds + critical_seconds)) < 1e-6
               and abs(unavailable_seconds - (failure_seconds + maintenance_reset_seconds)) < 1e-6
-              and observed_seconds
+              and observed_seconds + unobserved_seconds
                 <= (toUnixTimestamp64Micro(observed_to) - toUnixTimestamp64Micro(observed_from)) / 1e6 + 1e-6
               and (observed_seconds > 0) = isNotNull(availability)
     columns:
@@ -199,7 +214,16 @@ models:
         description: Time out of service (FAILURE + MAINTENANCE_RESET, seconds).
       - name: observed_seconds
         data_type: Float64
-        description: Time the history covers in the lifecycle (available + unavailable, seconds).
+        description: >
+          Time the history covers in the lifecycle outside platform outages (available +
+          unavailable, seconds).
+        data_tests:
+          - non_negative
+      - name: unobserved_seconds
+        data_type: Float64
+        description: Time the history covers in the lifecycle inside platform outages (seconds).
+        data_tests:
+          - non_negative
       - name: availability
         data_type: Nullable(Float64)
         description: available_seconds / observed_seconds; NULL when no time is observed yet.
@@ -217,11 +241,12 @@ models:
       (as_of_ts), so the newest day is partial. Failures count on the day the engine failed, and
       so do their repair and operating times (fct_engine_failures). availability = time available
       (HEALTHY, WARNING, CRITICAL) / time observed; MTTR = mean time from failure to return to
-      service over the day's repaired failures; MTBF = mean time (and cycles) from the previous
+      service over the day's repaired failures; MTBF = mean observed time (and cycles) from the previous
       return to service (or registration) to the failure over the day's failures whose operating
       run has a known start. The fleet row weighs engines by time (engine-seconds) and failures equally;
       durations are summed in whole microseconds, so it is the exact sum of its engines. The
-      history is wall-clock: while the platform is stopped every engine stays in its last status.
+      history is wall-clock, but time inside platform outages (int_platform_outages) counts to no
+      status and to no operating time, only to unobserved_seconds.
       Table (rebuilt every run) on ReplacingMergeTree ordered by (day, engine_id); rows are unique,
       so it can be read with or without FINAL.
     config:
@@ -237,7 +262,7 @@ models:
               abs(observed_seconds - (healthy_seconds + warning_seconds + critical_seconds
                 + failure_seconds + maintenance_reset_seconds)) < 1e-6
               and abs(available_seconds - (healthy_seconds + warning_seconds + critical_seconds)) < 1e-6
-              and observed_seconds <= 86400 * engines + 1e-6
+              and observed_seconds + unobserved_seconds <= 86400 * engines + 1e-6
               and (observed_seconds > 0) = isNotNull(availability)
               and repairs <= failures and operating_periods <= failures
               and isNull(mttr_seconds) = (repairs = 0)
@@ -259,7 +284,16 @@ models:
         description: Engines with status history on the day (1 on an engine row).
       - name: observed_seconds
         data_type: Float64
-        description: Time the status history covers on the day (engine-seconds on the fleet row).
+        description: >
+          Time the status history covers on the day outside platform outages (engine-seconds on the
+          fleet row).
+        data_tests:
+          - non_negative
+      - name: unobserved_seconds
+        data_type: Float64
+        description: >
+          Time the status history covers on the day inside platform outages (engine-seconds on the
+          fleet row).
         data_tests:
           - non_negative
       - name: healthy_seconds
@@ -304,7 +338,9 @@ models:
         description: Of the day's failures, the ones with a measured operating time (the MTBF sample).
       - name: mtbf_seconds
         data_type: Nullable(Float64)
-        description: Mean time between failures (operating time before the failure, seconds); NULL without a sample.
+        description: >
+          Mean time between failures: the observed operating time before the failure
+          (fct_engine_failures.operating_seconds, seconds); NULL without a sample.
         data_tests:
           - non_negative
       - name: mtbf_cycles
