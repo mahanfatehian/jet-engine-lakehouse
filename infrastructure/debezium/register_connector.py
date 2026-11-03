@@ -19,6 +19,11 @@ timed out, 2 invalid connector file.
 
 Adding a table to ``table.include.list`` does not snapshot that table's existing rows:
 ``snapshot.mode=initial`` only applies before offsets exist; use an incremental snapshot signal.
+The connector logs in as the replication role of postgres/roles.sql, which may neither create nor
+alter the publication: a new table must also join it (init.sql, ALTER PUBLICATION on an existing
+database) and the role's SELECT grant. So must the signal table of an incremental snapshot,
+which the role also needs INSERT on (and DELETE, with the insert_delete watermarking strategy):
+grant it in roles.sql, because postgres-init revokes a grant made by hand on its next run.
 """
 
 from __future__ import annotations

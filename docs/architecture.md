@@ -47,9 +47,17 @@ The simulator is designed so that every Debezium operation type appears in the s
 
 `REPLICA IDENTITY FULL` on all three tables makes UPDATE and DELETE events carry the complete
 before-image. The publication `dbz_engine_publication` is created in
-[`init.sql`](../infrastructure/postgres/init.sql), so the connector never needs table ownership.
-Credentials and the topic prefix reach the connector through Kafka Connect's
-`EnvVarConfigProvider` (`${env:POSTGRES_PASSWORD}`), so the connector JSON contains no secrets.
+[`init.sql`](../infrastructure/postgres/init.sql), and the connector uses it as it is
+(`publication.autocreate.mode=disabled`; Debezium's `filtered` mode runs `ALTER PUBLICATION` on
+every start, which only the publication's owner may do). So the connector streams as `debezium`, a
+role with LOGIN, REPLICATION and SELECT on the three tables, which the one-shot `postgres-init` job
+([`roles.sql`](../infrastructure/postgres/roles.sql)) creates or updates on every `up`; a table
+added to `table.include.list` must also join the publication and that grant. PostgreSQL cannot
+narrow REPLICATION to a publication, so the role could still decode every table's changes through a
+slot of its own: its password guards the whole change stream. The role's credentials and the topic
+prefix reach the connector through Kafka Connect's `EnvVarConfigProvider`
+(`${env:POSTGRES_CDC_PASSWORD}`), so the connector JSON contains no secrets and the worker never
+holds the superuser's password.
 
 ## 3. Streaming topology
 
@@ -175,10 +183,10 @@ whose loss would stop the query on its next restart.
 | gold | `rpt_fleet_reliability_daily` | dbt, table | `ReplacingMergeTree` | availability, failures, MTBF (time and cycles), MTTR per UTC day and engine, plus the fleet (`ALL`) |
 | gold | `rpt_failure_mode_pareto` | dbt, table | `ReplacingMergeTree` | work orders per failure mode, ranked with cumulative shares, per engine and fleet |
 | gold | `rpt_model_live_performance` | dbt, table | `ReplacingMergeTree` | live RMSE, MAE, bias, NASA score, horizon precision/recall/F1 and warning lead time per model version |
-| serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL | every prediction with its sensor readings |
-| serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree` | training-run registry |
+| serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL, insert deduplication window 100 | every prediction with its sensor readings |
+| serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree`, insert deduplication window 100 | training-run registry |
 | serving | `v_engine_rul_latest` | view | – | latest prediction per engine |
-| ops | `ops_reconciliation` | `reconcile_lakehouse.py` | `MergeTree`, key `(run_at, layer, engine_id, event_hour)`, 30-day TTL | one row per reconciliation run, layer, engine and hour of event time: source pulses the layer must hold, pulses it holds, OK / MISSING / EXTRA |
+| ops | `ops_reconciliation` | `reconcile_lakehouse.py` | `MergeTree`, key `(run_at, layer, engine_id, event_hour)`, 30-day TTL, insert deduplication window 100 | one row per reconciliation run, layer, engine and hour of event time: source pulses the layer must hold, pulses it holds, OK / MISSING / EXTRA |
 | ops | `ops_stream_progress` | Spark (listener of the streaming job) | `MergeTree`, key `(query_name, trigger_ts)`, 30-day TTL | one row per micro-batch of every streaming query: input rows and rates, durations of the batch, its sink and its Kafka offset lookup, Kafka consumer lag in records (NULL for a re-run batch) |
 
 ```mermaid
@@ -220,6 +228,12 @@ flowchart LR
 - **Replays are harmless.** Spark may replay a micro-batch after a crash. ClickHouse tables are
   keyed by the source primary key and versioned by `cdc_lsn`, so a replayed row collapses into the
   same version, and every dbt model reads with `FINAL` or explicit `argMax(..., cdc_lsn)`.
+- **A retried insert lands once.** The data-science jobs append predictions, training runs and
+  audit cells through one ClickHouse gateway, which retries an insert after a read timeout or a
+  dropped connection, failures that can come after ClickHouse stored the batch. Every attempt of one
+  insert carries the same `insert_deduplication_token`, and the three tables keep the block IDs of
+  their last 100 inserts (`non_replicated_deduplication_window`), so the retried copy is dropped;
+  the next insert gets a new token and lands even when its rows are identical.
 - **Updates win by log position, not arrival time.** The back-flagging UPDATE of a telemetry row
   carries a higher `cdc_lsn` than its INSERT, so the flagged version wins in `raw_*`, `stg_*` and
   the silver lake (readers keep the row with the highest `cdc_lsn` per key).
@@ -251,7 +265,8 @@ flowchart LR
 - **Every layer is reconciled against the source.** Every `RECONCILE_INTERVAL_SECONDS` the
   orchestrator task `reconcile` (`data_science/reconcile_lakehouse.py`) counts in one ClickHouse
   query, per engine and hour of event time, the last 6 hours of pulses in four places: PostgreSQL
-  (`postgresql()`, the window pushed down), `raw_engine_telemetry FINAL`, `stg_engine_telemetry FINAL`
+  (`postgresql()` as the SELECT-only role `auditor`, the window pushed down),
+  `raw_engine_telemetry FINAL`, `stg_engine_telemetry FINAL`
   and the silver Parquet (`s3()`, newest image per `telemetry_id`), and records OK / MISSING / EXTRA
   per cell in `ops_reconciliation`. Every layer applies the same filter, event time inside the window
   and the source's insert time at least `RECONCILE_LAG_SECONDS` before the run, so in-flight data is
@@ -272,6 +287,7 @@ flowchart LR
 | A task fails in the orchestrator | logged as FAILED with its output tail; the loop continues; repeated failures back off exponentially; a failed dbt test skips that cycle's training and snapshot |
 | A manual `make` job while the loop runs the same job | it waits for the per-job lock (shared volume) instead of colliding |
 | Debezium connector stopped, PAUSED or FAILED | the replication slot retains WAL (capped by `max_slot_wal_keep_size`, 4 GB); `make register-cdc` restarts or resumes it; `make cdc-status` exits 1 until it is RUNNING |
+| `postgres-init` fails (a wrong superuser password in `.env`, a role variable naming the superuser or the other role) | Debezium and the orchestrator do not start, because they log in with the roles it maintains; services already running keep running; `make logs SERVICE=postgres-init` names the error and the next `make up` retries |
 | Driver loop of the streaming job wedged | `/tmp/streaming.heartbeat` goes stale and the container turns unhealthy |
 | Kafka slow or down for the HF producer | frames are produced from a background thread, so the 1 Hz Postgres tick never waits; frames wait in a buffer of `SIM_HF_QUEUE_MAX_MB` that holds both queued and unacknowledged frames; the producer has no delivery timeout, so the buffer bounds an outage (about 37 minutes of the default fleet's frames), after which new frames are dropped and counted |
 | Simulator stopped before the first-boot HF backlog reached Kafka (`make down`, a crash, Kafka never up) | each engine's history transaction also writes its row in `simulator_hf_backfill` (frames owed, last event time); the row is deleted only after Kafka has acknowledged every backfill frame of that engine. The next start rebuilds the owed frames from the stored pulses and `simulator_lifecycle_params` (same `telemetry_id`, `frame_seq` and physics; byte-identical under an unchanged `SIM_SEED`) and queues them as backfill again, while live frames keep flowing; frames sent twice collapse in `raw_engine_hf_features`. A history the recorded settings cannot reproduce is logged and its row dropped |
@@ -300,4 +316,5 @@ flowchart LR
 | One HF backfill row per engine, cleared after every frame of it is acknowledged | a stop or a Kafka outage during the first-boot drain no longer leaves history without spectral features | an interrupted drain re-sends that engine's whole backfill (harmless duplicates) |
 | Reconcile inside ClickHouse (`postgresql()`, `s3()` table functions) | one SQL statement compares every layer where the data already lives; nothing new to deploy, and only the window's source rows leave Postgres | ClickHouse must reach Postgres and MinIO by their compose names, and the window reaches Postgres as UTC literals (the database runs with TimeZone UTC, the image default) |
 | Progress rows from a listener into a bounded buffer, inserted by a thread of their own and dropped when ClickHouse refuses them | monitoring must never block or fail a micro-batch, and a row ClickHouse rejects must not hold back the rows after it | an outage longer than the insert retries (about 15 s) loses the rows of that flush (counted in the log) |
+| Dedicated Postgres roles, re-applied by a one-shot job | Debezium and the audit hold only the privileges they use, and neither container holds the superuser password; init.sql runs once per volume, so only a job that runs on every `up` gives an existing stack the roles and applies a changed password | the connector no longer keeps the publication in step with `table.include.list` (only its owner may alter it): a new CDC table must also join the publication and the role's grant; REPLICATION cannot be narrowed to the publication, so the replication role's password still guards every table's changes |
 | Ports bound to `127.0.0.1` by default | default credentials stay unreachable from the network | set `BIND_HOST` to expose the stack deliberately |

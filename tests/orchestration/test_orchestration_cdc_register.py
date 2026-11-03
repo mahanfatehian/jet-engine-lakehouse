@@ -1,4 +1,5 @@
-"""CDC connector registration (infrastructure/debezium/register_connector.py) against a fake Connect API."""
+"""CDC connector registration (infrastructure/debezium/register_connector.py) against a fake Connect API, and
+the connector's contract with compose, init.sql's publication and postgres/roles.sql."""
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import yaml
 
 INFRASTRUCTURE = Path(__file__).resolve().parents[2] / "infrastructure"
 SCRIPT = INFRASTRUCTURE / "debezium" / "register_connector.py"
@@ -406,6 +408,37 @@ def test_defaults_point_at_debezium_and_the_repository_connector_file(
     spec = rc.load_connector_spec(args.config)
     assert spec.name == NAME
     assert spec.config["slot.name"] == "dbz_engine_slot"
+
+
+def test_the_connector_streams_as_the_replication_role_postgres_init_creates() -> None:
+    config = rc.load_connector_spec(SCRIPT.with_name("register-postgres-connector.json")).config
+    services = yaml.safe_load((INFRASTRUCTURE / "docker-compose.yml").read_text(encoding="utf-8"))["services"]
+    worker, roles = services["debezium"]["environment"], services["postgres-init"]["environment"]
+
+    assert (config["database.user"], config["database.password"]) == (
+        "${env:POSTGRES_CDC_USER}",
+        "${env:POSTGRES_CDC_PASSWORD}",
+    )
+    # The worker resolves every reference, with the role's own login: never the superuser's.
+    assert set(re.findall(r"\$\{env:(\w+)\}", json.dumps(config))) <= worker.keys()
+    assert all(worker[name] == roles[name] for name in ("POSTGRES_CDC_USER", "POSTGRES_CDC_PASSWORD"))
+    assert not {"POSTGRES_USER", "POSTGRES_PASSWORD"} & worker.keys()
+
+
+def test_every_captured_table_is_published_and_readable_by_the_replication_role() -> None:
+    config = rc.load_connector_spec(SCRIPT.with_name("register-postgres-connector.json")).config
+    init = (INFRASTRUCTURE / "postgres" / "init.sql").read_text(encoding="utf-8")
+    roles = (INFRASTRUCTURE / "postgres" / "roles.sql").read_text(encoding="utf-8")
+    published = re.search(rf"CREATE PUBLICATION {config['publication.name']}\s+FOR TABLE ([^;]+);", init)
+    granted = re.search(r'GRANT SELECT ON ([^;]+) TO :"cdc_user";', roles)
+
+    # Only the publication's owner may alter it, so the connector uses it as init.sql made it:
+    # a table added to table.include.list streams once it is published and granted too.
+    assert config["publication.autocreate.mode"] == "disabled"
+    assert published and granted
+    captured = {table.removeprefix("public.") for table in config["table.include.list"].split(",")}
+    assert {table.strip() for table in published.group(1).split(",")} == captured
+    assert {table.strip() for table in granted.group(1).split(",")} == captured
 
 
 def test_the_role_job_keeps_its_passwords_out_of_the_server_log() -> None:

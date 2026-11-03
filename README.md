@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,198 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,206 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -125,7 +125,7 @@ flowchart LR
 
 | Layer | Service | Image | Role |
 |---|---|---|---|
-| Edge OLTP | `postgres` | `postgres:15-alpine` | operational tables, `REPLICA IDENTITY FULL`, CDC publication |
+| Edge OLTP | `postgres` + `postgres-init` | `postgres:15-alpine` | operational tables, `REPLICA IDENTITY FULL`, CDC publication; least-privilege roles for Debezium and the reconciliation audit, re-applied on every `up` |
 | Edge | `simulator` | built from [`simulator/`](simulator) | wears engines out, fails and repairs them; writes INSERTs and UPDATEs; streams one HF sensor frame per engine per second |
 | CDC | `debezium` + `cdc-register` | `quay.io/debezium/connect:2.5` | streams WAL changes as JSON envelopes; connector registers itself |
 | Backbone | `kafka` + `kafka-init` | `confluentinc/cp-kafka:7.5.0` | KRaft broker; CDC and HF topics created as code (auto-create off) |
@@ -240,7 +240,7 @@ cd jet-engine-lakehouse
 # Optional: every variable already has a default inside docker-compose.yml.
 cp infrastructure/.env.example infrastructure/.env
 
-make up            # build 4 images and start 13 services; the CDC connector registers itself
+make up            # build 4 images and start 14 services; the CDC connector registers itself
 make ps            # wait until services are healthy and the init jobs exited with 0
 make register-cdc  # registers or updates the connector, restarts a FAILED task, waits for RUNNING
 make stream        # follow Spark: "clickhouse batch N: engine_telemetry=30 ..." every 5 s
@@ -476,7 +476,9 @@ backfill included, is never reported. Every cell lands in `ops_reconciliation` (
 line sums the run up, and a run with gaps exits 65, so the scheduler logs it as FAILED and backs off.
 `make reconcile` runs the audit on demand (`ARGS="--window-hours 24 --lag-seconds 0"` widens it),
 `make verify` shows the latest run, and the Data Platform dashboard shows it per layer with every
-cell that differs. Credentials reach ClickHouse only as query parameters, which it hides in its logs.
+cell that differs. The audit reads the source as `auditor`, a role that may only SELECT
+`engine_telemetry`, and credentials reach ClickHouse only as query parameters, which it hides in its
+logs.
 
 ```sql
 SELECT layer, sum(source_rows) AS source_pulses, sum(layer_rows) AS layer_pulses,
@@ -601,7 +603,7 @@ prints the addresses with the ports from your `infrastructure/.env`.
 | Debezium REST | http://localhost:8083/connectors/engine-postgres-cdc/status | – |
 | Schema Registry | http://localhost:8081/subjects | – |
 | Spark UI (Structured Streaming tab) | http://localhost:4040 | – |
-| PostgreSQL | `localhost:5432`, database `jet_engine_db` | `admin` / `adminpassword` |
+| PostgreSQL | `localhost:5432`, database `jet_engine_db` | `admin` / `adminpassword` (superuser); Debezium logs in as `debezium`, the reconciliation audit as `auditor` |
 | Kafka (host listener) | `localhost:9092` | – |
 
 ## Configuration
@@ -628,6 +630,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `SPECTRAL_MAX_LAG_SECONDS` | `60` | scoring carries spectral features forward this far while the newest frames are still in flight; beyond it the pulse features alone decide |
 | `PIPELINE_GATE_ON_DBT_TESTS` | `true` | a failed dbt test skips training and lake snapshots in that cycle |
 | `BIND_HOST` | `127.0.0.1` | interface every published port binds to |
+| `POSTGRES_CDC_USER` / `POSTGRES_CDC_PASSWORD`, `POSTGRES_AUDIT_USER` / `POSTGRES_AUDIT_PASSWORD` | `debezium` / `debezium-replication`, `auditor` / `auditor-readonly` | the replication role Debezium streams as (SELECT on the three CDC tables) and the SELECT-only role the reconciliation reads `engine_telemetry` with; `postgres-init` creates or updates both on every `up`, so a changed password applies on the next `up`; renaming a role leaves the old one with its grants and password: drop it by hand (`make psql`, then `DROP OWNED BY <old>; DROP ROLE <old>;`) |
 | `DBT_INTERVAL_SECONDS` / `TRAIN_INTERVAL_SECONDS` | `120` / `1800` | orchestration cadence |
 | `RUL_FAILURE_HORIZON_CYCLES` / `RUL_CAP_CYCLES` | `25` / `125` | "imminent failure" horizon and RUL target cap (dbt reads the same values) |
 | `FLIGHT_HOURS_PER_CYCLE` | `2.0` | converts predicted cycles into hours |
@@ -704,6 +707,10 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
   and are not retried beyond the insert's own retries.
 - **Connector not RUNNING:** `make cdc-status`, then `make register-cdc` (it restarts a FAILED task
   and resumes a PAUSED connector).
+- **`postgres-init` exited non-zero:** Debezium and the orchestrator start only once it succeeds;
+  `make logs SERVICE=postgres-init` shows why: a `POSTGRES_PASSWORD` the database does not accept,
+  or a `POSTGRES_CDC_USER` / `POSTGRES_AUDIT_USER` that names the superuser or the other role
+  (`must name three roles`).
 - **A manual `make dbt-run` or `make train-ml` seems to hang:** it is waiting for the scheduled run
   of the same job to finish (shared locks), then runs with the scheduler's timeouts.
 - **MinIO image:** MinIO Inc. no longer publishes the `minio/minio` and `minio/mc` images, so the
@@ -718,9 +725,10 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 ```text
 jet-engine-lakehouse/
 ├── infrastructure/
-│   ├── docker-compose.yml          # 13 services, healthchecks, ${VAR:-default} everywhere
+│   ├── docker-compose.yml          # 14 services, healthchecks, ${VAR:-default} everywhere
 │   ├── .env.example                # every variable with its default, documented
 │   ├── postgres/init.sql           # OLTP schema, REPLICA IDENTITY FULL, CDC publication
+│   ├── postgres/roles.sql          # least-privilege roles of Debezium and the audit (every up)
 │   ├── debezium/                   # connector config + idempotent registration script
 │   ├── kafka/create-topics.sh      # CDC and HF topics as code
 │   ├── schemas/engine_sensor_frame.avsc  # Avro contract of the HF sensor frames
@@ -768,10 +776,15 @@ This is a single-node reference platform. What is already in place:
 - model bundles are verified by SHA-256 before they are unpickled;
 - ClickHouse's own log tables expire after 3–7 days (profiling logs are off);
 - a stalled CDC replication slot can pin at most `PG_MAX_SLOT_WAL_KEEP_SIZE` (4 GB) of WAL;
+- Debezium streams as a dedicated replication role (SELECT on the three CDC tables; it neither owns
+  nor alters the publication) and the reconciliation reads as a SELECT-only role, so the superuser
+  password reaches only Postgres, the simulator and `postgres-init`; PostgreSQL cannot narrow
+  REPLICATION to a publication, so the replication role could still decode every table's changes
+  through a slot of its own, and its password guards the whole change stream;
 - the third-party MinIO images are pinned by digest.
 
 Before running it anywhere real: replace every default credential (MinIO, ClickHouse, Postgres)
-and keep `.env` out of version control; give Debezium a dedicated replication role instead of the
+and keep `.env` out of version control; give the simulator a table-owner role instead of the
 superuser; run Kafka with three brokers and replication factor 3; enable TLS on every endpoint;
 add retention to the silver and gold lake layers; and keep the lakehouse bucket writable only by
 the training job, because whoever can rewrite `production.json` can also forge its digest.
@@ -792,7 +805,17 @@ then the reconcile task skips with that hint.
 The streaming progress needs `ops_stream_progress` the same way: run `make ch-init` once (or
 restart ClickHouse) before `make up` starts the new streaming job; until then the job logs retry
 warnings and dropped progress rows on every flush, and `make verify` fails on the missing table
-without printing any of its summary checks.
+without printing any of its summary checks. The same `make ch-init` gives the prediction,
+model-run and audit tables their insert deduplication window.
+
+The least-privilege roles arrive with `make up`: `postgres-init` creates `debezium` and `auditor` on
+the existing volume, Debezium and the orchestrator are recreated with those logins, and
+`cdc-register` (it runs on every `make up`) replaces the connector's `database.user`,
+`database.password` and `publication.autocreate.mode` and restarts its task, which resumes on the
+same replication slot from its stored offsets: no new snapshot and nothing to re-register by hand.
+For the few seconds in between, the recreated worker reports the task FAILED, because the stored
+configuration still names the superuser's variables; after recreating only `debezium`, run
+`make register-cdc`.
 
 ## License
 

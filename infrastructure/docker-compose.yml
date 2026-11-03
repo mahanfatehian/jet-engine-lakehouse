@@ -32,13 +32,12 @@ x-s3-env: &s3-env
   LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
 
 # How services reach the source database inside the compose network: always port 5432 (the
-# POSTGRES_PORT variable only moves the port published on the host).
+# POSTGRES_PORT variable only moves the port published on the host). Each service adds the
+# credentials of the role it needs.
 x-postgres-env: &postgres-env
   POSTGRES_HOST: postgres
   POSTGRES_PORT: "5432"
   POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
-  POSTGRES_USER: ${POSTGRES_USER:-admin}
-  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
 
 services:
   # --------------------------------------------------------------- edge OLTP
@@ -189,8 +188,9 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      # The connector logs in as the replication role postgres-init creates.
+      postgres-init:
+        condition: service_completed_successfully
     ports:
       - "${BIND_HOST:-127.0.0.1}:${DEBEZIUM_PORT:-8083}:8083"
     environment:
@@ -206,8 +206,8 @@ services:
       CONNECT_CONFIG_PROVIDERS: env
       CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
       POSTGRES_DB: ${POSTGRES_DB:-jet_engine_db}
-      POSTGRES_USER: ${POSTGRES_USER:-admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      POSTGRES_CDC_USER: ${POSTGRES_CDC_USER:-debezium}
+      POSTGRES_CDC_PASSWORD: ${POSTGRES_CDC_PASSWORD:-debezium-replication}
       CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-engine_cdc}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors > /dev/null"]
@@ -328,6 +328,8 @@ services:
         condition: service_healthy
     environment:
       <<: *postgres-env
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
       SIM_ENGINE_IDS: ${SIM_ENGINE_IDS:-JT9D-001,JT9D-002,CFM56-104,CFM56-105,GE90-201,GE90-202}
       SIM_TICK_SECONDS: ${SIM_TICK_SECONDS:-1.0}
       SIM_PULSES_PER_CYCLE: ${SIM_PULSES_PER_CYCLE:-10}
@@ -420,9 +422,10 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
-      # The reconciliation audit reads the source database (through ClickHouse).
-      postgres:
-        condition: service_healthy
+      # The reconciliation audit reads the source database (through ClickHouse) as the
+      # SELECT-only role postgres-init creates.
+      postgres-init:
+        condition: service_completed_successfully
     command: ["python", "orchestration/pipeline_runner.py", "loop"]
     # tini as PID 1 reaps grandchildren of the dbt/ML subprocesses.
     init: true
@@ -433,6 +436,8 @@ services:
       # The reconciliation audit hands the POSTGRES_* and S3 settings to ClickHouse as query
       # parameters: ClickHouse itself connects to postgres:5432 and minio:9000.
       <<: [*clickhouse-env, *s3-env, *postgres-env]
+      POSTGRES_AUDIT_USER: ${POSTGRES_AUDIT_USER:-auditor}
+      POSTGRES_AUDIT_PASSWORD: ${POSTGRES_AUDIT_PASSWORD:-auditor-readonly}
       DBT_PROJECT_DIR: /app/analytics
       DBT_PROFILES_DIR: /app/analytics
       DBT_INTERVAL_SECONDS: ${DBT_INTERVAL_SECONDS:-120}

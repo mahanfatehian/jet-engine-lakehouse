@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 import reconcile_lakehouse
+import yaml
 from clickhouse_connect.driver.exceptions import DatabaseError
 from ds_runtime import (
     EXIT_OK,
@@ -170,7 +171,7 @@ def _table_columns(table: str) -> list[str]:
 # --------------------------------------------------------------------------------- settings
 
 
-def test_settings_default_to_the_values_compose_passes() -> None:
+def test_settings_outside_compose_default_to_the_superuser_fallback() -> None:
     settings = load_reconcile_settings({})
 
     assert (settings.window_hours, settings.lag_seconds) == (6, 600)
@@ -185,8 +186,10 @@ def test_settings_come_from_the_environment() -> None:
         "POSTGRES_HOST": "source-db",
         "POSTGRES_PORT": "15432",
         "POSTGRES_DB": "fleet",
-        "POSTGRES_USER": "auditor",
-        "POSTGRES_PASSWORD": PG_PASSWORD,
+        "POSTGRES_USER": "admin",
+        "POSTGRES_PASSWORD": "superuser-password",
+        "POSTGRES_AUDIT_USER": "auditor",
+        "POSTGRES_AUDIT_PASSWORD": PG_PASSWORD,
     }
 
     settings = load_reconcile_settings(env)
@@ -194,6 +197,28 @@ def test_settings_come_from_the_environment() -> None:
     assert (settings.window_hours, settings.lag_seconds) == (24, 0)
     assert settings.postgres == PostgresSource("source-db", 15432, "fleet", "auditor", PG_PASSWORD)
     assert PG_PASSWORD not in repr(settings)
+
+
+@pytest.mark.parametrize("audit_user", [None, " "], ids=["unset", "blank"])
+def test_an_environment_without_the_audit_role_reads_as_postgres_user(audit_user: str | None) -> None:
+    env = {"POSTGRES_USER": "admin", "POSTGRES_PASSWORD": "superuser-password"}
+    if audit_user is not None:
+        env |= {"POSTGRES_AUDIT_USER": audit_user, "POSTGRES_AUDIT_PASSWORD": PG_PASSWORD}
+
+    postgres = load_reconcile_settings(env).postgres
+
+    # An old .env or a run outside compose: the superuser's login, never its name with another password.
+    assert (postgres.user, postgres.password) == ("admin", "superuser-password")
+
+
+def test_compose_hands_the_audit_the_role_postgres_init_creates_not_the_superuser() -> None:
+    compose = yaml.safe_load((REPO / "infrastructure" / "docker-compose.yml").read_text(encoding="utf-8"))
+    audit = compose["services"]["orchestrator"]["environment"]
+    roles = compose["services"]["postgres-init"]["environment"]
+
+    for name in ("POSTGRES_AUDIT_USER", "POSTGRES_AUDIT_PASSWORD"):
+        assert audit[name] == roles[name], name
+    assert not {"POSTGRES_USER", "POSTGRES_PASSWORD"} & audit.keys()
 
 
 def test_blank_values_fall_back_to_the_defaults() -> None:
@@ -656,7 +681,8 @@ def cli(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(reconcile_lakehouse, "StopToken", _NoSignals)
     for name in ("RECONCILE_WINDOW_HOURS", "RECONCILE_LAG_SECONDS"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("POSTGRES_PASSWORD", PG_PASSWORD)
+    monkeypatch.setenv("POSTGRES_AUDIT_USER", "auditor")
+    monkeypatch.setenv("POSTGRES_AUDIT_PASSWORD", PG_PASSWORD)
     return answer
 
 
@@ -687,7 +713,7 @@ def test_the_command_line_overrides_the_window(cli: Any) -> None:
     parameters = gateway.queries[1][1]
     assert parameters["window_end"] - parameters["window_start"] == timedelta(hours=24)
     assert before - timedelta(seconds=1) <= parameters["window_end"] <= datetime.now(UTC)
-    assert parameters["pg_password"] == PG_PASSWORD
+    assert (parameters["pg_user"], parameters["pg_password"]) == ("auditor", PG_PASSWORD)
 
 
 def test_the_environment_sets_the_window_of_a_scheduled_run(

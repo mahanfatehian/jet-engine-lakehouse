@@ -25,10 +25,13 @@ instant (created_ts): data still in flight is never reported, not even a first-b
 whose old event times are committed at start-up.
 
 ClickHouse resolves POSTGRES_HOST/POSTGRES_PORT and S3_ENDPOINT_URL itself, so they must be
-addresses inside the compose network. The credentials travel as query parameters, never in
-the SQL text: ClickHouse masks them in its query log and, as their names contain password,
-secret or key, also in the request URIs its trace log records. The window reaches PostgreSQL
-as UTC wall-clock literals, so the database must run with TimeZone UTC (the image default).
+addresses inside the compose network. It reads the source as POSTGRES_AUDIT_USER, the role of
+infrastructure/postgres/roles.sql that may only SELECT engine_telemetry; an environment from
+before that role (no POSTGRES_AUDIT_USER) still reads as POSTGRES_USER. The credentials travel
+as query parameters, never in the SQL text: ClickHouse masks them in its query log and, as their
+names contain password, secret or key, also in the request URIs its trace log records. The
+window reaches PostgreSQL as UTC wall-clock literals, so the database must run with TimeZone UTC
+(the image default).
 
 Exit codes: 0 every layer matches the source, 3 skipped (a table, the bucket or the silver
 dataset does not exist yet, or no pulse of the window has been committed long enough ago),
@@ -267,6 +270,7 @@ class ReconcileSettings:
 def load_reconcile_settings(env: Mapping[str, str] | None = None) -> ReconcileSettings:
     """Read the audit's settings from ``env`` (defaults to os.environ); ConfigError names a bad one."""
     source = os.environ if env is None else env
+    user, password = _source_credentials(source)
     return ReconcileSettings(
         window_hours=_integer(source, "RECONCILE_WINDOW_HOURS", DEFAULT_WINDOW_HOURS, 1, MAX_WINDOW_HOURS),
         lag_seconds=_integer(source, "RECONCILE_LAG_SECONDS", DEFAULT_LAG_SECONDS, 0),
@@ -274,8 +278,8 @@ def load_reconcile_settings(env: Mapping[str, str] | None = None) -> ReconcileSe
             host=_text(source, "POSTGRES_HOST", "postgres"),
             port=_integer(source, "POSTGRES_PORT", 5432, 1, 65535),
             database=_text(source, "POSTGRES_DB", "jet_engine_db"),
-            user=_text(source, "POSTGRES_USER", "admin"),
-            password=source.get("POSTGRES_PASSWORD", "adminpassword"),
+            user=user,
+            password=password,
         ),
     )
 
@@ -561,6 +565,13 @@ def run_reconciliation(
 def _text(env: Mapping[str, str], name: str, default: str) -> str:
     # Compose passes unset `${VAR:-}` interpolations as empty strings: treat them as unset.
     return env.get(name, "").strip() or default
+
+
+def _source_credentials(env: Mapping[str, str]) -> tuple[str, str]:
+    """The audit role's login; without POSTGRES_AUDIT_USER, POSTGRES_USER's (never a mix of both)."""
+    if user := _text(env, "POSTGRES_AUDIT_USER", ""):
+        return user, env.get("POSTGRES_AUDIT_PASSWORD", "")
+    return _text(env, "POSTGRES_USER", "admin"), env.get("POSTGRES_PASSWORD", "adminpassword")
 
 
 def _integer(
