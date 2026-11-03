@@ -1,9 +1,11 @@
 """Exit-code convention, bounded retries, transient-error classification, the ClickHouse gateway's
-probe and statements, and settings."""
+probe, statements and inserts, and settings."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from pathlib import Path
 
 import ds_runtime
 import lakehouse_io
@@ -24,11 +26,16 @@ from ds_runtime import (
 )
 from ds_settings import ClickHouseSettings, ConfigError, PromotionSettings, load_settings
 from lakehouse_io import ClickHouseGateway, _is_transient, final_modifier
+from model_registry import ML_MODEL_RUNS_TABLE
+from predict_rul import PREDICTIONS_TABLE
+from reconcile_lakehouse import RESULTS_TABLE
 from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError, ReadTimeoutError
 
 CLICKHOUSE = ClickHouseSettings(
     host="clickhouse", port=8123, user="default", password="", database="iot_engine"
 )
+CLICKHOUSE_DDL = Path(__file__).resolve().parents[2] / "infrastructure" / "clickhouse" / "init-db.sql"
+DEDUPLICATION_WINDOW = r"non_replicated_deduplication_window = [1-9]\d*"
 
 
 def _raise(exc: Exception) -> int:
@@ -48,13 +55,14 @@ def _connection_refused() -> OperationalError:
 
 
 class FakeClickHouseClient:
-    """clickhouse-connect client stand-in: scripted ping() answers and command() outcomes, calls recorded."""
+    """clickhouse-connect client stand-in: scripted ping() answers and statement outcomes, calls recorded."""
 
     def __init__(self, pings: list[bool] | None = None, outcomes: list[object] | None = None) -> None:
         self.pings = list(pings or [])
         self.outcomes = list(outcomes or [])
         self.ping_calls = 0
         self.commands: list[tuple[str, dict]] = []
+        self.inserts: list[tuple[str, list, dict]] = []
 
     def ping(self) -> bool:
         # Like clickhouse-connect: a failed probe returns False, it never raises.
@@ -63,6 +71,13 @@ class FakeClickHouseClient:
 
     def command(self, cmd: str, parameters: dict | None = None) -> object:
         self.commands.append((cmd, parameters))
+        return self._outcome()
+
+    def insert(self, table: str, data: list, column_names: list[str], settings: dict | None = None) -> None:
+        self.inserts.append((table, data, settings))
+        self._outcome()
+
+    def _outcome(self) -> object:
         outcome = self.outcomes.pop(0) if self.outcomes else ""
         if isinstance(outcome, Exception):
             raise outcome
@@ -205,6 +220,34 @@ def test_command_never_reruns_a_statement_that_may_have_run(
 
     # The server may already have applied it: a second run would insert every row twice.
     assert len(client.commands) == 1 and backoffs == []
+
+
+def test_an_insert_retried_after_a_read_timeout_keeps_its_deduplication_token(
+    gateway_over, backoffs: list[float]
+) -> None:
+    timed_out = _transport_error(ReadTimeoutError(None, "/", "Read timed out. (read timeout=600)"))
+    client = FakeClickHouseClient(outcomes=[timed_out])
+    gateway = gateway_over(client)
+    rows, columns = [("JT9D-001", 42.0)], ["engine_id", "predicted_rul_cycles"]
+
+    gateway.insert_rows(PREDICTIONS_TABLE, rows, columns)
+    gateway.insert_rows(PREDICTIONS_TABLE, rows, columns)
+
+    # The timed-out attempt may have stored the batch: its retry carries the same token, so the table
+    # drops the copy. The second call is a new batch with identical rows and gets a token of its own.
+    tokens = [settings["insert_deduplication_token"] for _, _, settings in client.inserts]
+    assert len(tokens) == 3 and tokens[0] == tokens[1] != tokens[2]
+    assert all(data == rows for _, data, _ in client.inserts) and len(backoffs) == 1
+
+
+def test_every_table_the_jobs_insert_into_has_a_deduplication_window() -> None:
+    ddl = CLICKHOUSE_DDL.read_text(encoding="utf-8")
+
+    for table in (PREDICTIONS_TABLE, ML_MODEL_RUNS_TABLE, RESULTS_TABLE):
+        create = re.search(rf"CREATE TABLE IF NOT EXISTS {table}\b.*?;", ddl, re.DOTALL)
+        assert create and re.search(DEDUPLICATION_WINDOW, create.group(0)), f"{table}: no window on CREATE"
+        # init-db.sql runs on every ClickHouse start: tables created before the window get it too.
+        assert re.search(rf"ALTER TABLE {table} MODIFY SETTING {DEDUPLICATION_WINDOW};", ddl), table
 
 
 def test_final_is_only_applied_to_engines_that_merge_versions() -> None:

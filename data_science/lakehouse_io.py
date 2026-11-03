@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, TypeVar
@@ -173,10 +174,19 @@ class ClickHouseGateway:
         return [tuple(row) for row in result.result_rows]
 
     def insert_rows(self, table: str, rows: Sequence[Sequence[Any]], column_names: Sequence[str]) -> None:
-        """Insert ``rows`` (in ``column_names`` order) into ``table`` as one batch."""
+        """Insert ``rows`` (in ``column_names`` order) into ``table`` as one batch, once.
+
+        A read timeout or a dropped connection can come after ClickHouse stored the batch, so
+        every attempt of one call carries the same insert_deduplication_token: a table with
+        non_replicated_deduplication_window (init-db.sql) drops the retried copy. Each call
+        gets a new token, so a batch whose rows equal an earlier one still lands.
+        """
+        settings = {"insert_deduplication_token": uuid.uuid4().hex}
         self._retry(
             f"insert into {table}",
-            lambda: self._client.insert(table, list(rows), column_names=list(column_names)),
+            lambda: self._client.insert(
+                table, list(rows), column_names=list(column_names), settings=settings
+            ),
         )
 
     def export_parquet(self, sql: str, destination: Path) -> int:

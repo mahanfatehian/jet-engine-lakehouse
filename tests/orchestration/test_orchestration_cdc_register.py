@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import re
 import socket
 import sys
 import threading
@@ -16,7 +17,8 @@ from typing import Any
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "infrastructure" / "debezium" / "register_connector.py"
+INFRASTRUCTURE = Path(__file__).resolve().parents[2] / "infrastructure"
+SCRIPT = INFRASTRUCTURE / "debezium" / "register_connector.py"
 NAME = "engine-postgres-cdc"
 CONFIG = {
     "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
@@ -404,3 +406,20 @@ def test_defaults_point_at_debezium_and_the_repository_connector_file(
     spec = rc.load_connector_spec(args.config)
     assert spec.name == NAME
     assert spec.config["slot.name"] == "dbz_engine_slot"
+
+
+def test_the_role_job_keeps_its_passwords_out_of_the_server_log() -> None:
+    roles = (INFRASTRUCTURE / "postgres" / "roles.sql").read_text(encoding="utf-8")
+    session = dict(re.findall(r"^SET (\w+) = (.+);$", roles[: roles.index("\nBEGIN;\n")], re.MULTILINE))
+
+    # The server logs a statement with its text by type, on an error, above a duration threshold or when
+    # its duration or transaction is sampled (decided at BEGIN): the session turns each off before the
+    # transaction that sets the passwords, so a server configured to log statements never logs one.
+    quiet = {
+        "log_statement": "'none'",
+        "log_min_error_statement": "'panic'",
+        "log_min_duration_statement": "-1",
+        "log_min_duration_sample": "-1",
+        "log_transaction_sample_rate": "0",
+    }
+    assert quiet.items() <= session.items()

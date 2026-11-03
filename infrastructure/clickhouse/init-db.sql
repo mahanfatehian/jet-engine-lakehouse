@@ -148,6 +148,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(predicted_at)
 ORDER BY (engine_id, predicted_at)
 TTL toDateTime(predicted_at) + INTERVAL 180 DAY
+SETTINGS non_replicated_deduplication_window = 100
 COMMENT 'Remaining-useful-life predictions with the sensor readings they were computed from';
 
 CREATE TABLE IF NOT EXISTS ml_model_runs
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS ml_model_runs
 )
 ENGINE = MergeTree
 ORDER BY (trained_at, model_version)
+SETTINGS non_replicated_deduplication_window = 100
 COMMENT 'One row per training run of the RUL model (metrics, data volume, promotion decision)';
 
 CREATE VIEW IF NOT EXISTS v_engine_rul_latest AS
@@ -279,6 +281,7 @@ ENGINE = MergeTree
 PARTITION BY toYYYYMM(run_at)
 ORDER BY (run_at, layer, engine_id, event_hour)
 TTL toDateTime(run_at) + INTERVAL 30 DAY
+SETTINGS non_replicated_deduplication_window = 100
 COMMENT 'Reconciliation runs: source pulses a layer must hold vs pulses it holds, per layer, engine and event hour (OK, MISSING or EXTRA; informational = best-effort HF layer)';
 
 -- -----------------------------------------------------------------------------
@@ -304,3 +307,16 @@ PARTITION BY toYYYYMM(trigger_ts)
 ORDER BY (query_name, trigger_ts)
 TTL toDateTime(trigger_ts) + INTERVAL 30 DAY
 COMMENT 'One row per micro-batch of every streaming query: input rows and rates, durations (whole batch, sink, Kafka offset lookup) and the Kafka records not read yet';
+
+-- -----------------------------------------------------------------------------
+-- Insert deduplication of the tables the data-science jobs append to. Their
+-- gateway (data_science/lakehouse_io.py) retries an insert after a read timeout,
+-- which can come after ClickHouse stored the batch, so every attempt of one
+-- insert carries the same insert_deduplication_token: these tables keep the
+-- block IDs of their last 100 inserts and drop the retried copy, while the next
+-- insert gets a new token and lands even when its rows are identical. MODIFY
+-- SETTING gives tables created before the CREATE statements set it the same window.
+-- -----------------------------------------------------------------------------
+ALTER TABLE gold_engine_rul_predictions MODIFY SETTING non_replicated_deduplication_window = 100;
+ALTER TABLE ml_model_runs MODIFY SETTING non_replicated_deduplication_window = 100;
+ALTER TABLE ops_reconciliation MODIFY SETTING non_replicated_deduplication_window = 100;

@@ -70,6 +70,31 @@ services:
     restart: unless-stopped
     logging: *default-logging
 
+  # Least-privilege roles of Debezium and the reconciliation audit (postgres/roles.sql), created
+  # or updated on every `up`: init.sql only runs on an empty volume.
+  postgres-init:
+    image: postgres:15-alpine
+    container_name: de_postgres_init
+    user: "65534:65534"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["psql", "--no-psqlrc", "--quiet", "--file=/scripts/roles.sql"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-jet_engine_db}
+      PGUSER: ${POSTGRES_USER:-admin}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-adminpassword}
+      POSTGRES_CDC_USER: ${POSTGRES_CDC_USER:-debezium}
+      POSTGRES_CDC_PASSWORD: ${POSTGRES_CDC_PASSWORD:-debezium-replication}
+      POSTGRES_AUDIT_USER: ${POSTGRES_AUDIT_USER:-auditor}
+      POSTGRES_AUDIT_PASSWORD: ${POSTGRES_AUDIT_PASSWORD:-auditor-readonly}
+    volumes:
+      - ./postgres/roles.sql:/scripts/roles.sql:ro
+    restart: "no"
+    logging: *default-logging
+
   # ------------------------------------------------------ streaming backbone
   kafka:
     image: confluentinc/cp-kafka:7.5.0
