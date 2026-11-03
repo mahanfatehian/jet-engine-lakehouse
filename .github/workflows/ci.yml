@@ -13,7 +13,8 @@
 #   dbt-integration   push to main, PR   tests/analytics/run_dbt_integration.sh
 #   compose-config    push to main, PR   docker-compose.yml renders without any .env file
 #                                        (inline defaults) and with .env.example
-#   full-stack-smoke  nightly, manual    make up, make verify until every check is OK, make clean
+#   full-stack-smoke  nightly, manual    make up, make verify until every check is OK, the simulator
+#                                        stopped, make dr-drill (raw deleted and restored), make clean
 #
 # Nightly and manual runs execute every job. No secrets are used, so pull requests from
 # forks get the same checks.
@@ -316,7 +317,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: compose-config
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       SMOKE_TIMEOUT_MINUTES: 20
       SMOKE_POLL_SECONDS: 30
@@ -362,6 +363,19 @@ jobs:
           done
           cat "$report"
           { echo "### make verify summary"; echo '```text'; echo "$summary"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Settle the stack for the drill (stop the simulator, let streaming drain)
+        timeout-minutes: 5
+        run: |
+          docker compose -f infrastructure/docker-compose.yml stop simulator
+          # ClickHouse takes the last changes within seconds and the lake queries commit once a
+          # minute: three lake triggers drain both. Should rows still be on their way, make dr-drill
+          # refuses to delete (the lake and raw differ, or rows change while it checks) or fails.
+          sleep 180
+
+      - name: Delete raw_engine_telemetry and restore it from the lake (make dr-drill)
+        timeout-minutes: 10
+        run: make dr-drill 2>&1 | tee "$RUNNER_TEMP/stack-logs/dr-drill.log"
 
       - name: Dump the stack state and logs
         if: failure()

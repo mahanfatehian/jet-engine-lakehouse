@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 168 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,210 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 168 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,221 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -275,6 +275,7 @@ $C run --rm orchestrator python orchestration/pipeline_runner.py task dbt-build 
 $C run --rm orchestrator python orchestration/pipeline_runner.py task train       # make train-ml
 $C run --rm orchestrator python orchestration/pipeline_runner.py task predict     # make predict-ml
 $C run --rm --no-deps simulator python engine_generator.py --benchmark            # make load-test
+bash infrastructure/clickhouse/dr-drill.sh --day 2026-11-01        # make dr-drill
 $C down                                                            # make down (data is kept)
 ```
 
@@ -519,6 +520,28 @@ silver: `raw_cdc_dead_letter` (replay from Kafka or bronze), `hf_ingest_batches`
 `ops_stream_progress` (monitoring data), and the prediction, model-run and audit tables (the next
 predict, train and reconcile runs refill them).
 
+`make dr-drill` rehearses this restore on demand, and the nightly CI smoke test runs it on a fresh
+stack: it deletes the rows of one raw table (default `raw_engine_telemetry`, `--table` picks
+another) for one UTC day that ended at least an hour ago, or for the whole table, which it refuses
+while the simulator runs (CI stops it and lets streaming drain first), rebuilds them with
+`restore-raw` and fails unless every row comes back. It counts the window's rows per day (`FINAL`)
+and sums their `cdc_lsn` versions (the HF frames by count alone), and deletes only when a dry run
+of the restore counts as many rows in the lake and in raw, none missing from raw or older there,
+and a second count finds nothing changed; a refusal exits 1 before anything is deleted. The delete
+spares rows ingested after that second count began: a late row stays in raw and fails the drill
+instead of being lost. Then
+`restore-raw` must exit 0 (its recount and reconciliation included) and every day's rows and
+versions must be back; otherwise the drill exits 1 with the `make restore-raw ARGS=...` command
+that brings back whatever the lake holds, after the before/after table when rows or versions
+differ. An update raw held before the lake committed it fails the drill and comes back with that
+command once the lake has it. A dbt run during a `raw_maintenance_log` drill rebuilds
+`stg_maintenance_log` without that day's work orders until its next run, so drill that table on a
+quiet stack. The drill is a bash script that runs on the host (Git Bash on Windows) and drives the
+containers.
+
+    make dr-drill ARGS="--day 2026-11-01"    # one past UTC day of raw_engine_telemetry
+    make dr-drill ARGS="--day 2026-11-01 --table raw_maintenance_log"
+
 ### Fleet reliability: availability, MTBF and MTTR from the status history
 
 Every status change of `engine_status_registry` is a CDC update, so ClickHouse holds the registry's
@@ -659,6 +682,7 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
 | `make snapshot` | export silver/gold feature tables to MinIO Parquet now |
 | `make evaluate-spectral ARGS="--splits 5 --stride 4"` | fit the RUL models with and without the spectral features on several lifecycle splits and report RMSE, late-life RMSE, R², F1 and Brier per split and on average (evidence only; about 9 minutes for these arguments) |
 | `make restore-raw ARGS="--dry-run"`, `make restore-raw ARGS="--from 2026-11-01"` | rebuild the raw tables from the silver lake (only the rows raw lacks, idempotent), then reconcile the restored range; `--dry-run` reports per table and day what a restore would add (exit 65 when raw still differs, 3 when a table or the lake is missing) |
+| `make dr-drill ARGS="--day 2026-11-01"` | disaster-recovery drill: delete one UTC day of `raw_engine_telemetry` that ended at least an hour ago (`--table` another raw table; without `--day` the whole table, only with the simulator stopped), rebuild it with `restore-raw` and exit 1 unless every day's rows and versions are back; deletes nothing unless a dry run counts the same rows in the lake and in raw and a second count finds nothing changed (a bash script on the host) |
 | `make reconcile`, `make reconcile ARGS="--window-hours 24"` | reconcile the source with raw, staging and silver now (exit 65 when a layer has gaps, 3 while there is nothing to compare yet) |
 | `make train-ml ARGS="--promotion-policy always"` | force-promote a freshly trained model |
 | `make dbt-run ARGS="--full-refresh"` | rebuild every dbt model from the raw CDC tables |
@@ -743,7 +767,7 @@ jet-engine-lakehouse/
 │   ├── kafka/create-topics.sh      # CDC and HF topics as code
 │   ├── schemas/engine_sensor_frame.avsc  # Avro contract of the HF sensor frames
 │   ├── minio/init-buckets.sh       # lakehouse bucket, medallion zones, raw-frame expiry
-│   ├── clickhouse/                 # raw/serving DDL (init-db.sql), read-only Grafana user, verify.sql
+│   ├── clickhouse/                 # DDL (init-db.sql), read-only Grafana user, verify.sql, dr-drill.sh
 │   └── grafana/                    # image with the ClickHouse plugin, datasource, 5 dashboards
 ├── simulator/                      # fleet physics, Postgres writer, HF frame producer, load test
 ├── streaming/                      # Spark Structured Streaming: Kafka -> MinIO + ClickHouse, FFT features
@@ -752,23 +776,26 @@ jet-engine-lakehouse/
 ├── orchestration/pipeline_runner.py  # lightweight scheduler for dbt, snapshots, train, predict
 ├── tests/                          # unit tests per component + dbt integration harness
 ├── docs/                           # architecture and machine-learning deep dives
-├── Makefile                        # developer entry points (docker + make only)
+├── Makefile                        # developer entry points (docker + make; bash for dr-drill)
 └── README.md
 ```
 
 ## Testing
 
 - **Unit tests:** `make test` runs `make test-platform` (simulator physics, HF frames and
-  signatures, ML pipeline, registry, scheduler, in the data-platform image), `make test-streaming`
-  (CDC parsing, Avro decoding, the FFT features, the query supervisor, the progress listener and
-  the ClickHouse sinks with real Spark, in the streaming image, failing on any skipped test) and
-  `make test-simulator` (the frames against the real Avro schema, in the simulator image).
+  signatures, ML pipeline, registry, scheduler, the DR drill's safety checks against a fake docker,
+  in the data-platform image), `make test-streaming` (CDC parsing, Avro decoding, the FFT features,
+  the query supervisor, the progress listener and the ClickHouse sinks with real Spark, in the
+  streaming image, failing on any skipped test) and `make test-simulator` (the frames against the
+  real Avro schema, in the simulator image).
 - **Data tests:** every orchestrated dbt cycle runs the dbt tests (CDC dedup, label consistency,
   finite features, calibrated anomaly thresholds including the bearing-defect flag, one fleet row
   per engine, backtest invariants, HF frame dedup, finite non-negative spectral features, one ML
   feature row per pulse, ...); a failure blocks training and lake snapshots for that cycle.
 - **CI:** GitHub Actions runs lint, the three unit-test suites, the dbt integration harness and a
-  compose check on every push and pull request, plus a nightly full-stack smoke test.
+  compose check on every push and pull request, plus a nightly full-stack smoke test: `make up`,
+  `make verify` until every check is OK, then, with the simulator stopped, `make dr-drill` deletes
+  the whole `raw_engine_telemetry` and restores it from the lake.
 - **dbt integration harness:** `bash tests/analytics/run_dbt_integration.sh` seeds a throwaway
   ClickHouse with synthetic CDC (duplicates, updates, deletes, late rows) and the matching
   high-frequency frame features (dropped frames, NaN features, absent process keys, redelivered,
