@@ -67,8 +67,9 @@ exposures:
     url: http://localhost:3000/d/jet-engine-data-platform
     description: >
       Platform board (infrastructure/grafana/dashboards/data-platform.json): CDC ingest rate and
-      latency, dead letters, freshness of every stage, the HF path's throughput and coverage, and
-      the reconciliation audit. Its storage panel also reads system.parts, which is not modelled.
+      latency, dead letters, freshness of every stage, the HF path's throughput and coverage, the
+      reconciliation audit, and the processing rate and Kafka consumer lag of every streaming
+      query. Its storage panel also reads system.parts, which is not modelled.
     depends_on:
       - ref('stg_engine_telemetry')
       - ref('int_sensor_rolling_features')
@@ -83,6 +84,7 @@ exposures:
       - source('engine_raw', 'gold_engine_rul_predictions')
       - source('engine_raw', 'ml_model_runs')
       - source('engine_raw', 'ops_reconciliation')
+      - source('engine_raw', 'ops_stream_progress')
     owner:
       name: Jet Engine Lakehouse maintainers
 

@@ -76,6 +76,21 @@ error) every few seconds; the container healthcheck turns unhealthy when it goes
 query also checks its own prerequisites (the Avro schema file, the HF ClickHouse tables), so a
 missing one keeps only that query retrying.
 
+**Progress of every micro-batch.** A `StreamingQueryListener` (`ProgressRecorder` in
+[`streaming_queries.py`](../streaming/streaming_queries.py)) turns the `StreamingQueryProgress`
+Spark reports for every micro-batch of the ten queries into one row of `ops_stream_progress`; an
+idle trigger reports a `QueryIdleEvent` and writes none. The row holds the query name, run id and
+batch id, the trigger's start (UTC, milliseconds), input rows, input and processed rows per second,
+the batch duration (`triggerExecution`) with its sink (`addBatch`) and Kafka offset lookup
+(`latestOffset`) phases, and the consumer lag: the newest offset minus the batch's end offset,
+summed over every partition of the query's topics, NULL for a batch re-run from the offset log
+after a failure (it looks up no newest offsets). The listener only appends to a bounded buffer
+(1,000 rows, [`streaming_progress.py`](../streaming/streaming_progress.py)); a thread of its own
+inserts it every 10 s through Path B's ClickHouse writer and its retries, and the job flushes once
+more after `spark.stop()` has delivered the last events. Rows ClickHouse cannot take are dropped and
+counted in the log; so is the oldest row of a full buffer, whose count is logged with the next
+failed flush. Monitoring data never blocks or fails a query.
+
 CDC queries run with `failOnDataLoss=true` (`KAFKA_FAIL_ON_DATA_LOSS`): if the job was down for
 longer than the Kafka retention, a query stops loudly at the gap instead of silently skipping
 change events. The HF path is best effort by design (`HF_FAIL_ON_DATA_LOSS=false`): frames the
@@ -164,6 +179,7 @@ whose loss would stop the query on its next restart.
 | serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree` | training-run registry |
 | serving | `v_engine_rul_latest` | view | – | latest prediction per engine |
 | ops | `ops_reconciliation` | `reconcile_lakehouse.py` | `MergeTree`, key `(run_at, layer, engine_id, event_hour)`, 30-day TTL | one row per reconciliation run, layer, engine and hour of event time: source pulses the layer must hold, pulses it holds, OK / MISSING / EXTRA |
+| ops | `ops_stream_progress` | Spark (listener of the streaming job) | `MergeTree`, key `(query_name, trigger_ts)`, 30-day TTL | one row per micro-batch of every streaming query: input rows and rates, durations of the batch, its sink and its Kafka offset lookup, Kafka consumer lag in records (NULL for a re-run batch) |
 
 ```mermaid
 flowchart LR
@@ -247,7 +263,7 @@ flowchart LR
 | Event | Behaviour |
 |---|---|
 | `docker compose down` → `up` | everything resumes within the 7-day Kafka retention: Debezium from its stored offsets, Spark from its checkpoints, the simulator from the registry and the generation settings it stores per lifecycle in `simulator_lifecycle_params`, plus the HF frames a backfilled history still owes from `simulator_hf_backfill` (bit-identical wear trajectory; changed `SIM_SEED` / `SIM_MEAN_LIFE_CYCLES` / `SIM_PULSES_PER_CYCLE` apply from each engine's next lifecycle) |
-| ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (jittered backoff of at most 2–60 s) once ClickHouse answers; the six lake queries keep committing; the process stays up |
+| ClickHouse down | `clickhouse_raw` fails after its insert retries and is restarted from its checkpoint (jittered backoff of at most 2–60 s) once ClickHouse answers; the six lake queries keep committing; a progress flush that still fails after the insert retries drops its rows and logs the count, while the rows reported meanwhile wait in the buffer (a 30 s outage cost 2 of 59 rows in a test); the process stays up |
 | MinIO down | the lake queries stall or fail and resume from their checkpoints once MinIO answers; `clickhouse_raw` keeps running |
 | Outage longer than the Kafka retention | queries whose unread records were deleted stop loudly (`KAFKA_FAIL_ON_DATA_LOSS=true`) with recovery steps in the log |
 | Postgres down | the simulator drops ticks with bounded reconnect backoff and re-takes its single-writer lock on reconnect; after 10 failed attempts it exits and Docker restarts it |
@@ -283,4 +299,5 @@ flowchart LR
 | SCD2 status history derived from the CDC log, rebuilt every run (no dbt snapshot) | the log already holds every version; a rebuild equals a full refresh, and one late or backdated version can move intervals anywhere in an engine's history | reads one registry version per engine and cycle (~52k a day for 6 engines) every dbt cycle |
 | One HF backfill row per engine, cleared after every frame of it is acknowledged | a stop or a Kafka outage during the first-boot drain no longer leaves history without spectral features | an interrupted drain re-sends that engine's whole backfill (harmless duplicates) |
 | Reconcile inside ClickHouse (`postgresql()`, `s3()` table functions) | one SQL statement compares every layer where the data already lives; nothing new to deploy, and only the window's source rows leave Postgres | ClickHouse must reach Postgres and MinIO by their compose names, and the window reaches Postgres as UTC literals (the database runs with TimeZone UTC, the image default) |
+| Progress rows from a listener into a bounded buffer, inserted by a thread of their own and dropped when ClickHouse refuses them | monitoring must never block or fail a micro-batch, and a row ClickHouse rejects must not hold back the rows after it | an outage longer than the insert retries (about 15 s) loses the rows of that flush (counted in the log) |
 | Ports bound to `127.0.0.1` by default | default credentials stay unreachable from the network | set `BIND_HOST` to expose the stack deliberately |

@@ -59,7 +59,7 @@ This repository builds the complete data platform behind that answer:
 | **Ground truth** | a physics-inspired wear factor w(t) from overhaul (0) to failure (1), see [docs/machine-learning.md](docs/machine-learning.md) |
 | **History on first boot** | 24 complete failure-to-repair lifecycles (~45k pulses) backfilled automatically |
 | **Freshness** | source commit → ClickHouse: p50 4.2 s, p95 6.3 s; dbt features every 2 min; predictions every cycle |
-| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,021 unit tests (84 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
+| **Quality gates** | 163 dbt data tests per run (a failure blocks training and lake snapshots), an end-to-end reconciliation audit every 16 minutes (PostgreSQL source = raw = staging = silver lake, per engine and hour), 1,198 unit tests (85 of them on a real SparkSession), `make verify` (exits non-zero on any failed check), CI on every push |
 | **Model (example run)** | holdout RMSE 15 cycles, R² 0.87; calibrated failure classifier F1 0.87, precision 0.90, ROC-AUC 0.99 |
 | **Live backtest** | predictions scored against failures that happened later: RMSE 13–17 cycles, a HIGH warning a median 17–30 cycles before the failure |
 
@@ -429,6 +429,29 @@ SELECT engine_id, operational_status, round(fan_amp_bpfo_mean_5m, 2) AS bpfo_mm_
 FROM fct_engine_health_status ORDER BY engine_id;
 ```
 
+**6. The streaming queries**: every micro-batch of every query in `ops_stream_progress` (30-day TTL)
+
+```sql
+-- Latest micro-batch of every query: rows, rate, duration and the Kafka records it left behind
+SELECT query_name, trigger_ts, batch_id, input_rows, round(processed_rows_per_s) AS rows_per_s,
+       batch_duration_ms, add_batch_ms, kafka_lag_records
+FROM ops_stream_progress
+ORDER BY query_name, trigger_ts DESC
+LIMIT 1 BY query_name;
+```
+
+A listener in the streaming job turns the progress Spark reports for every micro-batch into one row:
+the trigger's start (UTC, milliseconds), input rows, input and processed rows per second, the batch
+duration with its sink (`addBatch`) and Kafka offset lookup (`latestOffset`) phases, and the
+consumer lag: the newest offsets minus the batch's end offsets, summed over the partitions of the
+query's topics. The lag is 0 while a query keeps up: a batch leaves records behind only when
+`maxOffsetsPerTrigger` caps it, as while the first-boot backfill is worked off, and a batch re-run
+after a failure reports no lag (NULL). The listener only appends to an in-memory buffer (1,000 rows)
+that a thread of its own inserts every 10 s, so ClickHouse never delays a micro-batch; rows
+ClickHouse cannot take after the insert's retries are dropped and counted in the log. `make verify`
+lists the latest batch of every query and warns while none is recorded yet, while a query is 50,000
+records or more behind, or while no query's latest batch reports a lag (`largest lag unknown`).
+
 ### Reconciliation audit: every layer holds exactly what the source committed
 
 Every 16 minutes (`RECONCILE_INTERVAL_SECONDS` 900, rounded up to whole dbt cycles, right after the
@@ -490,8 +513,9 @@ In a drill against the live lake, an empty ClickHouse was rebuilt in 16 s (908,4
 15 of the 474,201 CDC rows were identical to the live raw tables in every column but `ingested_at`
 (the 15 are change events Debezium delivered twice, which differ only in `kafka_offset` and
 `cdc_emitted_ts`), and the audit matched the source in all 396 cells of the week. Not restored from
-silver: `raw_cdc_dead_letter` (replay from Kafka or bronze), `hf_ingest_batches`, and the
-prediction, model-run and audit tables (the next predict, train and reconcile runs refill them).
+silver: `raw_cdc_dead_letter` (replay from Kafka or bronze), `hf_ingest_batches` and
+`ops_stream_progress` (monitoring data), and the prediction, model-run and audit tables (the next
+predict, train and reconcile runs refill them).
 
 ### Fleet reliability: availability, MTBF and MTTR from the status history
 
@@ -557,7 +581,7 @@ ClickHouse account that can only run queries, never write.
 |---|---|
 | **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, failures by mode |
 | **Vibration Analytics (HF Sensor Frames)** | bearing defect tone (BPFO), kurtosis, crest factor and core unbalance per engine, the oil system (quantity, filter ΔP, temperatures), the EGT A/B sensor split, HF frames per minute |
-| **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, and the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source |
+| **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source, and the processing rate and Kafka consumer lag of every streaming query |
 | **Fleet Reliability** | availability, failures, MTBF (time and cycles) and MTTR per engine and per day, time in each status per day, engine and lifecycle, the failure-mode Pareto, the SCD2 status timeline and every failure with its repair |
 | **Model Operations & Live Backtest** | the production model, every training run with its promotion decision, calibration of the failure probability, live versus holdout performance against failures that happened later |
 
@@ -674,6 +698,10 @@ as `${VAR:-default}`, so the stack boots without any `.env` file. To change some
   dropout), so such a pulse is scored from its pulse features alone; every training run logs and
   stores how the model scores its holdout that way (`holdout_spectral_masked` in `metrics.json`). After a stop during the first-boot drain, the next start logs "Resumed the
   HF backfill of ..." and sends the history's frames again.
+- **`streaming` logs "dropped N streaming progress rows":** ClickHouse did not take the progress
+  rows of one flush: it was down or restarting, or `ops_stream_progress` is missing on a stack
+  upgraded without `make ch-init`. The queries are not affected; progress rows are monitoring data
+  and are not retried beyond the insert's own retries.
 - **Connector not RUNNING:** `make cdc-status`, then `make register-cdc` (it restarts a FAILED task
   and resumes a PAUSED connector).
 - **A manual `make dbt-run` or `make train-ml` seems to hang:** it is waiting for the scheduled run
@@ -714,9 +742,9 @@ jet-engine-lakehouse/
 
 - **Unit tests:** `make test` runs `make test-platform` (simulator physics, HF frames and
   signatures, ML pipeline, registry, scheduler, in the data-platform image), `make test-streaming`
-  (CDC parsing, Avro decoding, the FFT features, the query supervisor and the ClickHouse sinks
-  with real Spark, in the streaming image, failing on any skipped test) and `make test-simulator`
-  (the frames against the real Avro schema, in the simulator image).
+  (CDC parsing, Avro decoding, the FFT features, the query supervisor, the progress listener and
+  the ClickHouse sinks with real Spark, in the streaming image, failing on any skipped test) and
+  `make test-simulator` (the frames against the real Avro schema, in the simulator image).
 - **Data tests:** every orchestrated dbt cycle runs the dbt tests (CDC dedup, label consistency,
   finite features, calibrated anomaly thresholds including the bearing-defect flag, one fleet row
   per engine, backtest invariants, HF frame dedup, finite non-negative spectral features, one ML
@@ -760,6 +788,11 @@ spectral features, so the spectral ablation reports "skipped" until lifecycles r
 frames complete. The reconciliation audit needs the `ops_reconciliation` table: after pulling it into
 a running stack, run `make ch-init` once (or restart ClickHouse, which re-applies its schema); until
 then the reconcile task skips with that hint.
+
+The streaming progress needs `ops_stream_progress` the same way: run `make ch-init` once (or
+restart ClickHouse) before `make up` starts the new streaming job; until then the job logs retry
+warnings and dropped progress rows on every flush, and `make verify` fails on the missing table
+without printing any of its summary checks.
 
 ## License
 

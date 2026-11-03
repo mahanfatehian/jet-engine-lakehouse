@@ -10,8 +10,9 @@ sources:
       raw_engine_hf_features and hf_ingest_batches are written by the same job from the Avro
       high-frequency (HF) sensor frames (CONTRACT_V2.md); they carry no CDC metadata.
       gold_engine_rul_predictions is written by data_science/predict_rul.py, ml_model_runs by
-      data_science/train_rul_model.py and ops_reconciliation by data_science/reconcile_lakehouse.py;
-      raw_cdc_dead_letter, ml_model_runs and ops_reconciliation are read by no model, only by the
+      data_science/train_rul_model.py, ops_reconciliation by data_science/reconcile_lakehouse.py
+      and ops_stream_progress by the streaming job's progress listener; raw_cdc_dead_letter,
+      ml_model_runs, ops_reconciliation and ops_stream_progress are read by no model, only by the
       dashboards (models/exposures.yml), and are declared here for the lineage.
     schema: "{{ env_var('CLICKHOUSE_DB', 'iot_engine') }}"
     loader: spark-structured-streaming
@@ -348,3 +349,18 @@ sources:
             description: Hour of event time of the cell.
           - name: status
             description: OK, MISSING or EXTRA.
+
+      - name: ops_stream_progress
+        description: >
+          Progress of the ten streaming queries (MergeTree, TTL 30 days), written by the Spark job's
+          listener (streaming/streaming_progress.py): one row per micro-batch with input rows and
+          rates, durations and the Kafka consumer lag. Read by the Data Platform dashboard.
+        columns:
+          - name: query_name
+            description: Streaming query (also the name of its checkpoint folder).
+          - name: trigger_ts
+            description: Start of the micro-batch's trigger (UTC, milliseconds).
+          - name: kafka_lag_records
+            description: >
+              Kafka records left behind the batch (newest minus end offset over the partitions);
+              NULL when Spark reported no newest offsets.

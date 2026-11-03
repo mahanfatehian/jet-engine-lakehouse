@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Health of the data platform: CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, ClickHouse storage, the high-frequency sensor-frame path, and the end-to-end reconciliation audit of every layer against the source.",
+  "description": "Health of the data platform: CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, ClickHouse storage, the high-frequency sensor-frame path, the end-to-end reconciliation audit of every layer against the source, and the processing rate and Kafka consumer lag of every streaming query.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -2190,6 +2190,137 @@
         "sortBy": []
       },
       "id": 22
+    },
+    {
+      "type": "row",
+      "title": "Streaming queries (Spark micro-batches: processing rate and Kafka consumer lag)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
+      },
+      "panels": [],
+      "id": 23
+    },
+    {
+      "type": "timeseries",
+      "title": "Processed rows/s per query",
+      "description": "Spark's processing rate of every streaming query (processedRowsPerSecond in ops_stream_progress): the rows of a micro-batch per second of its duration, averaged per interval. A query keeps up while it processes far faster than its input arrives. A point exists only where a query ran a micro-batch: the lake queries every 60 s, clickhouse_raw every 5 s, clickhouse_hf_features every 10 s.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 59
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(trigger_ts) AS time,\n    query_name,\n    avg(processed_rows_per_s) AS processed_rows_per_s\nFROM ops_stream_progress\nWHERE $__timeFilter(trigger_ts)\nGROUP BY time, query_name\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisLabel": "rows / s of batch time",
+            "spanNulls": 300000
+          },
+          "unit": "suffix: rows/s",
+          "displayName": "${__field.labels.query_name}",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 24
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer lag per query",
+      "description": "Kafka records a query left behind its micro-batch (kafka_lag_records in ops_stream_progress): the newest offsets minus the batch's end offsets, summed over the partitions of its topics; the largest per interval. 0 while a query keeps up: a batch leaves records behind only when maxOffsetsPerTrigger caps it, so a backlog (the first-boot backfill, a restart after an outage) shows as a peak that falls as the batches work it off.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 59
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "pluginVersion": "4.23.2",
+          "queryType": "timeseries",
+          "rawSql": "SELECT\n    $__timeInterval(trigger_ts) AS time,\n    query_name,\n    max(kafka_lag_records) AS lag_records\nFROM ops_stream_progress\nWHERE $__timeFilter(trigger_ts)\nGROUP BY time, query_name\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "axisLabel": "records behind",
+            "spanNulls": 300000
+          },
+          "unit": "short",
+          "displayName": "${__field.labels.query_name}",
+          "decimals": 0,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 25
     }
   ],
   "refresh": "30s",
