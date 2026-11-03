@@ -1893,6 +1893,13 @@
         "x": 0,
         "y": 42
       },
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Fleet Reliability: availability, MTBF and MTTR",
+          "url": "/d/jet-engine-fleet-reliability?${engine_id:queryparam}&${__url_time_range}"
+        }
+      ],
       "targets": [
         {
           "datasource": {
@@ -2006,6 +2013,13 @@
         "x": 0,
         "y": 50
       },
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Fleet Reliability: availability, MTBF and MTTR",
+          "url": "/d/jet-engine-fleet-reliability?${engine_id:queryparam}&${__url_time_range}"
+        }
+      ],
       "targets": [
         {
           "datasource": {
@@ -2135,6 +2149,13 @@
         "x": 16,
         "y": 50
       },
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Fleet Reliability: availability, MTBF and MTTR",
+          "url": "/d/jet-engine-fleet-reliability?${engine_id:queryparam}&${__url_time_range}"
+        }
+      ],
       "targets": [
         {
           "datasource": {

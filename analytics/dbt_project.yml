@@ -2,8 +2,8 @@
 #
 #   silver: stg_* (deduplicated CDC images and HF frame features), int_* (lifecycles, rolling
 #           sensor features, rolling spectral features of the HF frames, the SCD Type 2 status
-#           history of every engine) and int_ml_features (the ML feature vector: sensor +
-#           spectral features of every pulse)
+#           history of every engine, platform outages) and int_ml_features (the ML feature
+#           vector: sensor + spectral features of every pulse)
 #   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs),
 #           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest),
 #           fct_engine_failures, fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily +
@@ -42,6 +42,10 @@ vars:
   # Incremental models re-read rows ingested this long before their watermark, because rows can
   # become visible in the raw tables slightly out of ingested_at order (concurrent inserts).
   ingestion_lookback_minutes: 10
+  # int_platform_outages: a pause of the whole fleet's telemetry longer than this is an outage,
+  # left out of the reliability KPIs. A running fleet pauses at most for a repair of every engine
+  # at once plus a tick (SIM_MAINTENANCE_SECONDS 20 s + SIM_TICK_SECONDS 1 s), so 60 s is ~3x that.
+  outage_min_gap_seconds: 60
   # fct_engine_health_status anomaly flags: a flag is raised when the KPI exceeds the threshold.
   # Calibrated on the live fleet (simulator defaults, 38 completed lifecycles, 2026-10-26) from
   # the KPI percentiles p50 / p90 / p99 per pulse status:

@@ -1,14 +1,15 @@
-"""Independent Python reference of the reliability models (int_engine_status_history and the gold
-reliability models), for verify_reliability.py and its unit tests.
+"""Independent Python reference of the reliability models (int_engine_status_history,
+int_platform_outages and the gold reliability models) for verify_reliability.py and its unit tests.
 
-It rebuilds from the CDC versions of engine_status_registry and from the maintenance work orders
-what the dbt models must hold, with plain loops instead of window functions:
+It rebuilds from the CDC versions of engine_status_registry, the maintenance work orders and the
+pulses' event times what the dbt models must hold, with plain loops instead of window functions:
 
 status_intervals         the SCD2 history: versions in log order, replays collapsed; an interval
                          opens when (status, status_changed_ts) changes or after a delete; a delete
                          closes the open interval at its commit time; boundary times are made
                          monotonic by a suffix minimum (a change backdated before earlier ones
                          supersedes them) and intervals without duration are dropped
+platform_outages         every pause of the fleet's pulses longer than the gap, as [start, end)
 failures                 one per run of unavailable intervals that contains a FAILURE, with the
                          time to repair and the operating time and cycles since the start of the
                          operating run before it (a return to service or a registration)
@@ -25,7 +26,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from itertools import accumulate, groupby
+from itertools import accumulate, groupby, pairwise
 from typing import Any
 
 AVAILABLE = frozenset({"HEALTHY", "WARNING", "CRITICAL"})
@@ -33,6 +34,7 @@ STATUSES = ("HEALTHY", "WARNING", "CRITICAL", "FAILURE", "MAINTENANCE_RESET")
 FLEET = "ALL"
 DAY_US = 86_400_000_000
 EPOCH = date(1970, 1, 1)
+Outage = tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,11 @@ class _Tally:
 
 def _mean(values: Sequence[int], scale: float = 1.0) -> float | None:
     return sum(values) / len(values) / scale if values else None
+
+
+def platform_outages(pulse_us: Iterable[int], min_gap_us: int) -> list[Outage]:
+    """int_platform_outages: every pause between two pulses of the fleet longer than ``min_gap_us``."""
+    return [(start, end) for start, end in pairwise(sorted(set(pulse_us))) if end - start > min_gap_us]
 
 
 def as_of_us(versions: Iterable[RegistryVersion]) -> int:

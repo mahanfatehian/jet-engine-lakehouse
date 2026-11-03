@@ -3,7 +3,7 @@
 The integration harness trusts this reference to judge the dbt models, so the status model is
 pinned here on hand-made change logs: folding of progress updates, replays and log order, the
 backdated registration of a backfilled history, deregistration, failures with their repair and
-operating times, the cut at UTC midnight, the time per lifecycle and the failure-mode Pareto.
+operating times, the cut at UTC midnight, the time per lifecycle, outages and the failure-mode Pareto.
 The fixture's own truth (synthetic_cdc.py) must agree with the reference as well.
 """
 
@@ -24,6 +24,7 @@ from reliability_reference import (
     failure_mode_pareto,
     failures,
     lifecycle_status_time,
+    platform_outages,
     status_intervals,
 )
 from synthetic_cdc import build_history
@@ -211,6 +212,12 @@ def test_lifecycle_time_counts_each_status_once() -> None:
     assert (first["failure_seconds"], first["failures"], first["is_current"]) == (20, 1, 0)
     assert (second["maintenance_reset_seconds"], second["failure_seconds"], second["is_current"]) == (1, 0, 1)
     assert first["availability"] == pytest.approx(100 / 120)
+
+
+def test_only_pauses_of_the_fleet_longer_than_the_gap_are_outages() -> None:
+    # ticks, the 21 s pause of every engine under repair at once, a pause of exactly the gap, a stop
+    pulses = [s * S for s in (0, 1, 1, 22, 82, 83, 200)]
+    assert platform_outages(pulses, 60 * S) == [(83 * S, 200 * S)]
 
 
 def test_the_pareto_ranks_modes_and_accumulates_their_shares() -> None:

@@ -1,15 +1,15 @@
 """Checks of the reliability models against reliability_reference.py (see verify_analytics.py).
 
-check_reliability  reads the CDC versions of engine_status_registry and the work orders back from
+check_reliability  reads the CDC versions of engine_status_registry, work orders and pulses back from
                    the raw tables exactly as they landed (replays, an out-of-order version, a delete
                    and a re-registration, a registration dated after the history written behind it),
                    rebuilds every reliability model in Python and compares every row and column of
-                   int_engine_status_history, fct_engine_failures, fct_engine_lifecycle_status_time,
-                   rpt_fleet_reliability_daily and rpt_failure_mode_pareto; then checks the
-                   fixture's own truth (synthetic_cdc.py, manifest key ``reliability``): the
-                   failures it simulated with their return to service and operating run, each
-                   registry scenario, and that every failure is a failed lifecycle of
-                   int_engine_lifecycles at the same cycle and instant
+                   int_platform_outages, int_engine_status_history, fct_engine_failures,
+                   fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily and
+                   rpt_failure_mode_pareto; then checks the fixture's own truth (synthetic_cdc.py,
+                   manifest key ``reliability``): the failures it simulated with their return to
+                   service and operating run, each registry scenario, and that every failure is a
+                   failed lifecycle of int_engine_lifecycles at the same cycle and instant
 """
 
 from __future__ import annotations
@@ -30,11 +30,13 @@ from reliability_reference import (
     failure_mode_pareto,
     failures,
     lifecycle_status_time,
+    platform_outages,
     status_intervals,
 )
 from verify_queries import DATABASE, rows
 
 LOGGER = logging.getLogger("verify_analytics")
+OUTAGE_MIN_GAP_US = 60_000_000  # dbt var outage_min_gap_seconds
 Table = dict[tuple[Any, ...], dict[str, Any]]
 STATUS_SECONDS = (
     "healthy_seconds",
@@ -43,6 +45,7 @@ STATUS_SECONDS = (
     "failure_seconds",
     "maintenance_reset_seconds",
 )
+OUTAGE_COLUMNS = {"outage_end_us": "toUnixTimestamp64Micro(outage_end)"}
 HISTORY_COLUMNS = {
     "engine_model": "toString(engine_model)",
     "operational_status": "toString(operational_status)",
@@ -148,6 +151,12 @@ def read_registry_versions(client: Client) -> list[RegistryVersion]:
             FROM {DATABASE}.raw_engine_status_registry""",
         )
     ]
+
+
+def read_pulse_times(client: Client) -> list[int]:
+    """Event time of every pulse version that landed: a retracted pulse still proves the platform ran."""
+    sql = f"SELECT DISTINCT toUnixTimestamp64Micro(event_ts) FROM {DATABASE}.raw_engine_telemetry"
+    return [row[0] for row in rows(client, sql)]
 
 
 def read_work_orders(client: Client) -> list[WorkOrder]:
@@ -267,9 +276,15 @@ def check_reference(client: Client) -> tuple[list[str], list[StatusInterval]]:
     versions = read_registry_versions(client)
     orders = read_work_orders(client)
     intervals = status_intervals(versions)
+    outages = platform_outages(read_pulse_times(client), OUTAGE_MIN_GAP_US)
     failure_list = failures(intervals)
     horizon = as_of_us(versions)
     found = compare_rows(
+        "int_platform_outages",
+        read_model(client, "int_platform_outages", ("toUnixTimestamp64Micro(outage_start)",), OUTAGE_COLUMNS),
+        {(start,): {"outage_end_us": end} for start, end in outages},
+    )
+    found += compare_rows(
         "int_engine_status_history",
         read_model(
             client,

@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: int_platform_outages
+    description: >
+      Platform outages: every pause of the whole fleet's telemetry (every pulse of
+      stg_engine_telemetry, retracted ones included) longer than outage_min_gap_seconds, as
+      [outage_start, outage_end) from the last pulse before it to the first pulse after it. The
+      status history keeps every engine in its last status through an outage; the reliability marts
+      count that time as unobserved instead. Table (rebuilt every run) on ReplacingMergeTree ordered
+      by outage_start; rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["reliability"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['outage_start']
+    columns:
+      - name: outage_start
+        data_type: "DateTime64(6, 'UTC')"
+        description: Event time of the last pulse before the pause.
+      - name: outage_end
+        data_type: "DateTime64(6, 'UTC')"
+        description: Event time of the first pulse after the pause (exclusive end of the outage).

@@ -58,6 +58,7 @@ MODELS = (
     "fct_rul_prediction_backtest",
     "rpt_model_live_performance",
     "int_engine_status_history",
+    "int_platform_outages",
     "fct_engine_failures",
     "fct_engine_lifecycle_status_time",
     "rpt_fleet_reliability_daily",
