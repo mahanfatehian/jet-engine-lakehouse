@@ -1428,7 +1428,7 @@
           "format": 0,
           "pluginVersion": "4.23.2",
           "queryType": "timeseries",
-          "rawSql": "SELECT\n    $__timeInterval(batch_started_at) AS time,\n    sum(frames) * 60 / $__interval_s AS `frames / min`,\n    sum(bytes) * 60 / $__interval_s / 1000000 AS `MB / min`\nFROM hf_ingest_batches\nWHERE $__timeFilter(batch_started_at)\nGROUP BY time\nORDER BY time",
+           "rawSql": "SELECT\n    $__timeInterval(batch_started_at) AS time,\n    sum(frames) * 60 / $__interval_s AS `frames / min`,\n    sum(bytes) * 60 / $__interval_s / 1000000 AS `MB / min`,\n    sum(dead_letters) * 60 / $__interval_s AS `dead letters / min`\nFROM hf_ingest_batches\nWHERE $__timeFilter(batch_started_at)\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -2266,7 +2266,7 @@
     {
       "type": "timeseries",
       "title": "Consumer lag per query",
-      "description": "Kafka records a query left behind its micro-batch (kafka_lag_records in ops_stream_progress): the newest offsets minus the batch's end offsets, summed over the partitions of its topics; the largest per interval. 0 while a query keeps up: a batch leaves records behind only when maxOffsetsPerTrigger caps it, so a backlog (the first-boot backfill, a restart after an outage) shows as a peak that falls as the batches work it off.",
+      "description": "Kafka records a query left behind its micro-batch (kafka_lag_records in ops_stream_progress): the newest offsets minus the batch's end offsets, summed over the partitions of its topics; the largest per interval. 0 while a query keeps up: a batch leaves records behind only when maxOffsetsPerTrigger caps it, so a backlog (the first-boot backfill, a restart after an outage) shows as a peak that falls as the batches work it off. make verify treats CDC queries (clickhouse_raw and the six lake CDC queries) as WARN above 5000 records and HF queries as WARN above 50000 (the designed first-boot frame backlog).",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "clickhouse-lakehouse"
@@ -2303,7 +2303,24 @@
           "unit": "short",
           "displayName": "${__field.labels.query_name}",
           "decimals": 0,
-          "min": 0
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 5000
+              },
+              {
+                "color": "red",
+                "value": 50000
+              }
+            ]
+          }
         },
         "overrides": []
       },
