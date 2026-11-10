@@ -562,6 +562,8 @@ in service; FAILURE (under repair) and MAINTENANCE_RESET (repaired, not flown ye
 | `fct_engine_lifecycle_status_time` | engine × lifecycle | observed time in each status, unobserved time, availability, failures |
 | `rpt_fleet_reliability_daily` | UTC day × engine, plus the fleet (`ALL`) | availability, failures, MTBF (observed time and cycles), MTTR, unobserved time |
 | `rpt_failure_mode_pareto` | engine × failure mode, plus the fleet (`ALL`) | work orders per mode, ranked, with cumulative share |
+| `fct_engine_shop_visits` | one row per failure | operational WARNING→FAILURE lead (cycles and seconds), skipped WARNING/CRITICAL, work-order open/complete clock |
+| `rpt_shop_visit_lead_time` | engine × failure mode, plus `ALL` | median/p90 operational lead, share of sudden deaths (no WARNING before FAILURE) |
 
 dbt tests prove that an engine's intervals never overlap and tile its history, that the open
 interval is the registry's current state, that every failure is a failed lifecycle of
@@ -617,7 +619,7 @@ ClickHouse account that can only run queries, never write.
 | **Fleet Health & Remaining Useful Life** | status, health score, the five calibrated anomaly flags and the RUL prediction of every engine (aged to the current cycle), live 1 Hz sensors, the failure and repair timeline, work orders and failures by mode (each linked to the Fleet Reliability board) |
 | **Vibration Analytics (HF Sensor Frames)** | bearing defect tone (BPFO), kurtosis, crest factor and core unbalance per engine, the oil system (quantity, filter ΔP, temperatures), the EGT A/B sensor split, HF frames per minute |
 | **Data Platform & CDC Pipeline** | CDC ingest rate and end-to-end latency per hop, dead letters, freshness of every pipeline stage, storage footprint, the HF path's throughput, micro-batch duration, frame lag and coverage per engine, the latest reconciliation audit per layer with every (engine, hour) cell that differs from the source, and the processing rate and Kafka consumer lag of every streaming query |
-| **Fleet Reliability** | availability, failures, MTBF (observed time and cycles) and MTTR per engine and per day, observed time in each status per day, engine and lifecycle (platform outages left out), the failure-mode Pareto, the SCD2 status timeline and every failure with its repair |
+| **Fleet Reliability** | availability, failures, MTBF (observed time and cycles) and MTTR per engine and per day, observed time in each status per day, engine and lifecycle (platform outages left out), the failure-mode Pareto, the SCD2 status timeline, every failure with its repair, and the operational WARNING-to-FAILURE shop-visit lead time |
 | **Model Operations & Live Backtest** | the production model, every training run with its promotion decision, calibration of the failure probability, live versus holdout performance against failures that happened later |
 
 ## Service endpoints

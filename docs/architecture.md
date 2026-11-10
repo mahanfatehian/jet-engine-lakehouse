@@ -183,6 +183,8 @@ whose loss would stop the query on its next restart.
 | gold | `fct_engine_lifecycle_status_time` | dbt, table | `ReplacingMergeTree` | observed time in each status per engine lifecycle, unobserved time, availability, failures |
 | gold | `rpt_fleet_reliability_daily` | dbt, table | `ReplacingMergeTree` | availability, failures, MTBF (observed time and cycles), MTTR, unobserved time per UTC day and engine, plus the fleet (`ALL`) |
 | gold | `rpt_failure_mode_pareto` | dbt, table | `ReplacingMergeTree` | work orders per failure mode, ranked with cumulative shares, per engine and fleet |
+| gold | `fct_engine_shop_visits` | dbt, table | `ReplacingMergeTree` | one row per failure: operational WARNING→FAILURE lead, skipped stages, work-order clock |
+| gold | `rpt_shop_visit_lead_time` | dbt, table | `ReplacingMergeTree` | median/p90 operational lead and sudden-death share per engine and failure mode, plus ALL |
 | gold | `rpt_model_live_performance` | dbt, table | `ReplacingMergeTree` | live RMSE, MAE, bias, NASA score, horizon precision/recall/F1 and warning lead time per model version |
 | serving | `gold_engine_rul_predictions` | `predict_rul.py` | `MergeTree`, 180-day TTL, insert deduplication window 100 | every prediction with its sensor readings |
 | serving | `ml_model_runs` | `train_rul_model.py` | `MergeTree`, insert deduplication window 100 | training-run registry |
@@ -226,7 +228,11 @@ flowchart LR
     OUT --> LST
     OUT --> DAY
     STM --> PAR[rpt_failure_mode_pareto]
-```
+    FAIL --> VISIT[fct_engine_shop_visits]
+    SCD --> VISIT
+    STM --> VISIT
+    VISIT --> LEAD[rpt_shop_visit_lead_time]
+    ```
 
 ## 5. Correctness and idempotency, end to end
 
