@@ -25,6 +25,8 @@ from reliability_reference import (
     failures,
     lifecycle_status_time,
     platform_outages,
+    shop_visit_lead_time,
+    shop_visits,
     status_intervals,
 )
 from synthetic_cdc import build_history
@@ -257,6 +259,51 @@ def test_the_pareto_ranks_modes_and_accumulates_their_shares() -> None:
     assert (fleet[0]["engines_affected"], fleet[0]["completed_work_orders"]) == (2, 1)
     assert (fleet[0]["total_downtime_seconds"], fleet[0]["mean_downtime_seconds"]) == (20, 20)
     assert rows[("GE90-201", "OIL_SYSTEM_LEAK")]["total_downtime_seconds"] is None
+
+
+def test_shop_visits_measure_warning_to_failure_lead() -> None:
+    intervals = status_intervals(LIFECYCLE)
+    first, second = shop_visits(intervals, failures(intervals))
+    assert (first.warning_to_failure_cycles, first.warning_to_failure_seconds, first.skipped_warning) == (
+        4,
+        50.0,
+        0,
+    )
+    assert (first.warning_to_critical_cycles, first.critical_to_failure_cycles, first.skipped_critical) == (
+        3,
+        1,
+        0,
+    )
+    assert (second.warning_to_failure_cycles, second.skipped_critical, second.skipped_warning) == (2, 1, 0)
+    assert second.first_critical_at_us is None
+    assert first.failure_mode == "UNKNOWN"
+
+
+def test_a_failure_without_warning_is_a_skipped_shop_visit() -> None:
+    log = [version(1, "HEALTHY", 0, cdc_op="c"), version(2, "FAILURE", 10, cycle=3)]
+    intervals = status_intervals(log)
+    (visit,) = shop_visits(intervals, failures(intervals))
+    assert (visit.skipped_warning, visit.skipped_critical, visit.warning_to_failure_cycles) == (1, 1, None)
+
+
+def test_shop_visit_seconds_follow_the_work_order_clock() -> None:
+    intervals = status_intervals(LIFECYCLE)
+    order = WorkOrder(9, ENGINE, 1, "BEARING_DEGRADATION", "COMPLETED", 9, 100 * S, 20, 100 * S, 120 * S)
+    visit = shop_visits(intervals, failures(intervals), [order])[0]
+    assert (visit.failure_mode, visit.shop_visit_seconds, visit.work_order_status) == (
+        "BEARING_DEGRADATION",
+        20.0,
+        "COMPLETED",
+    )
+
+
+def test_shop_visit_lead_time_rolls_up_all_and_the_median() -> None:
+    intervals = status_intervals(LIFECYCLE)
+    rows = shop_visit_lead_time(shop_visits(intervals, failures(intervals)))
+    fleet = rows[(FLEET, FLEET)]
+    assert (fleet["shop_visits"], fleet["visits_with_warning"], fleet["visits_skipped_warning"]) == (2, 2, 0)
+    assert fleet["median_warning_to_failure_cycles"] == 3.0
+    assert fleet["visits_returned"] == 1
 
 
 def _micros(value: datetime) -> int:

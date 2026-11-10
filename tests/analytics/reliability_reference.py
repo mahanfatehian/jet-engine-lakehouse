@@ -17,12 +17,16 @@ failures                 one per run of unavailable intervals that contains a FA
 lifecycle_status_time    time in every status per engine lifecycle
 daily_reliability        availability, failures, MTTR and MTBF per UTC day and engine, plus 'ALL'
 failure_mode_pareto      work orders per failure mode, ranked, with cumulative shares
+shop_visits              one per failure, with first WARNING/CRITICAL of that lifecycle and the
+                         work-order clock (operational notice, not the ML HIGH-risk lead)
+shop_visit_lead_time     median/p90 warning-to-failure cycles by engine and failure mode, plus ALL
 
 Times are integer microseconds since the epoch (UTC), as toUnixTimestamp64Micro returns them.
 """
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -117,6 +121,8 @@ class WorkOrder:
     failure_cycle: int
     failure_us: int
     downtime_seconds: int | None
+    opened_us: int | None = None
+    completed_us: int | None = None
 
 
 @dataclass
@@ -368,6 +374,180 @@ def daily_reliability(
             "mtbf_cycles": _mean(tally.cycles),
         }
     return rows
+
+
+@dataclass(frozen=True)
+class ShopVisit:
+    """One shop visit: a failure plus the operational WARNING/CRITICAL notice of its lifecycle."""
+
+    engine_id: str
+    engine_model: str
+    lifecycle_id: int
+    failure_cycle: int
+    failed_at_us: int
+    first_warning_at_us: int | None
+    first_warning_cycle: int | None
+    first_critical_at_us: int | None
+    first_critical_cycle: int | None
+    returned_us: int | None
+    repair_us: int | None
+    maintenance_id: int | None
+    failure_mode: str
+    opened_us: int | None
+    completed_us: int | None
+    work_order_status: str | None
+
+    @property
+    def skipped_warning(self) -> int:
+        return int(self.first_warning_at_us is None)
+
+    @property
+    def skipped_critical(self) -> int:
+        return int(self.first_critical_at_us is None)
+
+    @property
+    def warning_to_failure_cycles(self) -> int | None:
+        if self.first_warning_cycle is None:
+            return None
+        return self.failure_cycle - self.first_warning_cycle
+
+    @property
+    def warning_to_failure_seconds(self) -> float | None:
+        if self.first_warning_at_us is None:
+            return None
+        return (self.failed_at_us - self.first_warning_at_us) / 1e6
+
+    @property
+    def warning_to_critical_cycles(self) -> int | None:
+        if self.first_warning_cycle is None or self.first_critical_cycle is None:
+            return None
+        return self.first_critical_cycle - self.first_warning_cycle
+
+    @property
+    def warning_to_critical_seconds(self) -> float | None:
+        if self.first_warning_at_us is None or self.first_critical_at_us is None:
+            return None
+        return (self.first_critical_at_us - self.first_warning_at_us) / 1e6
+
+    @property
+    def critical_to_failure_cycles(self) -> int | None:
+        if self.first_critical_cycle is None:
+            return None
+        return self.failure_cycle - self.first_critical_cycle
+
+    @property
+    def critical_to_failure_seconds(self) -> float | None:
+        if self.first_critical_at_us is None:
+            return None
+        return (self.failed_at_us - self.first_critical_at_us) / 1e6
+
+    @property
+    def shop_visit_seconds(self) -> float | None:
+        if self.opened_us is None or self.completed_us is None:
+            return None
+        return (self.completed_us - self.opened_us) / 1e6
+
+
+def _first_stage(intervals: Iterable[StatusInterval], status: str) -> dict[tuple[str, int], tuple[int, int]]:
+    """Earliest (valid_from_us, cycle_at_entry) of ``status`` per engine lifecycle."""
+    first: dict[tuple[str, int], tuple[int, int]] = {}
+    for interval in intervals:
+        if interval.operational_status != status:
+            continue
+        key = (interval.engine_id, interval.lifecycle_id)
+        current = first.get(key)
+        if current is None or interval.valid_from_us < current[0]:
+            first[key] = (interval.valid_from_us, interval.cycle_at_entry)
+    return first
+
+
+def shop_visits(
+    intervals: Iterable[StatusInterval],
+    failure_list: Iterable[Failure],
+    work_orders: Iterable[WorkOrder] = (),
+) -> list[ShopVisit]:
+    """One shop visit per failure, with the first WARNING/CRITICAL of that lifecycle."""
+    warnings = _first_stage(intervals, "WARNING")
+    criticals = _first_stage(intervals, "CRITICAL")
+    orders = {
+        (order.engine_id, order.lifecycle_id): order
+        for order in sorted(work_orders, key=lambda o: o.maintenance_id)
+    }
+    visits = []
+    for failure in failure_list:
+        key = (failure.engine_id, failure.lifecycle_id)
+        warning, critical = warnings.get(key), criticals.get(key)
+        order = orders.get(key)
+        visits.append(
+            ShopVisit(
+                engine_id=failure.engine_id,
+                engine_model=failure.engine_model,
+                lifecycle_id=failure.lifecycle_id,
+                failure_cycle=failure.failure_cycle,
+                failed_at_us=failure.failed_at_us,
+                first_warning_at_us=None if warning is None else warning[0],
+                first_warning_cycle=None if warning is None else warning[1],
+                first_critical_at_us=None if critical is None else critical[0],
+                first_critical_cycle=None if critical is None else critical[1],
+                returned_us=failure.returned_us,
+                repair_us=failure.repair_us,
+                maintenance_id=None if order is None else order.maintenance_id,
+                failure_mode="UNKNOWN" if order is None else order.failure_mode,
+                opened_us=None if order is None else order.opened_us,
+                completed_us=None if order is None else order.completed_us,
+                work_order_status=None if order is None else order.maintenance_status,
+            )
+        )
+    return visits
+
+
+def _quantile_inclusive(values: Sequence[float], level: float) -> float | None:
+    """Excel PERCENTILE.INC / ClickHouse quantileExactInclusive of ``values``."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = level * (len(ordered) - 1)
+    low = math.floor(position)
+    high = math.ceil(position)
+    if low == high:
+        return float(ordered[low])
+    fraction = position - low
+    return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
+
+
+def _visit_metrics(members: Sequence[ShopVisit]) -> dict[str, Any]:
+    leads = [
+        visit.warning_to_failure_cycles for visit in members if visit.warning_to_failure_cycles is not None
+    ]
+    lead_seconds = [
+        visit.warning_to_failure_seconds for visit in members if visit.warning_to_failure_seconds is not None
+    ]
+    shops = [visit.shop_visit_seconds for visit in members if visit.shop_visit_seconds is not None]
+    skipped = sum(visit.skipped_warning for visit in members)
+    return {
+        "shop_visits": len(members),
+        "visits_with_warning": len(members) - skipped,
+        "visits_skipped_warning": skipped,
+        "visits_returned": sum(visit.returned_us is not None for visit in members),
+        "share_skipped_warning": skipped / len(members),
+        "median_warning_to_failure_cycles": _quantile_inclusive(leads, 0.5),
+        "p90_warning_to_failure_cycles": _quantile_inclusive(leads, 0.9),
+        "median_warning_to_failure_seconds": _quantile_inclusive(lead_seconds, 0.5),
+        "median_shop_visit_seconds": _quantile_inclusive(shops, 0.5),
+    }
+
+
+def shop_visit_lead_time(visits: Iterable[ShopVisit]) -> dict[tuple[str, str], dict[str, Any]]:
+    """rpt_shop_visit_lead_time by (engine_id, failure_mode), ALL rollups included."""
+    groups: defaultdict[tuple[str, str], list[ShopVisit]] = defaultdict(list)
+    for visit in visits:
+        groups[(visit.engine_id, visit.failure_mode)].append(visit)
+        groups[(visit.engine_id, FLEET)].append(visit)
+        groups[(FLEET, visit.failure_mode)].append(visit)
+        groups[(FLEET, FLEET)].append(visit)
+    return {key: _visit_metrics(members) for key, members in groups.items()}
 
 
 def failure_mode_pareto(work_orders: Iterable[WorkOrder]) -> dict[tuple[str, str], dict[str, Any]]:

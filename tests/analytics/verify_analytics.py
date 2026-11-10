@@ -63,6 +63,8 @@ MODELS = (
     "fct_engine_lifecycle_status_time",
     "rpt_fleet_reliability_daily",
     "rpt_failure_mode_pareto",
+    "fct_engine_shop_visits",
+    "rpt_shop_visit_lead_time",
 )
 BUILD_TIME_COLUMNS = frozenset(
     {"feature_computed_at", "refreshed_at", "telemetry_staleness_seconds", "prediction_age_seconds"}

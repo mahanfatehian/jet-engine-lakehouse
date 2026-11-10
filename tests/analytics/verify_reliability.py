@@ -4,9 +4,10 @@ check_reliability  reads the CDC versions of engine_status_registry, work orders
                    the raw tables exactly as they landed (replays, an out-of-order version, a delete
                    and a re-registration, a registration dated after the history written behind it),
                    rebuilds every reliability model in Python and compares every row and column of
-                   int_platform_outages, int_engine_status_history, fct_engine_failures,
-                   fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily and
-                   rpt_failure_mode_pareto; then checks the fixture's own truth (synthetic_cdc.py,
+int_platform_outages, int_engine_status_history, fct_engine_failures,
+                    fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily,
+                    rpt_failure_mode_pareto, fct_engine_shop_visits and rpt_shop_visit_lead_time;
+                    then checks the fixture's own truth (synthetic_cdc.py,
                    manifest key ``reliability``): the failures it simulated with their return to
                    service and operating run, each registry scenario, its platform stop, and that
                    every failure is a failed lifecycle of int_engine_lifecycles at the same cycle
@@ -32,6 +33,8 @@ from reliability_reference import (
     failures,
     lifecycle_status_time,
     platform_outages,
+    shop_visit_lead_time,
+    shop_visits,
     status_intervals,
 )
 from verify_queries import DATABASE, rows
@@ -123,6 +126,45 @@ PARETO_COLUMNS = {
     "first_failure_us": "toUnixTimestamp64Micro(first_failure_ts)",
     "last_failure_us": "toUnixTimestamp64Micro(last_failure_ts)",
 }
+VISIT_COLUMNS = {
+    "engine_model": "toString(engine_model)",
+    "lifecycle_id": "lifecycle_id",
+    "failure_cycle": "failure_cycle",
+    "first_warning_us": "toUnixTimestamp64Micro(first_warning_at)",
+    "first_warning_cycle": "first_warning_cycle",
+    "first_critical_us": "toUnixTimestamp64Micro(first_critical_at)",
+    "first_critical_cycle": "first_critical_cycle",
+    "warning_to_failure_cycles": "warning_to_failure_cycles",
+    "warning_to_failure_seconds": "warning_to_failure_seconds",
+    "warning_to_critical_cycles": "warning_to_critical_cycles",
+    "warning_to_critical_seconds": "warning_to_critical_seconds",
+    "critical_to_failure_cycles": "critical_to_failure_cycles",
+    "critical_to_failure_seconds": "critical_to_failure_seconds",
+    "skipped_warning": "skipped_warning",
+    "skipped_critical": "skipped_critical",
+    "opened_us": "toUnixTimestamp64Micro(work_order_opened_at)",
+    "completed_us": "toUnixTimestamp64Micro(work_order_completed_at)",
+    "work_order_status": "work_order_status",
+    "shop_visit_seconds": "shop_visit_seconds",
+    "returned_us": "toUnixTimestamp64Micro(returned_to_service_at)",
+    "repair_seconds": "repair_seconds",
+    "maintenance_id": "maintenance_id",
+    "failure_mode": "toString(failure_mode)",
+}
+LEAD_COLUMNS = {
+    name: name
+    for name in (
+        "shop_visits",
+        "visits_with_warning",
+        "visits_skipped_warning",
+        "visits_returned",
+        "share_skipped_warning",
+        "median_warning_to_failure_cycles",
+        "p90_warning_to_failure_cycles",
+        "median_warning_to_failure_seconds",
+        "median_shop_visit_seconds",
+    )
+}
 
 
 def _iso_micros(value: str | None) -> int | None:
@@ -171,7 +213,8 @@ def read_work_orders(client: Client) -> list[WorkOrder]:
         f"""
         SELECT engine_id, maintenance_id, lifecycle_id, toString(failure_mode), toString(maintenance_status),
                failure_cycle, toUnixTimestamp64Micro(failure_ts), downtime_seconds, is_deleted, cdc_lsn,
-               toUnixTimestamp64Micro(ingested_at)
+               toUnixTimestamp64Micro(ingested_at), toUnixTimestamp64Micro(opened_ts),
+               toUnixTimestamp64Micro(completed_ts)
         FROM {DATABASE}.raw_maintenance_log""",
     ):
         key = (row[0], row[1])
@@ -187,6 +230,8 @@ def read_work_orders(client: Client) -> list[WorkOrder]:
             failure_cycle=row[5],
             failure_us=row[6],
             downtime_seconds=row[7],
+            opened_us=row[11],
+            completed_us=row[12],
         )
         for row in newest.values()
         if not row[8]
@@ -343,7 +388,59 @@ def check_reference(client: Client) -> tuple[list[str], list[StatusInterval]]:
         ),
         failure_mode_pareto(orders),
     )
+    visit_list = shop_visits(intervals, failure_list, orders)
+    found += compare_rows(
+        "fct_engine_shop_visits",
+        read_model(
+            client,
+            "fct_engine_shop_visits",
+            ("toString(engine_id)", "toUnixTimestamp64Micro(failed_at)"),
+            VISIT_COLUMNS,
+        ),
+        _visit_reference(visit_list),
+    )
+    found += compare_rows(
+        "rpt_shop_visit_lead_time",
+        read_model(
+            client,
+            "rpt_shop_visit_lead_time",
+            ("toString(engine_id)", "toString(failure_mode)"),
+            LEAD_COLUMNS,
+        ),
+        shop_visit_lead_time(visit_list),
+    )
     return found, intervals
+
+
+def _visit_reference(visit_list: list) -> Table:
+    return {
+        (visit.engine_id, visit.failed_at_us): {
+            "engine_model": visit.engine_model,
+            "lifecycle_id": visit.lifecycle_id,
+            "failure_cycle": visit.failure_cycle,
+            "first_warning_us": visit.first_warning_at_us,
+            "first_warning_cycle": visit.first_warning_cycle,
+            "first_critical_us": visit.first_critical_at_us,
+            "first_critical_cycle": visit.first_critical_cycle,
+            "warning_to_failure_cycles": visit.warning_to_failure_cycles,
+            "warning_to_failure_seconds": visit.warning_to_failure_seconds,
+            "warning_to_critical_cycles": visit.warning_to_critical_cycles,
+            "warning_to_critical_seconds": visit.warning_to_critical_seconds,
+            "critical_to_failure_cycles": visit.critical_to_failure_cycles,
+            "critical_to_failure_seconds": visit.critical_to_failure_seconds,
+            "skipped_warning": visit.skipped_warning,
+            "skipped_critical": visit.skipped_critical,
+            "opened_us": visit.opened_us,
+            "completed_us": visit.completed_us,
+            "work_order_status": visit.work_order_status,
+            "shop_visit_seconds": visit.shop_visit_seconds,
+            "returned_us": visit.returned_us,
+            "repair_seconds": None if visit.repair_us is None else visit.repair_us / 1e6,
+            "maintenance_id": visit.maintenance_id,
+            "failure_mode": visit.failure_mode,
+        }
+        for visit in visit_list
+    }
 
 
 def _simulated_failures(client: Client, scenario: dict[str, Any]) -> list[str]:
