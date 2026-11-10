@@ -54,7 +54,7 @@ work_orders as (
         toNullable(maintenance_id) as work_order_id,
         toNullable(cast(failure_mode as String)) as work_order_failure_mode,
         toNullable(cast(maintenance_status as String)) as work_order_status,
-        opened_ts as work_order_opened_at,
+        toNullable(opened_ts) as work_order_opened_at,
         completed_ts as work_order_completed_at
     from {{ ref('stg_maintenance_log') }} final
     order by engine_id, lifecycle_id, maintenance_id desc
@@ -72,24 +72,30 @@ select
     stages.first_warning_cycle as first_warning_cycle,
     stages.first_critical_at as first_critical_at,
     stages.first_critical_cycle as first_critical_cycle,
-    if(
-        isNull(stages.first_warning_cycle),
-        null,
-        toInt32(failures.failure_cycle) - toInt32(stages.first_warning_cycle)
+    cast(
+        if(
+            isNull(stages.first_warning_cycle),
+            null,
+            toInt32(failures.failure_cycle) - toInt32(stages.first_warning_cycle)
+        ) as Nullable(Int32)
     ) as warning_to_failure_cycles,
     {{ micros_between('stages.first_warning_at', 'failures.failed_at') }} / 1000000.0
         as warning_to_failure_seconds,
-    if(
-        isNull(stages.first_warning_cycle) or isNull(stages.first_critical_cycle),
-        null,
-        toInt32(stages.first_critical_cycle) - toInt32(stages.first_warning_cycle)
+    cast(
+        if(
+            isNull(stages.first_warning_cycle) or isNull(stages.first_critical_cycle),
+            null,
+            toInt32(stages.first_critical_cycle) - toInt32(stages.first_warning_cycle)
+        ) as Nullable(Int32)
     ) as warning_to_critical_cycles,
     {{ micros_between('stages.first_warning_at', 'stages.first_critical_at') }} / 1000000.0
         as warning_to_critical_seconds,
-    if(
-        isNull(stages.first_critical_cycle),
-        null,
-        toInt32(failures.failure_cycle) - toInt32(stages.first_critical_cycle)
+    cast(
+        if(
+            isNull(stages.first_critical_cycle),
+            null,
+            toInt32(failures.failure_cycle) - toInt32(stages.first_critical_cycle)
+        ) as Nullable(Int32)
     ) as critical_to_failure_cycles,
     {{ micros_between('stages.first_critical_at', 'failures.failed_at') }} / 1000000.0
         as critical_to_failure_seconds,
