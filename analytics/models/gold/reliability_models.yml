@@ -452,3 +452,233 @@ models:
       - name: refreshed_at
         data_type: "DateTime64(3, 'UTC')"
         description: Build time of this table (UTC).
+
+  - name: fct_engine_shop_visits
+    description: >
+      One row per shop visit, the same identity as fct_engine_failures (engine_id, failed_at).
+      Adds the operational WARNING/CRITICAL notice period of the failed lifecycle (first registry
+      interval of that status, not the ML HIGH-risk prediction) and the work-order open/complete
+      clock. skipped_warning is 1 when the lifecycle never entered WARNING before FAILURE (a
+      sudden death). Table (rebuilt every run) on ReplacingMergeTree ordered by
+      (engine_id, failed_at); rows are unique, so it can be read with or without FINAL.
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'failed_at']
+      - expression_is_true:
+          name: fct_engine_shop_visits_stages_ordered
+          arguments:
+            expression: >
+              isNull(first_warning_at) = skipped_warning
+              and isNull(first_critical_at) = skipped_critical
+              and isNull(first_warning_at) = isNull(warning_to_failure_cycles)
+              and isNull(first_warning_at) = isNull(warning_to_failure_seconds)
+              and isNull(first_critical_at) = isNull(critical_to_failure_cycles)
+              and (isNull(first_warning_at) or first_warning_at <= failed_at)
+              and (isNull(first_critical_at) or first_critical_at <= failed_at)
+              and (isNull(first_warning_at) or isNull(first_critical_at)
+                or first_warning_at <= first_critical_at)
+              and isNull(returned_to_service_at) = isNull(repair_seconds)
+              and (isNull(returned_to_service_at) or returned_to_service_at > failed_at)
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine that went to the shop.
+        data_tests:
+          - not_null
+      - name: engine_model
+        data_type: LowCardinality(String)
+        description: Engine model (registry).
+      - name: lifecycle_id
+        data_type: UInt32
+        description: Lifecycle that ended in this shop visit.
+      - name: failure_cycle
+        data_type: UInt32
+        description: Cycle at which the engine failed.
+      - name: failed_at
+        data_type: "DateTime64(6, 'UTC')"
+        description: Start of the FAILURE interval; the FAILURE pulse's event time.
+        data_tests:
+          - not_null
+      - name: first_warning_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Start of the first WARNING interval of this lifecycle; NULL if WARNING was skipped.
+      - name: first_warning_cycle
+        data_type: Nullable(UInt32)
+        description: Registry cycle when that WARNING interval began.
+      - name: first_critical_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Start of the first CRITICAL interval of this lifecycle; NULL if CRITICAL was skipped.
+      - name: first_critical_cycle
+        data_type: Nullable(UInt32)
+        description: Registry cycle when that CRITICAL interval began.
+      - name: warning_to_failure_cycles
+        data_type: Nullable(Int32)
+        description: >
+          Operational lead time in cycles, failure_cycle - first_warning_cycle. NULL when
+          WARNING was skipped. Distinct from rpt_model_live_performance.median_warning_lead_cycles
+          (first HIGH-risk RUL prediction).
+        data_tests:
+          - non_negative
+      - name: warning_to_failure_seconds
+        data_type: Nullable(Float64)
+        description: Seconds from first_warning_at to failed_at; NULL when WARNING was skipped.
+        data_tests:
+          - non_negative
+      - name: warning_to_critical_cycles
+        data_type: Nullable(Int32)
+        description: first_critical_cycle - first_warning_cycle; NULL if either stage is missing.
+        data_tests:
+          - non_negative
+      - name: warning_to_critical_seconds
+        data_type: Nullable(Float64)
+        description: Seconds from first WARNING to first CRITICAL; NULL if either stage is missing.
+        data_tests:
+          - non_negative
+      - name: critical_to_failure_cycles
+        data_type: Nullable(Int32)
+        description: failure_cycle - first_critical_cycle; NULL when CRITICAL was skipped.
+        data_tests:
+          - non_negative
+      - name: critical_to_failure_seconds
+        data_type: Nullable(Float64)
+        description: Seconds from first CRITICAL to FAILURE; NULL when CRITICAL was skipped.
+        data_tests:
+          - non_negative
+      - name: skipped_warning
+        data_type: UInt8
+        description: 1 when this lifecycle never entered WARNING before FAILURE.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: skipped_critical
+        data_type: UInt8
+        description: 1 when this lifecycle never entered CRITICAL before FAILURE.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [0, 1]
+      - name: work_order_opened_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Work order opened_ts; NULL until the work order lands.
+      - name: work_order_completed_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Work order completed_ts; NULL while OPEN or until it lands.
+      - name: work_order_status
+        data_type: "Nullable(LowCardinality(String))"
+        description: OPEN or COMPLETED of the work order; NULL until it lands.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['OPEN', 'COMPLETED']
+              config:
+                severity: warn
+      - name: shop_visit_seconds
+        data_type: Nullable(Float64)
+        description: >
+          Work-order clock, completed_ts - opened_ts in seconds. Distinct from repair_seconds,
+          which also counts the reset until the next lifecycle's first pulse.
+        data_tests:
+          - non_negative
+      - name: returned_to_service_at
+        data_type: "Nullable(DateTime64(6, 'UTC'))"
+        description: Start of the first available interval after the failure; NULL while still down.
+      - name: repair_seconds
+        data_type: Nullable(Float64)
+        description: Time to repair from fct_engine_failures (FAILURE to return to service).
+        data_tests:
+          - non_negative
+      - name: maintenance_id
+        data_type: Nullable(UInt64)
+        description: Work order of the failed lifecycle; NULL until it lands.
+      - name: failure_mode
+        data_type: LowCardinality(String)
+        description: Failure mode of the work order; UNKNOWN until it has landed.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['HPT_BLADE_EROSION', 'BEARING_DEGRADATION', 'OIL_SYSTEM_LEAK', 'COMPRESSOR_FOULING', 'UNKNOWN']
+              config:
+                severity: warn
+
+  - name: rpt_shop_visit_lead_time
+    description: >
+      Operational notice period of shop visits, rolled up by engine and failure mode with
+      engine_id = 'ALL' and failure_mode = 'ALL' grouping sets. median_warning_to_failure_cycles
+      is the median of fct_engine_shop_visits.warning_to_failure_cycles (registry WARNING, not
+      the ML HIGH-risk lead). Table (rebuilt every run) on ReplacingMergeTree ordered by
+      (engine_id, failure_mode).
+    config:
+      tags: ["reliability", "kpi"]
+    data_tests:
+      - unique_under_final:
+          arguments:
+            columns: ['engine_id', 'failure_mode']
+      - expression_is_true:
+          name: rpt_shop_visit_lead_time_counts_consistent
+          arguments:
+            expression: >
+              visits_with_warning + visits_skipped_warning = shop_visits
+              and visits_returned <= shop_visits
+              and abs(share_skipped_warning - visits_skipped_warning / shop_visits) < 1e-12
+    columns:
+      - name: engine_id
+        data_type: LowCardinality(String)
+        description: Engine, or ALL for the fleet rollup.
+        data_tests:
+          - not_null
+      - name: failure_mode
+        data_type: LowCardinality(String)
+        description: Failure mode, or ALL for every mode of the engine (or fleet).
+        data_tests:
+          - not_null
+      - name: shop_visits
+        data_type: UInt64
+        description: Shop visits (failures) in this scope.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 1
+      - name: visits_with_warning
+        data_type: UInt64
+        description: Visits whose lifecycle entered WARNING before FAILURE.
+      - name: visits_skipped_warning
+        data_type: UInt64
+        description: Sudden deaths: WARNING was never observed before FAILURE.
+      - name: visits_returned
+        data_type: UInt64
+        description: Visits that have returned to service.
+      - name: share_skipped_warning
+        data_type: Float64
+        description: visits_skipped_warning / shop_visits.
+        data_tests:
+          - accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+      - name: median_warning_to_failure_cycles
+        data_type: Nullable(Float64)
+        description: Median operational lead in cycles; NULL when every visit skipped WARNING.
+        data_tests:
+          - non_negative
+      - name: p90_warning_to_failure_cycles
+        data_type: Nullable(Float64)
+        description: 90th percentile of operational lead in cycles.
+        data_tests:
+          - non_negative
+      - name: median_warning_to_failure_seconds
+        data_type: Nullable(Float64)
+        description: Median operational lead in seconds.
+        data_tests:
+          - non_negative
+      - name: median_shop_visit_seconds
+        data_type: Nullable(Float64)
+        description: Median work-order open-to-complete seconds; NULL while none is completed.
+        data_tests:
+          - non_negative
+      - name: refreshed_at
+        data_type: "DateTime64(3, 'UTC')"
+        description: Build time of this table (UTC).

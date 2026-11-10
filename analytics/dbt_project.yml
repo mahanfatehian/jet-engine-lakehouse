@@ -7,7 +7,8 @@
 #   gold:   mart_rul_training_features (ML training set), fct_engine_health_status (fleet KPIs),
 #           fct_rul_prediction_backtest + rpt_model_live_performance (live model backtest),
 #           fct_engine_failures, fct_engine_lifecycle_status_time, rpt_fleet_reliability_daily +
-#           rpt_failure_mode_pareto (reliability: availability, MTBF, MTTR, failure modes)
+#           rpt_failure_mode_pareto (reliability: availability, MTBF, MTTR, failure modes),
+#           fct_engine_shop_visits + rpt_shop_visit_lead_time (WARNING-to-FAILURE notice)
 #   exposures (models/exposures.yml): the Grafana dashboards and the RUL model
 #
 # Every table model is a ReplacingMergeTree so that consumers can always read it with FINAL;
