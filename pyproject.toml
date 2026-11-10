@@ -40,3 +40,31 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 testpaths = ["tests"]
 pythonpath = ["simulator", "streaming", "data_science", "orchestration"]
 addopts = "-q --import-mode=importlib"
+
+[tool.coverage.run]
+branch = true
+source = ["simulator", "streaming", "data_science", "orchestration"]
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+
+[tool.ty.environment]
+python-version = "3.11"
+extra-paths = ["simulator", "streaming", "data_science", "orchestration"]
+
+[tool.ty.terminal]
+error-on-warning = false
+
+[tool.ty.rules]
+# Images hold numpy/pyspark/psycopg2; ty runs without those site-packages.
+import-not-found = "ignore"
+# First land: warn on the existing argument/attribute mismatches; new undefined names still error.
+invalid-argument-type = "warn"
+missing-attribute = "warn"
+unsupported-operator = "warn"

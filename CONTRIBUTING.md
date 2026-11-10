@@ -54,6 +54,7 @@ local Python is needed.
 The pull request template (`.github/pull_request_template.md`) asks for:
 
 - [ ] `make lint` passes (ruff check and ruff format --check)
+- [ ] `make typecheck` passes (ty)
 - [ ] `make test` passes, and new behaviour comes with unit tests
 - [ ] dbt models, macros or tests changed: `bash tests/analytics/run_dbt_integration.sh` passes
 - [ ] Stack changes (compose, images, CDC, schemas): after `make up`, `make verify` reports every check OK
@@ -83,6 +84,8 @@ harness in `tests/analytics/`), `ml`, `orchestration`, `grafana`, `infra`. Leave
 | Simulator tests | `make test-simulator` | simulator image | the HF frames against the real Avro schema |
 | dbt integration | `bash tests/analytics/run_dbt_integration.sh` | throwaway ClickHouse and dbt containers | synthetic CDC and HF data; the incremental models equal a full refresh |
 | Lint | `make lint` | ruff image | ruff check + ruff format --check |
+| Typecheck | `make typecheck` | ty 0.0.100 | simulator, streaming, data_science, orchestration |
+
 
 `TEST_PATHS` and `STREAMING_TEST_PATHS` narrow a run, for example
 `make test-streaming STREAMING_TEST_PATHS=tests/streaming/test_streaming_supervisor.py`.

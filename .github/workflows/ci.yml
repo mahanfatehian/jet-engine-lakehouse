@@ -6,6 +6,7 @@
 # workflow works on a clean machine that has nothing but docker and make.
 #
 #   lint              push to main, PR   make lint (ruff check + format check), pinned ruff
+#   typecheck         push to main, PR   ty 0.0.100 on simulator, streaming, data_science, orchestration
 #   unit-tests        push to main, PR   images built from docker-compose.yml (GHA layer cache),
 #                                        pytest inside them like make test-platform (tests/),
 #                                        make test-streaming (tests/streaming, Spark + Java) and
@@ -70,6 +71,25 @@ jobs:
           ruff check || true
           ruff format --check || true
 
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TY_VERSION: "0.0.100"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+
+      - name: ty check simulator streaming data_science orchestration
+        run: uvx ty@"$TY_VERSION" check simulator streaming data_science orchestration
+
   unit-tests:
     name: unit-tests (${{ matrix.suite }})
     runs-on: ubuntu-latest
@@ -87,6 +107,7 @@ jobs:
             image: iot-engine/data-platform:latest
             tests: tests
             fail-on-skip: "could not import '(?!pyspark'|fastavro')"
+            cov: "--cov=data_science --cov=orchestration --cov=simulator"
           # `make test-streaming`: tests/streaming inside the streaming image, the only one with
           # Spark, Java and the connector jars. As in the Makefile, any skip fails the leg.
           - suite: streaming
@@ -94,6 +115,7 @@ jobs:
             image: iot-engine/streaming:latest
             tests: tests/streaming
             fail-on-skip: "."
+            cov: "--cov=streaming"
           # `make test-simulator`: tests/simulator inside the simulator image, which has the
           # Kafka client and fastavro, so the frames are checked against the real Avro schema.
           # The runtime image ships no pytest; this leg installs it into the container first.
@@ -105,6 +127,7 @@ jobs:
             tests: tests/simulator
             fail-on-skip: "^(?!could not import 'pandas')"
             pytest-install: pytest==9.1.1
+            cov: "--cov=simulator"
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -140,6 +163,7 @@ jobs:
           IMAGE: ${{ matrix.image }}
           TEST_PATHS: ${{ matrix.tests }}
           PYTEST_INSTALL: ${{ matrix.pytest-install }}
+          COV: ${{ matrix.cov }}
         run: |
           results="$RUNNER_TEMP/test-results"
           # The images run as an unprivileged user (uid 10001), which writes the report.
@@ -152,14 +176,19 @@ jobs:
           docker run --rm --init \
             -v "$GITHUB_WORKSPACE:/src:ro" -v "$results:/test-results" -w /src \
             -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/tmp/test-deps -e PYTEST_INSTALL \
-            -e SUITE -e TEST_PATHS --entrypoint sh "$IMAGE" -c '
+            -e SUITE -e TEST_PATHS -e COV --entrypoint sh "$IMAGE" -c '
               if [ -n "$PYTEST_INSTALL" ]; then
                 pip install --quiet --disable-pip-version-check --no-cache-dir --retries 5 \
                   --target /tmp/test-deps "$PYTEST_INSTALL" || exit 1
               fi
+              pip install --quiet --disable-pip-version-check --no-cache-dir --retries 5 \
+                --target /tmp/test-deps pytest-cov==7.0.0 || exit 1
+              # shellcheck disable=SC2086
               exec timeout --signal=INT --kill-after=1m 15m \
                 python -m pytest -p no:cacheprovider -rfEs -o faulthandler_timeout=300 \
-                --junitxml="/test-results/$SUITE.xml" -o junit_suite_name="$SUITE" "$TEST_PATHS"'
+                --junitxml="/test-results/$SUITE.xml" -o junit_suite_name="$SUITE" \
+                $COV --cov-report="xml:/test-results/$SUITE-coverage.xml" --cov-report=term-missing \
+                "$TEST_PATHS"'
 
       - name: Summarise the JUnit report, fail on forbidden skips
         if: ${{ !cancelled() && steps.pytest.outcome != 'skipped' }}
