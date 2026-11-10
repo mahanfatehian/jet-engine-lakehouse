@@ -118,7 +118,7 @@ def test_engine_count_saturates_at_the_uint16_maximum() -> None:
 def test_batch_row_follows_the_column_order() -> None:
     started = datetime(2026, 10, 26, 9, 0, 5, 250000, tzinfo=UTC)
     stats = BatchStats(4, 4096, 2, ROUND_TRIP_INSTANT, ROUND_TRIP_INSTANT)
-    row = dict(zip(HF_BATCH_COLUMNS, batch_row(17, started, stats, 1.2346), strict=True))
+    row = dict(zip(HF_BATCH_COLUMNS, batch_row(17, started, stats, 1.2346, dead_letters=2), strict=True))
     assert row == {
         "batch_id": 17,
         "batch_started_at": started,
@@ -128,13 +128,20 @@ def test_batch_row_follows_the_column_order() -> None:
         "min_frame_ts": ROUND_TRIP_INSTANT,
         "max_frame_ts": ROUND_TRIP_INSTANT,
         "duration_ms": 1235,
+        "dead_letters": 2,
     }
+
+
+def test_batch_row_defaults_dead_letters_to_zero() -> None:
+    stats = BatchStats(1, 1, 1, ROUND_TRIP_INSTANT, ROUND_TRIP_INSTANT)
+    row = dict(zip(HF_BATCH_COLUMNS, batch_row(0, ROUND_TRIP_INSTANT, stats, 0.0), strict=True))
+    assert row["dead_letters"] == 0
 
 
 @pytest.mark.parametrize(("seconds", "expected_ms"), [(0.0, 0), (0.0004, 0), (0.0006, 1), (-0.5, 0)])
 def test_batch_duration_is_rounded_to_whole_milliseconds(seconds: float, expected_ms: int) -> None:
     stats = BatchStats(1, 1, 1, ROUND_TRIP_INSTANT, ROUND_TRIP_INSTANT)
-    assert batch_row(0, ROUND_TRIP_INSTANT, stats, seconds)[-1] == expected_ms
+    assert batch_row(0, ROUND_TRIP_INSTANT, stats, seconds)[-2] == expected_ms
 
 
 def test_feature_rows_insert_nan_where_arrow_delivered_null() -> None:

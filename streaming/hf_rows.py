@@ -5,7 +5,8 @@ The query collects ``raw_engine_hf_features`` rows in ``FEATURE_COLUMNS`` order 
 Python process' local timezone (see ``clickhouse_rows``). :func:`feature_rows` rebuilds the
 exact, timezone-aware UTC instant and restores the name order of ``process_means``, which
 ``collect()`` loses (maps travel through a Java HashMap). :func:`batch_row` summarises a
-micro-batch for ``hf_ingest_batches``, the throughput log of the HF path.
+micro-batch for ``hf_ingest_batches``, the throughput log of the HF path (frames plus
+dead-lettered Kafka records).
 
 An undefined feature (a flat-line or missing channel, a NaN sample) is NaN in ``hf_features``,
 but PySpark's Arrow serializer of ``mapInPandas`` stores every NaN as NULL, inside the
@@ -36,6 +37,7 @@ HF_BATCH_COLUMNS: tuple[str, ...] = (
     "min_frame_ts",
     "max_frame_ts",
     "duration_ms",
+    "dead_letters",
 )
 UINT16_MAX = 65_535
 
@@ -86,7 +88,13 @@ def batch_stats(rows: Sequence[Row]) -> BatchStats | None:
     )
 
 
-def batch_row(batch_id: int, started_at: datetime, stats: BatchStats, duration_s: float) -> Row:
+def batch_row(
+    batch_id: int,
+    started_at: datetime,
+    stats: BatchStats,
+    duration_s: float,
+    dead_letters: int = 0,
+) -> Row:
     """One ``hf_ingest_batches`` row in ``HF_BATCH_COLUMNS`` order."""
     return (
         batch_id,
@@ -97,6 +105,7 @@ def batch_row(batch_id: int, started_at: datetime, stats: BatchStats, duration_s
         stats.min_frame_ts,
         stats.max_frame_ts,
         max(round(duration_s * 1000), 0),
+        max(dead_letters, 0),
     )
 
 

@@ -122,6 +122,7 @@ def test_batch_inserts_features_dead_letters_and_one_summary_row(mixed_batch) ->
         "min_frame_ts": FIRST_FRAME,
         "max_frame_ts": datetime(2026, 10, 26, 9, 0, 3, 123456, tzinfo=UTC),
         "duration_ms": 1250,
+        "dead_letters": 2,
     }
 
 

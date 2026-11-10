@@ -157,8 +157,14 @@ class HfFeatureBatchHandler:
         self._writer.insert_rows(DEAD_LETTER_TABLE, DEAD_LETTER_COLUMNS, rejected)
         stats = batch_stats(rows)
         elapsed_s = self._clock() - started
-        if stats is not None:
-            summary = batch_row(batch_id, started_at, stats, elapsed_s)
+        if stats is not None or rejected:
+            summary = batch_row(
+                batch_id,
+                started_at,
+                stats or BatchStats(0, 0, 0, started_at, started_at),
+                elapsed_s,
+                dead_letters=len(rejected),
+            )
             self._writer.insert_rows(HF_BATCHES_TABLE, HF_BATCH_COLUMNS, [summary])
         _log_batch(batch_id, stats, rejected, elapsed_s)
 

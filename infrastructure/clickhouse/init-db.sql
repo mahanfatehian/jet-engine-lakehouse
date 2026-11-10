@@ -246,13 +246,17 @@ CREATE TABLE IF NOT EXISTS hf_ingest_batches
     min_frame_ts      DateTime64(6, 'UTC'),
     max_frame_ts      DateTime64(6, 'UTC'),
     duration_ms       UInt32,
+    dead_letters      UInt32,
     ingested_at       DateTime64(3, 'UTC') DEFAULT now64(3)
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(batch_started_at)
 ORDER BY batch_started_at
 TTL toDateTime(batch_started_at) + INTERVAL 30 DAY
-COMMENT 'One row per HF micro-batch: frames, bytes and frame-time span, for throughput dashboards';
+COMMENT 'One row per HF micro-batch: frames, bytes, dead letters and frame-time span, for throughput dashboards';
+
+-- Existing volumes created before dead_letters: named inserts still match; default 0.
+ALTER TABLE hf_ingest_batches ADD COLUMN IF NOT EXISTS dead_letters UInt32 DEFAULT 0;
 
 -- -----------------------------------------------------------------------------
 -- Operations: the reconciliation audit (orchestrator task `reconcile`, make

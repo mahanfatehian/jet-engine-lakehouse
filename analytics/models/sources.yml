@@ -298,6 +298,8 @@ sources:
             description: Newest frame_start_ts of the batch; ingested_at minus it is the HF path latency.
           - name: duration_ms
             description: Processing time of the batch (ms).
+          - name: dead_letters
+            description: Kafka records of the batch that could not be decoded (raw_cdc_dead_letter).
           - name: ingested_at
             description: Server time the batch row landed in ClickHouse.
 
