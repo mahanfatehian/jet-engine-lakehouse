@@ -37,7 +37,7 @@
       }
     ]
   },
-  "description": "Maintenance-engineering board of the fleet: availability, failures, MTBF and MTTR per engine and per day, time in each status, the failure-mode Pareto and the SCD2 status timeline built from the CDC history of the engine registry.",
+  "description": "Maintenance-engineering board of the fleet: availability, failures, MTBF and MTTR per engine and per day, time in each status, the failure-mode Pareto, the SCD2 status timeline and the operational WARNING-to-FAILURE shop-visit lead time built from the CDC history of the engine registry.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -2473,6 +2473,321 @@
         "sortBy": []
       },
       "id": 21
+    },
+    {
+      "type": "row",
+      "title": "Warning-to-failure lead time (gold fct_engine_shop_visits)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 57
+      },
+      "panels": [],
+      "id": 22
+    },
+    {
+      "type": "stat",
+      "title": "Median notice (cycles)",
+      "description": "Median operational lead of the selected engines' shop visits in the range: failure_cycle minus the cycle of the first registry WARNING of that lifecycle (fct_engine_shop_visits.warning_to_failure_cycles). Distinct from the ML HIGH-risk lead on Model Operations.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT quantileExactInclusive(0.5)(warning_to_failure_cycles) AS median_notice_cycles\nFROM fct_engine_shop_visits FINAL\nWHERE $__timeFilter(failed_at)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 23
+    },
+    {
+      "type": "stat",
+      "title": "Sudden failures",
+      "description": "Share of shop visits in the range whose lifecycle never entered WARNING before FAILURE (fct_engine_shop_visits.skipped_warning).",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT if(count() > 0, countIf(skipped_warning = 1) / count(), NULL) AS sudden_failures\nFROM fct_engine_shop_visits FINAL\nWHERE $__timeFilter(failed_at)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.05
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "id": 24
+    },
+    {
+      "type": "table",
+      "title": "Shop-visit funnel",
+      "description": "Every shop visit of the selected engines that failed in the range (fct_engine_shop_visits): first WARNING and CRITICAL of that lifecycle, operational lead in cycles, work-order status and when it opened and completed. Newest first.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse-lakehouse"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse-lakehouse"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "pluginVersion": "4.23.2",
+          "queryType": "table",
+          "rawSql": "SELECT\n    engine_id AS `Engine`,\n    lifecycle_id AS `Lifecycle`,\n    first_warning_at AS `First warning`,\n    first_critical_at AS `First critical`,\n    failed_at AS `Failed at`,\n    warning_to_failure_cycles AS `Lead cycles`,\n    work_order_status AS `WO status`,\n    work_order_opened_at AS `Opened`,\n    work_order_completed_at AS `Completed`,\n    returned_to_service_at AS `Back in service`\nFROM fct_engine_shop_visits FINAL\nWHERE $__timeFilter(failed_at)\n  AND $__conditionalAll(engine_id IN (${engine_id:singlequote}), $engine_id)\nORDER BY failed_at DESC\nLIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false,
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Engine"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "targetBlank": false,
+                    "title": "Fleet health of ${__value.raw}",
+                    "url": "/d/jet-engine-fleet-health?var-engine_id=${__value.raw}&${__url_time_range}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "First warning"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "First critical"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failed at"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Opened"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Completed"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Back in service"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "id": 25
     }
   ],
   "refresh": "1m",

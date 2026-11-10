@@ -34,7 +34,8 @@ exposures:
     description: >
       Maintenance-engineering board (infrastructure/grafana/dashboards/fleet-reliability.json):
       availability, failures, MTBF and MTTR per engine and per day, time in each status, the
-      failure-mode Pareto and the SCD2 status timeline.
+      failure-mode Pareto, the SCD2 status timeline and the operational WARNING-to-FAILURE
+      shop-visit lead time.
     depends_on:
       - ref('int_engine_status_history')
       - ref('int_platform_outages')
@@ -42,6 +43,8 @@ exposures:
       - ref('fct_engine_lifecycle_status_time')
       - ref('rpt_fleet_reliability_daily')
       - ref('rpt_failure_mode_pareto')
+      - ref('fct_engine_shop_visits')
+      - ref('rpt_shop_visit_lead_time')
       - source('engine_raw', 'raw_engine_status_registry')
     owner:
       name: Jet Engine Lakehouse maintainers
