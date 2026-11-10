@@ -61,7 +61,9 @@ LOAD_TEST_SECONDS ?= 60
 LOAD_TEST_ENGINES ?= 24
 LOAD_TEST_ARGS ?=
 RUFF_IMAGE ?= ghcr.io/astral-sh/ruff:0.17.1
+TY_VERSION ?= 0.0.100
 PYTEST_VERSION ?= 9.1.1
+PYTEST_COV_VERSION ?= 7.0.0
 TEST_PATHS ?= tests
 STREAMING_TEST_PATHS ?= tests/streaming
 LINT_PATHS ?= .
@@ -115,7 +117,10 @@ PG_VERIFY_SQL = \
 	GROUP BY maintenance_status ORDER BY maintenance_status; \
 	SELECT slot_name, plugin, active, confirmed_flush_lsn, \
 	pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS replication_lag \
-	FROM pg_replication_slots;
+	FROM pg_replication_slots; \
+	SELECT count(*) AS engines_owing_hf_backfill, coalesce(sum(frames), 0) AS frames_owed \
+	FROM simulator_hf_backfill; \
+	SELECT engine_id, frames, last_event_ts FROM simulator_hf_backfill ORDER BY engine_id;
 # Manual jobs run through the pipeline runner in a one-off orchestrator container. It
 # takes the same per-job locks as the scheduled loop (PIPELINE_LOCK_DIR on a volume both
 # share), so a manual run waits for the loop's run of the same job instead of colliding.
@@ -124,20 +129,25 @@ TASK_ARGS = $(if $(strip $(ARGS)),-- $(ARGS))
 # pytest is installed into a throw-away directory only when the image lacks it.
 PYTEST_BOOTSTRAP = python -m pytest --version >/dev/null 2>&1 \
 	|| pip install --quiet --disable-pip-version-check --root-user-action=ignore --no-cache-dir --target /tmp/test-deps \
-	"pytest==$(PYTEST_VERSION)"
+	"pytest==$(PYTEST_VERSION)"; \
+	pip install --quiet --disable-pip-version-check --root-user-action=ignore --no-cache-dir --target /tmp/test-deps \
+	"pytest-cov==$(PYTEST_COV_VERSION)"
 # The streaming image is the only one with PySpark and a JVM, and its conftest skips the
 # Spark tests when no SparkSession can start: any skip in this run is turned into a failure.
 JUNIT_SKIPS = import sys, xml.etree.ElementTree as et; \
 	print(sum(int(s.get(\"skipped\", 0)) for s in et.parse(sys.argv[1]).getroot().iter(\"testsuite\")))
-STREAMING_PYTEST = python -m pytest -p no:cacheprovider -rs --junitxml=/tmp/streaming-tests.xml \
-	$(STREAMING_TEST_PATHS) && skipped=$$(python -c "$(JUNIT_SKIPS)" /tmp/streaming-tests.xml) \
+STREAMING_PYTEST = pip install --quiet --disable-pip-version-check --root-user-action=ignore --no-cache-dir \
+	--target /tmp/test-deps "pytest-cov==$(PYTEST_COV_VERSION)" && \
+	PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs --junitxml=/tmp/streaming-tests.xml \
+	--cov=streaming --cov-report=term-missing $(STREAMING_TEST_PATHS) \
+	&& skipped=$$(python -c "$(JUNIT_SKIPS)" /tmp/streaming-tests.xml) \
 	&& if [ "$$skipped" -ne 0 ]; then \
 	echo "test-streaming: $$skipped test(s) skipped; every Spark test must run in this image" >&2; exit 1; fi
 
 .PHONY: help up down clean ps logs build urls register-cdc cdc-status stream dbt-run dbt-test \
 	snapshot train-ml predict-ml reconcile restore-raw dr-drill evaluate-spectral pipeline-once verify verify-postgres verify-minio \
 	verify-clickhouse ch-init psql ch-client test test-platform test-streaming test-simulator \
-	load-test lint
+	load-test lint typecheck
 
 help: ## Show this help (default target)
 	@echo "IoT Jet Engine Lakehouse - make targets (run from the repository root)"
@@ -159,6 +169,7 @@ help: ## Show this help (default target)
 		'LOAD_TEST_ARGS="..."' 'extra --benchmark-* flags (load-test), e.g. full fidelity' \
 		'LINT_PATHS=$(LINT_PATHS)' 'ruff targets (lint)' \
 		'CLEAN_GRACE_SECONDS=$(CLEAN_GRACE_SECONDS)' 'abort window before clean deletes the volumes'
+	@echo "Typecheck: make typecheck (ty $(TY_VERSION) via uvx). Coverage: pytest-cov $(PYTEST_COV_VERSION) in the test images."
 	@echo "LAKEHOUSE_BUCKET, ML_ARTIFACT_PREFIX, BIND_HOST and the *_PORT knobs default to the"
 	@echo "values in infrastructure/.env, like the compose services."
 
@@ -271,7 +282,8 @@ test-platform: ## Unit tests in the data-platform image (the PySpark modules run
 	$(COMPOSE) build orchestrator
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
 		$(DATA_PLATFORM_IMAGE) -c '($(PYTEST_BOOTSTRAP)) \
-		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs $(TEST_PATHS)'
+		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs \
+		--cov=data_science --cov=orchestration --cov=simulator --cov-report=term-missing $(TEST_PATHS)'
 
 test-streaming: ## tests/streaming incl. the PySpark tests in the streaming image; fails on any skip
 	$(COMPOSE) build streaming
@@ -282,7 +294,8 @@ test-simulator: ## tests/simulator in the simulator image (has fastavro: runs th
 	$(COMPOSE) build simulator
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
 		$(SIMULATOR_IMAGE) -c '($(PYTEST_BOOTSTRAP)) \
-		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs tests/simulator'
+		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs \
+		--cov=simulator --cov-report=term-missing tests/simulator'
 
 load-test: ## HF producer load test (needs make up): frames/s, MB/s, latency, 30 TB / 30 min projection
 	$(COMPOSE) run --rm --no-deps simulator python engine_generator.py --benchmark \
@@ -291,3 +304,8 @@ load-test: ## HF producer load test (needs make up): frames/s, MB/s, latency, 30
 lint: ## Lint (ruff check) and format-check (ruff format --check) the Python code
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src $(RUFF_IMAGE) check --no-cache $(LINT_PATHS)
 	docker run --rm -v "$(CURDIR):/src:ro" -w /src $(RUFF_IMAGE) format --check --no-cache $(LINT_PATHS)
+
+typecheck: ## Type-check simulator, streaming, data_science and orchestration (ty)
+	docker run --rm -v "$(CURDIR):/src:ro" -w /src python:3.12-slim-bookworm \
+		sh -c 'pip install --quiet --disable-pip-version-check --no-cache-dir ty==$(TY_VERSION) \
+		&& ty check simulator streaming data_science orchestration'

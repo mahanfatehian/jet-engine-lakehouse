@@ -152,6 +152,33 @@ SELECT
 FROM hf_ingest_batches
 WHERE batch_started_at >= now64(3) - INTERVAL 15 MINUTE;
 
+SELECT '\n== 7b2. HF coverage of the last 15 minutes (pulses vs frames, frame_seq gaps) ==' FORMAT TSVRaw;
+SELECT
+    t.engine_id,
+    t.pulses,
+    ifNull(h.frames, 0) AS frames,
+    round(ifNull(h.frames, 0) / t.pulses, 4) AS coverage,
+    ifNull(h.seq_gaps, 0) AS seq_gaps
+FROM
+(
+    SELECT engine_id, count() AS pulses
+    FROM raw_engine_telemetry FINAL
+    WHERE is_deleted = 0
+      AND event_ts >= now64(6) - INTERVAL 15 MINUTE
+    GROUP BY engine_id
+) AS t
+LEFT JOIN
+(
+    SELECT
+        engine_id,
+        uniqExact(telemetry_id) AS frames,
+        max(frame_seq) - min(frame_seq) + 1 - uniqExact(frame_seq) AS seq_gaps
+    FROM raw_engine_hf_features FINAL
+    WHERE frame_start_ts >= now64(6) - INTERVAL 15 MINUTE
+    GROUP BY engine_id
+) AS h ON h.engine_id = t.engine_id
+ORDER BY t.engine_id;
+
 SELECT '\n== 7c. Streaming queries: latest micro-batch of each query (ops_stream_progress) ==' FORMAT TSVRaw;
 SELECT
     query_name,
@@ -366,21 +393,74 @@ FROM
       AND informational = 0
     UNION ALL
     -- A batch leaves records behind only when maxOffsetsPerTrigger caps it; one re-run after a failure
-    -- reports no lag (NULL). 50000 records are about two hours of the default fleet's CDC; the first-boot
+    -- reports no lag (NULL). CDC lag of 5000 is minutes of the default fleet; the first-boot HF
     -- backfill leaves the HF lake queries some 46000 frames behind, which they work off at 2000 a minute.
     SELECT
         10,
-        'streaming consumer lag below 50000 records (latest batch of every query)',
-        if(count() > 0 AND max(kafka_lag_records) < 50000, 'OK', 'WARN'),
-        if(count() = 0, 'no micro-batch recorded yet',
-           concat(toString(count()), ' queries, largest lag ',
+        'CDC streaming consumer lag below 5000 records (latest batch of every CDC query)',
+        if(count() > 0 AND max(kafka_lag_records) < 5000, 'OK', 'WARN'),
+        if(count() = 0, 'no CDC micro-batch recorded yet',
+           concat(toString(count()), ' CDC queries, largest lag ',
                   ifNull(concat(toString(max(kafka_lag_records)), ' records'), 'unknown')))
     FROM
     (
         SELECT query_name, kafka_lag_records
         FROM ops_stream_progress
+        WHERE query_name NOT IN (
+            'bronze_engine_sensor_frames', 'silver_engine_hf_features', 'clickhouse_hf_features')
         ORDER BY query_name, trigger_ts DESC
         LIMIT 1 BY query_name
+    )
+    UNION ALL
+    SELECT
+        11,
+        'HF streaming consumer lag below 50000 records (latest batch of every HF query)',
+        if(count() > 0 AND max(kafka_lag_records) < 50000, 'OK', 'WARN'),
+        if(count() = 0, 'no HF micro-batch recorded yet',
+           concat(toString(count()), ' HF queries, largest lag ',
+                  ifNull(concat(toString(max(kafka_lag_records)), ' records'), 'unknown')))
+    FROM
+    (
+        SELECT query_name, kafka_lag_records
+        FROM ops_stream_progress
+        WHERE query_name IN (
+            'bronze_engine_sensor_frames', 'silver_engine_hf_features', 'clickhouse_hf_features')
+        ORDER BY query_name, trigger_ts DESC
+        LIMIT 1 BY query_name
+    )
+    UNION ALL
+    -- Live window only: first-boot history is older than 15 minutes. HF is best effort (WARN).
+    SELECT
+        12,
+        'HF coverage of the last 15 minutes at least 0.99 with no frame_seq gaps (best effort)',
+        if(count() = 0 OR (min(coverage) >= 0.99 AND max(seq_gaps) = 0), 'OK', 'WARN'),
+        if(count() = 0, 'no pulses in the last 15 minutes',
+           concat(toString(count()), ' engines, lowest coverage ',
+                  toString(round(min(coverage), 3)), ', seq gaps ', toString(max(seq_gaps))))
+    FROM
+    (
+        SELECT
+            t.engine_id,
+            ifNull(h.frames, 0) / t.pulses AS coverage,
+            ifNull(h.seq_gaps, 0) AS seq_gaps
+        FROM
+        (
+            SELECT engine_id, count() AS pulses
+            FROM raw_engine_telemetry FINAL
+            WHERE is_deleted = 0
+              AND event_ts >= now64(6) - INTERVAL 15 MINUTE
+            GROUP BY engine_id
+        ) AS t
+        LEFT JOIN
+        (
+            SELECT
+                engine_id,
+                uniqExact(telemetry_id) AS frames,
+                max(frame_seq) - min(frame_seq) + 1 - uniqExact(frame_seq) AS seq_gaps
+            FROM raw_engine_hf_features FINAL
+            WHERE frame_start_ts >= now64(6) - INTERVAL 15 MINUTE
+            GROUP BY engine_id
+        ) AS h ON h.engine_id = t.engine_id
     )
 )
 ORDER BY ord
