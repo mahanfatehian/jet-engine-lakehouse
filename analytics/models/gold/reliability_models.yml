@@ -647,7 +647,7 @@ models:
         description: Visits whose lifecycle entered WARNING before FAILURE.
       - name: visits_skipped_warning
         data_type: UInt64
-        description: Sudden deaths: WARNING was never observed before FAILURE.
+        description: "Sudden deaths: WARNING was never observed before FAILURE."
       - name: visits_returned
         data_type: UInt64
         description: Visits that have returned to service.

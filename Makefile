@@ -280,19 +280,22 @@ test: test-platform test-streaming test-simulator ## Run every unit test: data-p
 
 test-platform: ## Unit tests in the data-platform image (the PySpark modules run in test-streaming)
 	$(COMPOSE) build orchestrator
-	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
+	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 \
+		-e COVERAGE_FILE=/tmp/.coverage --entrypoint sh \
 		$(DATA_PLATFORM_IMAGE) -c '($(PYTEST_BOOTSTRAP)) \
 		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs \
 		--cov=data_science --cov=orchestration --cov=simulator --cov-report=term-missing $(TEST_PATHS)'
 
 test-streaming: ## tests/streaming incl. the PySpark tests in the streaming image; fails on any skip
 	$(COMPOSE) build streaming
-	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
+	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 \
+		-e COVERAGE_FILE=/tmp/.coverage --entrypoint sh \
 		$(STREAMING_IMAGE) -c '$(STREAMING_PYTEST)'
 
 test-simulator: ## tests/simulator in the simulator image (has fastavro: runs the real-schema Avro round trip)
 	$(COMPOSE) build simulator
-	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 --entrypoint sh \
+	docker run --rm -v "$(CURDIR):/src:ro" -w /src -e PYTHONDONTWRITEBYTECODE=1 \
+		-e COVERAGE_FILE=/tmp/.coverage --entrypoint sh \
 		$(SIMULATOR_IMAGE) -c '($(PYTEST_BOOTSTRAP)) \
 		&& PYTHONPATH=/tmp/test-deps python -m pytest -p no:cacheprovider -rs \
 		--cov=simulator --cov-report=term-missing tests/simulator'

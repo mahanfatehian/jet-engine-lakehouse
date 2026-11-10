@@ -216,6 +216,8 @@ class TaskLocks:
 
 
 def _try_lock(fd: int) -> bool:
+    if fcntl is None:
+        raise OSError("this platform has no fcntl.flock")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

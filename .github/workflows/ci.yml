@@ -176,6 +176,7 @@ jobs:
           docker run --rm --init \
             -v "$GITHUB_WORKSPACE:/src:ro" -v "$results:/test-results" -w /src \
             -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/tmp/test-deps -e PYTEST_INSTALL \
+            -e COVERAGE_FILE=/tmp/.coverage \
             -e SUITE -e TEST_PATHS -e COV --entrypoint sh "$IMAGE" -c '
               if [ -n "$PYTEST_INSTALL" ]; then
                 pip install --quiet --disable-pip-version-check --no-cache-dir --retries 5 \
