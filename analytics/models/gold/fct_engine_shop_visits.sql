@@ -97,7 +97,7 @@ select
     toUInt8(isNull(stages.first_critical_at)) as skipped_critical,
     work_orders.work_order_opened_at as work_order_opened_at,
     work_orders.work_order_completed_at as work_order_completed_at,
-    cast(work_orders.work_order_status as Nullable(LowCardinality(String))) as work_order_status,
+    cast(work_orders.work_order_status as LowCardinality(Nullable(String))) as work_order_status,
     {{ micros_between('work_orders.work_order_opened_at', 'work_orders.work_order_completed_at') }}
         / 1000000.0 as shop_visit_seconds,
     failures.returned_to_service_at as returned_to_service_at,

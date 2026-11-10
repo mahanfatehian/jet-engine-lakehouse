@@ -7,7 +7,7 @@ Group ``lake`` (Kafka + MinIO), parquet file sinks, each with its own Kafka sour
 Group ``clickhouse`` (Kafka + ClickHouse), at-least-once through ``foreachBatch``:
     clickhouse_hf_features       features    -> raw_engine_hf_features (ReplacingMergeTree keyed by
                                                 engine_id, telemetry_id: replays collapse), one
-                                                hf_ingest_batches row per batch with frames,
+                                                hf_ingest_batches row per batch with frames or dead letters,
                                                 raw_cdc_dead_letter for rejected records
 
 Unlike the CDC path the HF path is best effort. HF_FAIL_ON_DATA_LOSS defaults to false: frames

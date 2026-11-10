@@ -139,11 +139,23 @@ def test_frame_times_are_exact_under_a_non_utc_process_timezone(
     assert ticks == 1_793_005_201_123_456
 
 
-def test_batch_of_rejected_records_writes_no_summary(hf_records) -> None:
+def test_batch_of_rejected_records_records_dead_letters_and_a_zero_frame_summary(hf_records) -> None:
     writer = FakeWriter()
     handler(writer)(hf_records([b"\x00\x00\x00\x00\x01garbage", None]), 3)
-    assert set(writer.inserts) == {DEAD_LETTER_TABLE}
+    assert set(writer.inserts) == {DEAD_LETTER_TABLE, HF_BATCHES_TABLE}
     assert len(writer.as_dicts(DEAD_LETTER_TABLE)) == 2
+    (summary,) = writer.as_dicts(HF_BATCHES_TABLE)
+    assert summary == {
+        "batch_id": 3,
+        "batch_started_at": STARTED_AT,
+        "frames": 0,
+        "bytes": 0,
+        "engines": 0,
+        "min_frame_ts": STARTED_AT,
+        "max_frame_ts": STARTED_AT,
+        "duration_ms": 1250,
+        "dead_letters": 2,
+    }
 
 
 def test_insert_failure_fails_the_batch_and_releases_the_cache(mixed_batch) -> None:

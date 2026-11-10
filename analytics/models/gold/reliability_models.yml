@@ -568,7 +568,7 @@ models:
         data_type: "Nullable(DateTime64(6, 'UTC'))"
         description: Work order completed_ts; NULL while OPEN or until it lands.
       - name: work_order_status
-        data_type: "Nullable(LowCardinality(String))"
+        data_type: "LowCardinality(Nullable(String))"
         description: OPEN or COMPLETED of the work order; NULL until it lands.
         data_tests:
           - accepted_values:
