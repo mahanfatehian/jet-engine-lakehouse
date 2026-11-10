@@ -17,13 +17,13 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  # Python pins of the three images: minor and patch updates in one pull request per directory,
-  # major updates in another. dbt-core and dbt-clickhouse are also pinned in
-  # tests/analytics/run_dbt_integration.sh: bump them there in the same pull request.
+  # Python pins of the simulator and data-platform images: minor and patch updates in one
+  # pull request per directory, major updates in another. dbt-core and dbt-clickhouse are
+  # also pinned in tests/analytics/run_dbt_integration.sh: bump them there in the same PR.
+  # Streaming is a separate entry below: PySpark 3.5 cannot take pandas 3 / numpy 2.
   - package-ecosystem: pip
     directories:
       - /simulator
-      - /streaming
       - /data_science
     schedule:
       interval: weekly
@@ -38,11 +38,33 @@ updates:
       python-major:
         patterns: ["*"]
         update-types: [major]
+
+  # Streaming image is CPython 3.11 + PySpark 3.5: pandas 3, numpy 2 and the pyarrow line
+  # that follows them are not supported (streaming/requirements.txt). Keep majors out of
+  # this directory so the weekly python-major group cannot open a breaking bump here.
+  - package-ecosystem: pip
+    directory: /streaming
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build(deps)
+    groups:
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
     ignore:
-      # pyspark (and py4j, which it pins) moves together with the SHA-256 verified pyspark sdist
-      # and the Spark connector jars in streaming/Dockerfile: upgrade them together, by hand.
       - dependency-name: pyspark
       - dependency-name: py4j
+      - dependency-name: pandas
+        update-types: ["version-update:semver-major"]
+      - dependency-name: numpy
+        update-types: ["version-update:semver-major"]
+      - dependency-name: pyarrow
+        update-types: ["version-update:semver-major"]
+      - dependency-name: python-dateutil
+        update-types: ["version-update:semver-major"]
 
   # Base images of the three Dockerfiles.
   - package-ecosystem: docker
