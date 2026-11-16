@@ -1,7 +1,7 @@
 # Edge telemetry simulator: pulses a jet-engine fleet into PostgreSQL (captured by Debezium CDC) and streams
 # every committed pulse's high-frequency sensor frame to Kafka (Avro, Schema Registry). The frame schema is
 # mounted at /schemas (HF_SCHEMA_PATH), not baked in: infrastructure/schemas is its single source of truth.
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

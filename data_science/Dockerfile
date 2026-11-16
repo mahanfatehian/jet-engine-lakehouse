@@ -5,7 +5,7 @@
 #   orchestration/  pipeline runner (default command)
 # Build context is the repository root:
 #   docker build -f data_science/Dockerfile -t iot-engine/data-platform:latest .
-FROM python:3.12-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

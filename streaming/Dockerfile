@@ -6,7 +6,7 @@
 # curl inside RUN rather than `ADD <url>`: RUN traffic honours the daemon/Docker Desktop
 # proxy like any container, and partial downloads resume after a stall instead of
 # restarting (pip cannot resume, which breaks the ~320 MB pyspark sdist on slow links).
-FROM python:3.11-slim-bookworm AS fetcher
+FROM python:3.15-slim-bookworm AS fetcher
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -59,7 +59,7 @@ RUN fetch ea27adc39ddac9413b8951e45aa748cbed6c785971b81386efc41938f6243d93 \
     https://files.pythonhosted.org/packages/95/ce/81e53e729790556e3983e95de1a7d5df91a34adfcd34b5a5ab0e0c6e9b33/pyspark-3.5.9.tar.gz
 
 # ------------------------------------------------------------------ runtime image
-FROM python:3.11-slim-bookworm
+FROM python:3.15-slim-bookworm
 
 ENV TZ=UTC \
     PYTHONUNBUFFERED=1 \
